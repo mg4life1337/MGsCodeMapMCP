@@ -105,7 +105,16 @@ public sealed class McpServer
         catch (Exception ex)
         {
             _logger.LogError(ex, "Unhandled error dispatching {Method}", method);
-            return BuildError(id, -32603, "Internal error");
+            // Surface the exception type + message in error.data. CodeMap is open-source,
+            // so there's no secret to protect, and a bare "Internal error" forces the caller
+            // to dig through daemon logs (the original -32603 overlay-FQN bug took a full
+            // repro session to localise for exactly this reason). The top-level message stays
+            // concise; structured detail goes in `data` per the JSON-RPC convention.
+            return BuildError(id, -32603, $"Internal error: {ex.Message}", new JsonObject
+            {
+                ["exceptionType"] = ex.GetType().FullName,
+                ["method"] = method,
+            });
         }
     }
 
@@ -169,13 +178,18 @@ public sealed class McpServer
     private static JsonObject BuildSuccess(JsonNode? id, JsonNode result) =>
         new() { ["jsonrpc"] = "2.0", ["id"] = id, ["result"] = result };
 
-    private static JsonObject BuildError(JsonNode? id, int code, string message) =>
-        new()
+    private static JsonObject BuildError(JsonNode? id, int code, string message, JsonNode? data = null)
+    {
+        var error = new JsonObject { ["code"] = code, ["message"] = message };
+        if (data is not null)
+            error["data"] = data;
+        return new JsonObject
         {
             ["jsonrpc"] = "2.0",
             ["id"] = id,
-            ["error"] = new JsonObject { ["code"] = code, ["message"] = message },
+            ["error"] = error,
         };
+    }
 
     // ─── Transport ────────────────────────────────────────────────────────────
 

@@ -69,6 +69,12 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         // Upsert symbols
         foreach (var sym in delta.AddedOrUpdatedSymbols)
         {
+            // Skip unaddressable symbols (empty SymbolId, e.g. SymbolId.Empty from a
+            // Roslyn symbol with no doc-comment ID). Storing one indexes its name tokens
+            // but leaves an empty FQN string, which later crashes SymbolId.From on the
+            // read path. A symbol with no ID can't be looked up anyway — drop it here so
+            // it never enters the overlay.
+            if (string.IsNullOrWhiteSpace(sym.SymbolId.Value)) continue;
             var fqn = sym.SymbolId.Value;
             var stableId = RecordMappers.ComputeDegradedStableId(sym.Kind, fqn, null);
             var stableIdSid = batch.InternString(stableId);
@@ -230,6 +236,13 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
             }
 
             var fqn = overlay.ResolveString(sym.FqnStringId);
+            // Defensive: an overlay-new symbol can carry an empty FQN when its source
+            // SymbolId was SymbolId.Empty (e.g. a Roslyn symbol with no doc-comment ID).
+            // Its name tokens are still indexed, so a search/browse can match it — but
+            // SymbolId.From("") throws ArgumentException, which escapes to the MCP layer
+            // as -32603. An unaddressable symbol is not a usable hit; skip it. Mirrors the
+            // empty-path filter in GetOverlayFilePathsAsync.
+            if (string.IsNullOrWhiteSpace(fqn)) continue;
             var displayName = overlay.ResolveString(sym.DisplayNameStringId);
             var ns = overlay.ResolveString(sym.NamespaceStringId);
 
@@ -300,6 +313,13 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
             }
 
             var fqn = overlay.ResolveString(sym.FqnStringId);
+            // Defensive: an overlay-new symbol can carry an empty FQN when its source
+            // SymbolId was SymbolId.Empty (e.g. a Roslyn symbol with no doc-comment ID).
+            // Its name tokens are still indexed, so a search/browse can match it — but
+            // SymbolId.From("") throws ArgumentException, which escapes to the MCP layer
+            // as -32603. An unaddressable symbol is not a usable hit; skip it. Mirrors the
+            // empty-path filter in GetOverlayFilePathsAsync.
+            if (string.IsNullOrWhiteSpace(fqn)) continue;
             var displayName = overlay.ResolveString(sym.DisplayNameStringId);
             var ns = overlay.ResolveString(sym.NamespaceStringId);
 
@@ -396,8 +416,11 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         foreach (var stableId in overlay.Tombstones)
         {
             var rec = reader.GetSymbolByStableId(stableId);
-            if (rec != null)
-                result.Add(SymbolId.From(reader.ResolveString(rec.Value.FqnStringId)));
+            if (rec == null) continue;
+            var fqn = reader.ResolveString(rec.Value.FqnStringId);
+            // Same empty-FQN guard as the search path: SymbolId.From("") throws.
+            if (string.IsNullOrWhiteSpace(fqn)) continue;
+            result.Add(SymbolId.From(fqn));
         }
         return Task.FromResult<IReadOnlySet<SymbolId>>(result);
     }
