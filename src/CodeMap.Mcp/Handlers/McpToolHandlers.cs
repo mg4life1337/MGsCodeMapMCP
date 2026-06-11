@@ -84,7 +84,8 @@ public sealed class McpToolHandlers
                     ["project_name"] = Prop("string", "Exact project name filter (case-insensitive). E.g., 'CodeMap.Core'."),
                     ["limit"] = new JsonObject { ["type"] = "integer", ["description"] = "Max results (default: 20, max: 100)" },
                 }),
-            HandleSearchAsync));
+            HandleSearchAsync,
+            HandlerHelpers.AnnotReadOnly));
 
         registry.Register(new ToolDefinition(
             "symbols.get_card",
@@ -101,7 +102,8 @@ public sealed class McpToolHandlers
                     ["name_filter"] = NameFilterProp(),
                     ["include_code"] = new JsonObject { ["type"] = "boolean", ["description"] = "Include source code in response (default: true). When true, the symbol's full source is included up to 100 lines; methods are rarely truncated. Set false for metadata-only lookups (faster, no disk read)." },
                 }),
-            HandleGetCardAsync));
+            HandleGetCardAsync,
+            HandlerHelpers.AnnotReadOnly));
 
         registry.Register(new ToolDefinition(
             "code.get_span",
@@ -119,7 +121,8 @@ public sealed class McpToolHandlers
                     ["context_lines"] = new JsonObject { ["type"] = "integer", ["description"] = "Extra lines before/after (default: 0)" },
                     ["max_lines"] = new JsonObject { ["type"] = "integer", ["description"] = "Budget cap (default: 120)" },
                 }),
-            HandleGetSpanAsync));
+            HandleGetSpanAsync,
+            HandlerHelpers.AnnotReadOnly));
 
         registry.Register(new ToolDefinition(
             "symbols.get_definition_span",
@@ -137,7 +140,8 @@ public sealed class McpToolHandlers
                     ["max_lines"] = new JsonObject { ["type"] = "integer", ["description"] = "Max lines to return (default: 120)" },
                     ["context_lines"] = new JsonObject { ["type"] = "integer", ["description"] = "Context around definition (default: 2)" },
                 }),
-            HandleGetDefinitionSpanAsync));
+            HandleGetDefinitionSpanAsync,
+            HandlerHelpers.AnnotReadOnly));
 
         registry.Register(new ToolDefinition(
             "code.search_text",
@@ -154,7 +158,8 @@ public sealed class McpToolHandlers
                         "File path prefix filter (e.g. 'src/' for production files only, 'tests/' for test files)."),
                     ["limit"] = new JsonObject { ["type"] = "integer", ["description"] = "Max matches to return (default: 50, max: 200)" },
                 }),
-            HandleSearchTextAsync));
+            HandleSearchTextAsync,
+            HandlerHelpers.AnnotReadOnly));
     }
 
     // ── Handlers ──────────────────────────────────────────────────────────────
@@ -176,7 +181,18 @@ public sealed class McpToolHandlers
         var budgets = new BudgetLimits(maxResults: Math.Clamp(limit, 1, 100));
 
         var result = await _queryEngine.SearchSymbolsAsync(routingResult.Value, query, filters, budgets, ct).ConfigureAwait(false);
-        return result.Match(Ok, Err);
+        if (result.IsFailure) return Err(result.Error);
+
+        var okResult = Ok(result.Value);
+        // Zero-hit responses are a common dead-end: agents read "found 0 hits" and
+        // stop, even though a one-step adjustment (drop filters, try wildcard, switch
+        // to code.search_text) almost always lands. Inline the right next step.
+        if (result.Value.Data.Hits.Count == 0)
+        {
+            var hint = HandlerHelpers.EmptySearchHint(query, filters is not null);
+            okResult = InjectAnswerNote(okResult, hint);
+        }
+        return okResult;
     }
 
     internal async Task<ToolCallResult> HandleGetCardAsync(JsonObject? args, CancellationToken ct)
@@ -197,7 +213,7 @@ public sealed class McpToolHandlers
         {
             var stableId = new StableId(explicitSymbolId);
             var stableResult = await _queryEngine.GetSymbolByStableIdAsync(routingResult.Value, stableId, ct).ConfigureAwait(false);
-            if (stableResult.IsFailure) return HandlerHelpers.ErrWithNotFoundSuggestion(stableResult.Error, explicitSymbolId);
+            if (stableResult.IsFailure) return await HandlerHelpers.ErrWithFuzzyCandidatesAsync(stableResult.Error, explicitSymbolId, _queryEngine, routingResult.Value, ct).ConfigureAwait(false);
             return await AppendSourceCodeAsync(stableResult.Value.Data.SymbolId, stableResult.Value, routingResult.Value, includeCode, ct).ConfigureAwait(false);
         }
 
@@ -214,7 +230,7 @@ public sealed class McpToolHandlers
                 var corrected = await TryAutoCorrectCardAsync(symbolIdStr, routingResult.Value, includeCode, ct).ConfigureAwait(false);
                 if (corrected is not null) return corrected;
             }
-            return HandlerHelpers.ErrWithNotFoundSuggestion(result.Error, symbolIdStr);
+            return await HandlerHelpers.ErrWithFuzzyCandidatesAsync(result.Error, symbolIdStr, _queryEngine, routingResult.Value, ct).ConfigureAwait(false);
         }
         return await AppendSourceCodeAsync(symbolId, result.Value, routingResult.Value, includeCode, ct).ConfigureAwait(false);
     }
@@ -291,8 +307,17 @@ public sealed class McpToolHandlers
         };
         dataObj["source"] = sourceValue;
 
+        // Type-card hint: must fire on every path (with code, without code, decompiled,
+        // metadata stub). Compute it once and apply at every return point — earlier
+        // versions of this code attached the hint only after the source-code-fetch
+        // block, which meant `include_code: false` callers silently lost the hint.
+        var typeHint = HandlerHelpers.TypeCardHint(card);
+
         if (!includeCode)
-            return new ToolCallResult(jsonNode.ToJsonString());
+        {
+            var noCodeResult = new ToolCallResult(jsonNode.ToJsonString());
+            return typeHint is not null ? InjectAnswerNote(noCodeResult, typeHint) : noCodeResult;
+        }
 
         if (card.IsDecompiled == 2)
         {
@@ -337,7 +362,8 @@ public sealed class McpToolHandlers
             }
         }
 
-        return new ToolCallResult(jsonNode.ToJsonString());
+        var withCodeResult = new ToolCallResult(jsonNode.ToJsonString());
+        return typeHint is not null ? InjectAnswerNote(withCodeResult, typeHint) : withCodeResult;
     }
 
     internal async Task<ToolCallResult> HandleGetSpanAsync(JsonObject? args, CancellationToken ct)

@@ -98,6 +98,13 @@ internal static class RecordToCoreMappings
         var visibility = ReverseAccessibility(sym.Accessibility);
         var kind = ReverseSymbolKind(sym.Kind);
 
+        // A baseline symbol with no associated file is the syntactic-fallback sentinel
+        // (FileIntId==0 → rendered as file_path "unknown"). These symbols come from projects
+        // that failed to compile cleanly, so their extracted metadata (name resolution,
+        // containing-type, span) is best-effort, not Roslyn-grade. Surface that to callers
+        // as Confidence.Low instead of silently re-stamping High here.
+        var confidence = filePath.Length > 0 ? Confidence.High : Confidence.Low;
+
         // Reconstruct containing type from container (positive IntIds = baseline, skip negative = overlay-local)
         string? containingType = null;
         if (sym.ContainerIntId > 0 && sym.ContainerIntId <= reader.SymbolCount)
@@ -138,7 +145,7 @@ internal static class RecordToCoreMappings
             SideEffects: [],
             ThrownExceptions: [],
             Evidence: [],
-            Confidence: Confidence.High,
+            Confidence: confidence,
             StableId: stableIdStr != null ? new StableId(stableIdStr) : null);
 
         return card with { IsDecompiled = (sym.Flags & (1 << 7)) != 0 ? 1 : 0 };

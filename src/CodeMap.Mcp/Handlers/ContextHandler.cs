@@ -91,7 +91,8 @@ public sealed class ContextHandler
                         ["description"] = "Include source code in all cards (default: true). Set false for metadata-only.",
                     },
                 }),
-            HandleGetContextAsync));
+            HandleGetContextAsync,
+            HandlerHelpers.AnnotReadOnly));
     }
 
     internal async Task<ToolCallResult> HandleGetContextAsync(JsonObject? args, CancellationToken ct)
@@ -118,7 +119,7 @@ public sealed class ContextHandler
         {
             var stableId = new StableId(explicitSymbolId);
             var stableResult = await _queryEngine.GetSymbolByStableIdAsync(routingResult.Value, stableId, ct).ConfigureAwait(false);
-            if (stableResult.IsFailure) return HandlerHelpers.ErrWithNotFoundSuggestion(stableResult.Error, explicitSymbolId);
+            if (stableResult.IsFailure) return await HandlerHelpers.ErrWithFuzzyCandidatesAsync(stableResult.Error, explicitSymbolId, _queryEngine, routingResult.Value, ct).ConfigureAwait(false);
             symbolId = stableResult.Value.Data.SymbolId;
             symbolIdStr = symbolId.Value;
         }
@@ -141,7 +142,7 @@ public sealed class ContextHandler
                     symbolIdStr, routingResult.Value, calleeDepth, maxCallees, includeCode, ct).ConfigureAwait(false);
                 if (corrected is not null) return corrected;
             }
-            return HandlerHelpers.ErrWithNotFoundSuggestion(result.Error, symbolIdStr);
+            return await HandlerHelpers.ErrWithFuzzyCandidatesAsync(result.Error, symbolIdStr, _queryEngine, routingResult.Value, ct).ConfigureAwait(false);
         }
         return Ok(result.Value);
     }

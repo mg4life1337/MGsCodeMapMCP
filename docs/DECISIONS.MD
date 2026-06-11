@@ -1156,3 +1156,66 @@ is created.
 - FAKE's `Fake.Core.Target` module functions (`run`, `runOrDefault`, etc.) appear in index.
 - Generalises: any future FCS case where entity XmlDocSig is unavailable still indexes members.
 - 379/379 Roslyn tests pass (new test: `ExtractSymbols_FindsMembersOfRequireQualifiedAccessModule`).
+
+
+---
+
+## ADR-038: `graph.callers` Interface-Aware Resolution
+
+**Date:** 2026-05-11
+**Status:** Accepted
+
+**Context:**
+Field report (2026-05-11) from an AI agent investigating a config bug:
+`graph.callers` on the concrete `SurveyorConfigService.GetCMSIpAddress` returned 2
+callers; `refs.find` on the interface `ISurveyorConfigService.GetCMSIpAddress`
+returned 7. The 5 real call sites all dispatched through DI on the interface.
+Without prior context, the agent would have shipped a fix based on the 2-caller
+result and missed the actual handler. This is the failure mode CodeMap exists to
+prevent: silently under-reporting in a tool whose value prop is "don't miss things
+a grep would miss."
+
+**Decision:**
+Resolve interface implementation at **query time** (not at indexing time):
+
+- For methods, properties, events, indexers: derive the containing-type FQN by
+  parsing the doc-comment ID (last dot before any `(`). Look up the containing
+  type's interfaces via `type_relations`. For each interface, substitute its FQN
+  into the doc ID to construct a candidate interface-member SymbolId and probe
+  the symbol store.
+- Always emit `interface_implementation_hint` on the response when interface
+  members are matched (metadata, bounded probe cap = 50 for the count).
+- Add opt-in `follow_interface: bool = false`. When true, union concrete callers
+  with refs targeting the interface members at the BFS root level, dedupe by
+  `from_symbol`.
+- Cache key gains `:fi={true|false}` suffix so the two modes don't poison
+  each other.
+
+**Why query-time, not storage:**
+Member-level `implements` edges in storage would be precise (O(1) lookup, clean
+explicit-impl handling) but require a baseline-format bump and forced re-index
+for every user. M20-03 is a correctness-only fix; a baseline migration is too
+heavy a ship. Promote to stored edges if future field reports surface resolution
+accuracy issues.
+
+**Quirk discovered live:**
+`card.ContainingType` stores the SIMPLE type name in production extraction
+(`"RoslynCompiler"`), not the FQN (`"CodeMap.Roslyn.RoslynCompiler"`). v2.6.0
+unit tests masked this because they constructed mock cards with FQN containing
+types. v2.6.1 resolver parses the doc ID directly for the FQN and only uses
+the card field as a sanity check (must equal or end with `"." + simpleName`).
+For explicit-interface impls (`M:Ns.Foo.IFoo.X` with simple type `Foo`),
+peel one dotted segment off the parsed container and shift it into the member
+tail so the existing explicit-impl prefix-strip logic applies.
+
+**Consequences:**
+- Concrete-method `graph.callers` in DI codebases stops under-reporting silently.
+- Hint surfaces availability of the union *without* anyone paying for it
+  (bounded probe is one indexed lookup per interface member, ≤50 caller scan).
+- Backwards-compatible: existing callers see a new optional response field;
+  default `follow_interface=false` preserves prior behavior exactly.
+- Smoke-tested live on the indexed CodeMap repo: `RoslynCompiler.CompileAndExtractAsync`
+  default → 31 callers + hint(6); `follow_interface: true` → 37 callers, hint
+  text adapts to "already applied". 1635 unit tests pass.
+- Deferred to future milestones: `graph.callees` inverse (interface → impls),
+  `virtual`/`override` upward walk, member-level storage edges.

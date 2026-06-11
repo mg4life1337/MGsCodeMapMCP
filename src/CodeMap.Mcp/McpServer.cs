@@ -98,7 +98,7 @@ public sealed class McpServer
                 "initialize" => HandleInitialize(id, @params),
                 "tools/list" => HandleToolsList(id),
                 "tools/call" => await HandleToolCallAsync(id, @params, ct).ConfigureAwait(false),
-                _ => BuildError(id, -32601, $"Method not found: {method}"),
+                _ => BuildError(id, -32601, MethodNotFoundMessage(method)),
             };
         }
         catch (OperationCanceledException) { throw; }
@@ -116,6 +116,21 @@ public sealed class McpServer
                 ["method"] = method,
             });
         }
+    }
+
+    private static readonly string[] _knownMethods = ["initialize", "tools/list", "tools/call"];
+
+    /// <summary>
+    /// Builds the -32601 error message with a did-you-mean suggestion. Agents
+    /// occasionally send "tool/call", "tool_call", or call a tool name directly
+    /// as the JSON-RPC method — surfacing the closest known method short-circuits
+    /// the otherwise opaque dead-end.
+    /// </summary>
+    private static string MethodNotFoundMessage(string method)
+    {
+        var closest = Handlers.HandlerHelpers.ClosestName(method, _knownMethods);
+        if (closest is not null) return $"Method not found: {method}. Did you mean: {closest}?";
+        return $"Method not found: {method}. Valid methods: initialize, tools/list, tools/call.";
     }
 
     // ─── Method handlers ──────────────────────────────────────────────────────
@@ -142,12 +157,27 @@ public sealed class McpServer
         var tools = new JsonArray();
         foreach (var t in _registry.GetAll())
         {
-            tools.Add(new JsonObject
+            var entry = new JsonObject
             {
                 ["name"] = t.Name,
                 ["description"] = t.Description,
                 ["inputSchema"] = t.InputSchema.DeepClone(),
-            });
+            };
+            // MCP 2025-03-26 `annotations` (readOnlyHint / destructiveHint / idempotentHint /
+            // openWorldHint). Clients like Claude Desktop use these to auto-approve read-only
+            // calls and gate destructive ones. Emitted only when set so older clients (and
+            // tools without annotations) see no spurious `annotations` key — fully back-compat.
+            if (t.Annotations is { } ann)
+            {
+                entry["annotations"] = new JsonObject
+                {
+                    ["readOnlyHint"] = ann.ReadOnly,
+                    ["destructiveHint"] = ann.Destructive,
+                    ["idempotentHint"] = ann.Idempotent,
+                    ["openWorldHint"] = ann.OpenWorld,
+                };
+            }
+            tools.Add(entry);
         }
         return BuildSuccess(id, new JsonObject { ["tools"] = tools });
     }
@@ -161,7 +191,17 @@ public sealed class McpServer
 
         var tool = _registry.Find(name);
         if (tool is null)
-            return BuildError(id, -32602, $"Unknown tool: {name}");
+        {
+            // Did-you-mean: agents typo tool names ("symbol.search", "graph.caller")
+            // or carry stale names across CodeMap upgrades. A Levenshtein-based
+            // closest match resolves both without forcing an extra tools/list round-trip.
+            var registered = _registry.GetAll().Select(t => t.Name).ToList();
+            var closest = Handlers.HandlerHelpers.ClosestName(name, registered);
+            var msg = closest is not null
+                ? $"Unknown tool: {name}. Did you mean: {closest}?"
+                : $"Unknown tool: {name}. Call tools/list to see the {registered.Count} registered tools.";
+            return BuildError(id, -32602, msg);
+        }
 
         var arguments = @params?["arguments"] as JsonObject;
         var toolResult = await tool.Handler(arguments, ct).ConfigureAwait(false);
