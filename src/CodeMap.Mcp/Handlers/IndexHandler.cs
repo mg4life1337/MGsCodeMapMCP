@@ -1,5 +1,6 @@
 namespace CodeMap.Mcp.Handlers;
 
+using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using CodeMap.Core.Errors;
@@ -35,6 +36,8 @@ using Microsoft.Extensions.Logging;
 /// </remarks>
 public sealed class IndexHandler
 {
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> IndexLocks =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly IGitService _git;
     private readonly IRoslynCompiler _compiler;
     private readonly ISymbolStore _store;
@@ -257,11 +260,33 @@ public sealed class IndexHandler
         }
     }
 
-    internal async Task<ToolCallResult> HandleAsync(JsonObject? args, CancellationToken ct)
+    public async Task<ToolCallResult> HandleAsync(JsonObject? args, CancellationToken ct)
     {
         var repoPath = args?["repo_path"]?.GetValue<string>();
         var solutionPath = args?["solution_path"]?.GetValue<string>();
+        var requestedSolutionId = args?["solution_id"]?.GetValue<string>();
         if (string.IsNullOrEmpty(repoPath)) return Error("repo_path is required");
+
+        if (string.IsNullOrWhiteSpace(solutionPath))
+        {
+            var discovered = DiscoverSolutionPaths(repoPath);
+            if (!string.IsNullOrWhiteSpace(requestedSolutionId))
+            {
+                discovered = discovered
+                    .Where(path => string.Equals(
+                        SolutionId.FromPath(repoPath, path).Value,
+                        requestedSolutionId,
+                        StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                if (discovered.Count == 0)
+                    return Error($"Unknown solution_id '{requestedSolutionId}' in {repoPath}.");
+            }
+            if (discovered.Count > 1)
+            {
+                return AmbiguousSolutions(repoPath, discovered);
+            }
+            solutionPath = discovered.SingleOrDefault();
+        }
 
         // Auto-discover solution if not provided or not found
         var resolved = DiscoverSolutionPath(repoPath, solutionPath);
@@ -276,6 +301,21 @@ public sealed class IndexHandler
         try
         {
             var repoId = await _git.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+            var solutionId = SolutionId.FromPath(repoPath!, solutionPath);
+            if (!string.IsNullOrWhiteSpace(requestedSolutionId) &&
+                !string.Equals(requestedSolutionId, solutionId.Value, StringComparison.OrdinalIgnoreCase))
+            {
+                return Error(
+                    $"solution_id '{requestedSolutionId}' does not match solution_path " +
+                    $"'{solutionPath}' (expected '{solutionId.Value}').");
+            }
+            var solutionRelativePath = SolutionId.GetRepositoryRelativePath(repoPath!, solutionPath);
+            var solutionRegistration = new SolutionRegistration(
+                solutionId,
+                solutionRelativePath,
+                Path.GetFullPath(solutionPath));
+            _repoRegistry.RegisterSolution(repoPath!, solutionRegistration);
+            var storageRepoId = SolutionScope.ToStorageRepoId(repoId, solutionId);
             CommitSha commitSha;
             var commitShaStr = args?["commit_sha"]?.GetValue<string>();
             if (!string.IsNullOrEmpty(commitShaStr))
@@ -297,28 +337,38 @@ public sealed class IndexHandler
             else
                 commitSha = await _git.GetCurrentCommitAsync(repoPath!, ct).ConfigureAwait(false);
 
+            var lockKey = $"{storageRepoId.Value}|{commitSha.Value}";
+            var indexLock = IndexLocks.GetOrAdd(lockKey, _ => new SemaphoreSlim(1, 1));
+            await indexLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+
             // Step 1: Check local (existing behavior)
-            var exists = await _store.BaselineExistsAsync(repoId, commitSha, ct).ConfigureAwait(false);
+            var exists = await _store.BaselineExistsAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
             if (exists)
             {
                 _logger.LogInformation("index.ensure_baseline: baseline already exists for {Sha}", commitSha.Value[..8]);
                 _repoRegistry.Register(repoPath!);
-                var skipped = new EnsureBaselineResponse(commitSha, AlreadyExisted: true, Stats: null);
+                var skipped = new EnsureBaselineResponse(
+                    commitSha, solutionId, solutionRelativePath,
+                    AlreadyExisted: true, Stats: null);
                 return new ToolCallResult(JsonSerializer.Serialize(skipped, CodeMapJsonOptions.Default));
             }
 
             // Step 2: Check shared cache
-            var pulledPath = await _cache.PullAsync(repoId, commitSha, ct).ConfigureAwait(false);
+            var pulledPath = await _cache.PullAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
             if (pulledPath is not null)
             {
                 // Verify the pulled DB is now available locally
-                var pulledExists = await _store.BaselineExistsAsync(repoId, commitSha, ct).ConfigureAwait(false);
+                var pulledExists = await _store.BaselineExistsAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
                 if (pulledExists)
                 {
                     _logger.LogInformation(
                         "index.ensure_baseline: baseline {Sha} pulled from shared cache", commitSha.Value[..8]);
                     _repoRegistry.Register(repoPath!);
-                    var cached = new EnsureBaselineResponse(commitSha, AlreadyExisted: true, Stats: null, FromCache: true);
+                    var cached = new EnsureBaselineResponse(
+                        commitSha, solutionId, solutionRelativePath,
+                        AlreadyExisted: true, Stats: null, FromCache: true);
                     return new ToolCallResult(JsonSerializer.Serialize(cached, CodeMapJsonOptions.Default));
                 }
             }
@@ -333,7 +383,7 @@ public sealed class IndexHandler
                     [solutionPath]).Message);
 
             // Store with repoRootPath (ADR-012)
-            await _store.CreateBaselineAsync(repoId, commitSha, compilationResult, repoPath, ct).ConfigureAwait(false);
+            await _store.CreateBaselineAsync(storageRepoId, commitSha, compilationResult, repoPath, ct).ConfigureAwait(false);
 
             _logger.LogInformation(
                 "index.ensure_baseline: indexed {Symbols} symbols, {Refs} refs in {Ms:F1}ms",
@@ -342,11 +392,18 @@ public sealed class IndexHandler
                 compilationResult.Stats.ElapsedSeconds * 1000);
 
             // Step 4: Push to shared cache — fire-and-forget for errors
-            await _cache.PushAsync(repoId, commitSha, ct).ConfigureAwait(false);
+            await _cache.PushAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
 
             _repoRegistry.Register(repoPath!);
-            var response = new EnsureBaselineResponse(commitSha, AlreadyExisted: false, Stats: compilationResult.Stats);
+            var response = new EnsureBaselineResponse(
+                commitSha, solutionId, solutionRelativePath,
+                AlreadyExisted: false, Stats: compilationResult.Stats);
             return new ToolCallResult(JsonSerializer.Serialize(response, CodeMapJsonOptions.Default));
+            }
+            finally
+            {
+                indexLock.Release();
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -415,6 +472,44 @@ public sealed class IndexHandler
         return null;
     }
 
+    /// <summary>Recursively discovers solution files while pruning generated/vendor directories.</summary>
+    public static IReadOnlyList<string> DiscoverSolutionPaths(string repoPath)
+    {
+        if (!Directory.Exists(repoPath)) return [];
+        var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "bin", "obj", ".git", ".vs", "packages", ".codemap", ".codex",
+        };
+        var results = new List<string>();
+        var pending = new Stack<string>();
+        pending.Push(Path.GetFullPath(repoPath));
+        while (pending.Count > 0)
+        {
+            var directory = pending.Pop();
+            try
+            {
+                results.AddRange(Directory.GetFiles(directory, "*.slnx", SearchOption.TopDirectoryOnly));
+                results.AddRange(Directory.GetFiles(directory, "*.sln", SearchOption.TopDirectoryOnly));
+                foreach (var child in Directory.GetDirectories(directory))
+                    if (!excluded.Contains(Path.GetFileName(child)))
+                        pending.Push(child);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // A single inaccessible subtree must not prevent other solutions from being discovered.
+            }
+        }
+        return results
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .GroupBy(
+                path => Path.Combine(Path.GetDirectoryName(path)!, Path.GetFileNameWithoutExtension(path)),
+                StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.FirstOrDefault(path =>
+                Path.GetExtension(path).Equals(".slnx", StringComparison.OrdinalIgnoreCase)) ?? group.First())
+            .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
     private static string[] ListProjectFiles(string directory) =>
         [
             .. Directory.GetFiles(directory, "*.csproj", SearchOption.TopDirectoryOnly),
@@ -428,10 +523,30 @@ public sealed class IndexHandler
             CodeMapJsonOptions.Default),
             IsError: true);
 
+    private static ToolCallResult AmbiguousSolutions(
+        string repoPath,
+        IReadOnlyList<string> solutions)
+    {
+        var available = solutions.Select(path => new
+        {
+            solution_id = SolutionId.FromPath(repoPath, path).Value,
+            solution_path = SolutionId.GetRepositoryRelativePath(repoPath, path),
+        }).ToList();
+        var error = new CodeMapError(
+            "AMBIGUOUS_SOLUTION",
+            $"Repository contains {available.Count} solutions. Pass solution_path or solution_id.",
+            new Dictionary<string, object> { ["available_solutions"] = available });
+        return new ToolCallResult(
+            JsonSerializer.Serialize(error, CodeMapJsonOptions.Default),
+            IsError: true);
+    }
+
     // ── Response type ──────────────────────────────────────────────────────────
 
     private record EnsureBaselineResponse(
         CommitSha CommitSha,
+        SolutionId SolutionId,
+        string SolutionPath,
         bool AlreadyExisted,
         IndexStats? Stats,
         bool FromCache = false);

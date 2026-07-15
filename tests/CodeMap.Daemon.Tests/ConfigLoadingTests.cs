@@ -1,16 +1,9 @@
 namespace CodeMap.Daemon.Tests;
 
-using System.Text.Json;
 using CodeMap.Core.Models;
 using FluentAssertions;
-using Microsoft.Extensions.Logging;
 
-/// <summary>
-/// Tests for config.json loading logic. Tests are self-contained and do not
-/// start the MCP server — they test the static LoadConfig pattern via direct
-/// JSON deserialization matching Program.cs behavior.
-/// </summary>
-public class ConfigLoadingTests : IDisposable
+public sealed class ConfigLoadingTests : IDisposable
 {
     private readonly string _tempDir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
 
@@ -21,109 +14,107 @@ public class ConfigLoadingTests : IDisposable
         try { Directory.Delete(_tempDir, recursive: true); } catch { }
     }
 
-    private string ConfigPath => Path.Combine(_tempDir, "config.json");
-
-    private static CodeMapConfig LoadConfig(string configPath)
+    [Fact]
+    public void Resolve_MissingConfig_UsesExecutableRelativeDefaults()
     {
-        if (!File.Exists(configPath))
-            return new CodeMapConfig();
-        try
-        {
-            var json = File.ReadAllText(configPath);
-            return JsonSerializer.Deserialize<CodeMapConfig>(json,
-                new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true,
-                    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
-                })
-                ?? new CodeMapConfig();
-        }
-        catch { return new CodeMapConfig(); }
+        var result = RuntimeConfiguration.Resolve([], _tempDir, _ => null);
+
+        result.ConfigPath.Should().Be(Path.Combine(_tempDir, "codemap.json"));
+        result.DataDirectory.Should().Be(Path.Combine(_tempDir, "data"));
+        result.LogDirectory.Should().Be(Path.Combine(_tempDir, "logs"));
+        Directory.Exists(result.DataDirectory).Should().BeTrue();
+        Directory.Exists(result.LogDirectory).Should().BeTrue();
     }
 
     [Fact]
-    public void LoadConfig_ValidFile_ParsesCorrectly()
+    public void Resolve_CamelCaseConfig_ResolvesRelativeToConfigFile()
     {
-        File.WriteAllText(ConfigPath, """
+        var configDir = Path.Combine(_tempDir, "config");
+        Directory.CreateDirectory(configDir);
+        var configPath = Path.Combine(configDir, "custom.json");
+        File.WriteAllText(configPath, """
             {
-              "log_level": "Debug",
-              "shared_cache_dir": "/tmp/cache"
+              "dataDirectory": ".\\portable-data",
+              "logDirectory": ".\\portable-logs",
+              "logLevel": "Debug",
+              "msBuildPath": ".\\msbuild"
             }
             """);
 
-        var config = LoadConfig(ConfigPath);
+        var result = RuntimeConfiguration.Resolve(
+            ["--config", configPath], _tempDir, _ => null);
 
-        config.LogLevel.Should().Be("Debug");
-        config.SharedCacheDir.Should().Be("/tmp/cache");
+        result.DataDirectory.Should().Be(Path.Combine(configDir, "portable-data"));
+        result.LogDirectory.Should().Be(Path.Combine(configDir, "portable-logs"));
+        result.MsBuildPath.Should().Be(Path.Combine(configDir, "msbuild"));
+        result.Config.LogLevel.Should().Be("Debug");
     }
 
     [Fact]
-    public void LoadConfig_MissingFile_ReturnsDefaults()
+    public void Resolve_CommandLineOverridesEnvironmentAndConfig()
     {
-        var config = LoadConfig(Path.Combine(_tempDir, "nonexistent.json"));
+        File.WriteAllText(Path.Combine(_tempDir, "codemap.json"), """
+            { "dataDirectory": "config-data", "logDirectory": "config-logs" }
+            """);
+        var environment = new Dictionary<string, string>
+        {
+            ["CODEMAP_DATA_DIR"] = "env-data",
+            ["CODEMAP_LOG_DIR"] = "env-logs",
+        };
 
-        config.LogLevel.Should().Be("Information");
-        config.SharedCacheDir.Should().BeNull();
+        var result = RuntimeConfiguration.Resolve(
+            ["--data-dir", "cli-data", "--log-dir=cli-logs"],
+            _tempDir,
+            name => environment.GetValueOrDefault(name));
+
+        result.DataDirectory.Should().Be(Path.Combine(_tempDir, "cli-data"));
+        result.LogDirectory.Should().Be(Path.Combine(_tempDir, "cli-logs"));
     }
 
     [Fact]
-    public void LoadConfig_CorruptFile_ReturnsDefaults()
+    public void Resolve_EnvironmentOverridesConfigAndIsExecutableRelative()
     {
-        File.WriteAllText(ConfigPath, "{{{{ not valid json }}}}");
+        File.WriteAllText(Path.Combine(_tempDir, "codemap.json"), """
+            { "dataDirectory": "config-data", "logDirectory": "config-logs" }
+            """);
 
-        var act = () => LoadConfig(ConfigPath);
-        act.Should().NotThrow();
+        var result = RuntimeConfiguration.Resolve(
+            [],
+            _tempDir,
+            name => name switch
+            {
+                "CODEMAP_DATA_DIR" => "env-data",
+                "CODEMAP_LOG_DIR" => "env-logs",
+                _ => null,
+            });
 
-        var config = LoadConfig(ConfigPath);
-        config.LogLevel.Should().Be("Information");
+        result.DataDirectory.Should().Be(Path.Combine(_tempDir, "env-data"));
+        result.LogDirectory.Should().Be(Path.Combine(_tempDir, "env-logs"));
     }
 
     [Fact]
-    public void LoadConfig_EnvVarOverridesConfig()
+    public void LoadConfig_MalformedJson_ReturnsUnderstandableError()
     {
-        File.WriteAllText(ConfigPath, """{"shared_cache_dir": "/config-dir"}""");
-        var config = LoadConfig(ConfigPath);
+        var configPath = Path.Combine(_tempDir, "codemap.json");
+        File.WriteAllText(configPath, "{{not-json}}");
 
-        // Simulate env var override (as done in Program.cs)
-        var envCacheDir = "/env-dir";
-        var effectiveCacheDir = envCacheDir ?? config.SharedCacheDir;
+        var act = () => RuntimeConfiguration.LoadConfig(configPath);
 
-        effectiveCacheDir.Should().Be("/env-dir", "env var wins over config.json");
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage($"*{configPath}*");
     }
 
     [Fact]
-    public void LoadConfig_LogLevelParsing_ReturnsCorrectLevel()
-    {
-        File.WriteAllText(ConfigPath, """{"log_level": "Warning"}""");
-        var config = LoadConfig(ConfigPath);
-
-        var logLevel = Enum.TryParse<LogLevel>(config.LogLevel, ignoreCase: true, out var parsed)
-            ? parsed
-            : LogLevel.Information;
-
-        logLevel.Should().Be(LogLevel.Warning);
-    }
-
-    [Fact]
-    public void LoadConfig_MissingLogLevel_DefaultsToInformation()
-    {
-        File.WriteAllText(ConfigPath, "{}");
-        var config = LoadConfig(ConfigPath);
-
-        var logLevel = Enum.TryParse<LogLevel>(config.LogLevel, ignoreCase: true, out var parsed)
-            ? parsed
-            : LogLevel.Information;
-
-        logLevel.Should().Be(LogLevel.Information);
-    }
-
-    [Fact]
-    public void CodeMapConfig_DefaultRecord_HasExpectedValues()
+    public void CodeMapConfig_DefaultRecord_HasPortableDefaults()
     {
         var config = new CodeMapConfig();
 
         config.LogLevel.Should().Be("Information");
         config.SharedCacheDir.Should().BeNull();
-        config.BudgetOverrides.Should().BeNull();
+        config.DataDirectory.Should().BeNull();
+        config.LogDirectory.Should().BeNull();
+        config.MsBuildPath.Should().BeNull();
+        config.RepositoryRoots.Should().BeNull();
+        config.Repositories.Should().BeNull();
     }
 }

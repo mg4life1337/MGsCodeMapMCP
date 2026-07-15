@@ -123,6 +123,9 @@ public sealed class DiffHandler
         }
 
         var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct);
+        var (storageRepoId, _, solutionError) = HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+        if (solutionError is { } scopeError) return scopeError;
+        repoId = storageRepoId;
 
         // Verify both baselines exist before invoking the differ
         if (!await _symbolStore.BaselineExistsAsync(repoId, fromCommit, ct))

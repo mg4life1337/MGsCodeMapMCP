@@ -15,7 +15,9 @@ public record BaselineInfo(
     DateTimeOffset CreatedAt,
     long SizeBytes,
     bool IsCurrentHead,
-    bool IsActiveWorkspaceBase);
+    bool IsActiveWorkspaceBase,
+    SolutionId? SolutionId = null,
+    string? SolutionPath = null);
 
 /// <summary>
 /// Response for the <c>index.list_baselines</c> MCP tool.

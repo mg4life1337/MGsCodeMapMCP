@@ -6,7 +6,8 @@ using CodeMap.Core.Types;
 
 /// <summary>
 /// IBaselineScanner implementation for the v2 custom storage engine.
-/// Scans <c>{storeBaseDir}/{repoId}/baselines/{commitSha}/</c> directories.
+/// Scans legacy <c>{repoId}/baselines/{commitSha}</c> and solution-scoped
+/// <c>{repoId}/solutions/{solutionId}/baselines/{commitSha}</c> directories.
 /// Replaces the SQLite-based BaselineDbFactory from CodeMap.Storage.
 /// </summary>
 public sealed class EngineBaselineScanner : IBaselineScanner
@@ -29,37 +30,53 @@ public sealed class EngineBaselineScanner : IBaselineScanner
         ct.ThrowIfCancellationRequested();
 
         var baselines = new List<BaselineInfo>();
-        var baselinesDir = Path.Combine(_storeBaseDir, SanitizeRepoId(repoId.Value), "baselines");
+        var repoDir = Path.Combine(_storeBaseDir, SanitizeRepoId(repoId.Value));
+        var roots = new List<(string Directory, SolutionId? SolutionId)>();
+        var legacyRoot = Path.Combine(repoDir, "baselines");
+        if (Directory.Exists(legacyRoot)) roots.Add((legacyRoot, null));
 
-        if (!Directory.Exists(baselinesDir))
-            return Task.FromResult<IReadOnlyList<BaselineInfo>>([]);
-
-        foreach (var dir in Directory.GetDirectories(baselinesDir))
+        var solutionsRoot = Path.Combine(repoDir, "solutions");
+        if (Directory.Exists(solutionsRoot))
         {
-            ct.ThrowIfCancellationRequested();
-
-            var sha = Path.GetFileName(dir);
-            if (sha.Length != 40 || !IsHexString(sha)) continue;
-
-            var manifestPath = Path.Combine(dir, "manifest.json");
-            var manifest = ManifestWriter.Read(manifestPath);
-            if (manifest is null) continue;
-
-            long sizeBytes = 0;
-            try
+            foreach (var solutionDir in Directory.GetDirectories(solutionsRoot))
             {
-                foreach (var file in Directory.GetFiles(dir))
-                    sizeBytes += new FileInfo(file).Length;
+                var id = Path.GetFileName(solutionDir);
+                if (string.IsNullOrWhiteSpace(id)) continue;
+                var root = Path.Combine(solutionDir, "baselines");
+                if (Directory.Exists(root)) roots.Add((root, SolutionId.From(id)));
             }
-            catch { /* best-effort */ }
+        }
 
-            baselines.Add(new BaselineInfo(
-                CommitSha: CommitSha.From(sha.ToLowerInvariant()),
-                CreatedAt: manifest.CreatedAt,
-                SizeBytes: sizeBytes,
-                IsCurrentHead: false,        // Caller enriches
-                IsActiveWorkspaceBase: false  // Caller enriches
-            ));
+        foreach (var root in roots)
+        {
+            foreach (var dir in Directory.GetDirectories(root.Directory))
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var sha = Path.GetFileName(dir);
+                if (sha.Length != 40 || !IsHexString(sha)) continue;
+
+                var manifestPath = Path.Combine(dir, "manifest.json");
+                var manifest = ManifestWriter.Read(manifestPath);
+                if (manifest is null) continue;
+
+                long sizeBytes = 0;
+                try
+                {
+                    foreach (var file in Directory.GetFiles(dir, "*", SearchOption.AllDirectories))
+                        sizeBytes += new FileInfo(file).Length;
+                }
+                catch { /* best-effort */ }
+
+                baselines.Add(new BaselineInfo(
+                    CommitSha: CommitSha.From(sha.ToLowerInvariant()),
+                    CreatedAt: manifest.CreatedAt,
+                    SizeBytes: sizeBytes,
+                    IsCurrentHead: false,
+                    IsActiveWorkspaceBase: false,
+                    SolutionId: root.SolutionId,
+                    SolutionPath: manifest.SolutionPath));
+            }
         }
 
         return Task.FromResult<IReadOnlyList<BaselineInfo>>(
@@ -116,13 +133,13 @@ public sealed class EngineBaselineScanner : IBaselineScanner
             candidates = candidates.Where(b => b.CreatedAt < cutoff).ToList();
         }
 
-        var keepShas = baselines
-            .OrderByDescending(b => b.CreatedAt)
-            .Take(keepCount)
-            .Select(b => b.CommitSha.Value)
+        var keepKeys = baselines
+            .GroupBy(b => b.SolutionId?.Value ?? string.Empty, StringComparer.OrdinalIgnoreCase)
+            .SelectMany(group => group.OrderByDescending(b => b.CreatedAt).Take(keepCount))
+            .Select(BaselineKey)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-        candidates = candidates.Where(b => !keepShas.Contains(b.CommitSha.Value)).ToList();
+        candidates = candidates.Where(b => !keepKeys.Contains(BaselineKey(b))).ToList();
 
         long bytesReclaimed = 0;
         var removed = new List<CommitSha>();
@@ -131,8 +148,7 @@ public sealed class EngineBaselineScanner : IBaselineScanner
         {
             foreach (var baseline in candidates)
             {
-                var dir = Path.Combine(
-                    _storeBaseDir, SanitizeRepoId(repoId.Value), "baselines", baseline.CommitSha.Value);
+                var dir = GetBaselineDirectory(repoId, baseline);
                 try
                 {
                     Directory.Delete(dir, recursive: true);
@@ -149,9 +165,12 @@ public sealed class EngineBaselineScanner : IBaselineScanner
             removed = candidates.Select(b => b.CommitSha).ToList();
         }
 
-        var removedSet = removed.Select(c => c.Value).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var removedKeys = candidates
+            .Where(b => removed.Any(c => c == b.CommitSha))
+            .Select(BaselineKey)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var kept = baselines
-            .Where(b => !removedSet.Contains(b.CommitSha.Value))
+            .Where(b => !removedKeys.Contains(BaselineKey(b)))
             .Select(b => b.CommitSha)
             .ToList();
 
@@ -165,6 +184,17 @@ public sealed class EngineBaselineScanner : IBaselineScanner
                 return false;
         return true;
     }
+
+    private string GetBaselineDirectory(RepoId repoId, BaselineInfo baseline)
+    {
+        var repoDir = Path.Combine(_storeBaseDir, SanitizeRepoId(repoId.Value));
+        return baseline.SolutionId is { } solutionId
+            ? Path.Combine(repoDir, "solutions", solutionId.Value, "baselines", baseline.CommitSha.Value)
+            : Path.Combine(repoDir, "baselines", baseline.CommitSha.Value);
+    }
+
+    private static string BaselineKey(BaselineInfo baseline) =>
+        $"{baseline.SolutionId?.Value ?? string.Empty}:{baseline.CommitSha.Value}";
 
     private static string SanitizeRepoId(string repoId)
     {

@@ -1,9 +1,7 @@
 namespace CodeMap.Daemon;
 
 using System.Reflection;
-using System.Text.Json;
 using CodeMap.Core.Interfaces;
-using CodeMap.Core.Models;
 using CodeMap.Daemon.Logging;
 using CodeMap.Mcp;
 using CodeMap.Roslyn;
@@ -31,17 +29,23 @@ internal static class Program
             var version = typeof(Program).Assembly
                 .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
                 ?.InformationalVersion ?? "1.0.0";
-            Console.WriteLine($"codemap-mcp {version}");
+            Console.WriteLine($"MGsCodeMapMCP {version} (upstream CodeMap 2.8.0)");
             return;
         }
 
-        // Resolve ~/.codemap directory
-        var codeMapDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".codemap");
+        RuntimeConfiguration runtime;
+        try
+        {
+            runtime = RuntimeConfiguration.Resolve(args);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+        {
+            Console.Error.WriteLine($"MGsCodeMapMCP startup failed: {ex.Message}");
+            Environment.ExitCode = 2;
+            return;
+        }
 
-        // Load config.json (missing or corrupt → defaults)
-        var config = LoadConfig(Path.Combine(codeMapDir, "config.json"));
+        var config = runtime.Config;
 
         // Resolve log level: config.json, then default
         var logLevel = Enum.TryParse<LogLevel>(config.LogLevel, ignoreCase: true, out var parsed)
@@ -49,23 +53,38 @@ internal static class Program
             : LogLevel.Information;
 
         // MSBuild registration MUST happen before any Roslyn workspace use.
-        MsBuildInitializer.EnsureRegistered();
+        try
+        {
+            MsBuildInitializer.EnsureRegistered(runtime.MsBuildPath, Console.Error.WriteLine);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException)
+        {
+            Console.Error.WriteLine($"MGsCodeMapMCP MSBuild initialization failed: {ex.Message}");
+            Environment.ExitCode = 3;
+            return;
+        }
 
         var builder = Host.CreateDefaultBuilder(args);
 
         // Logging: stderr (real-time) + structured JSON file (persistent)
-        var logsDir = Path.Combine(codeMapDir, "logs");
         builder.ConfigureLogging(logging =>
         {
             logging.ClearProviders();
             logging.SetMinimumLevel(logLevel);
             logging.AddConsole(options =>
                 options.LogToStandardErrorThreshold = LogLevel.Trace);
-            logging.AddProvider(new FileLoggerProvider(logsDir, logLevel));
+            logging.AddProvider(new FileLoggerProvider(runtime.LogDirectory, logLevel));
         });
 
         builder.ConfigureServices(services =>
-            services.AddCodeMapServices(baseDir: "~/.codemap"));
+        {
+            services.AddSingleton(runtime);
+            services.AddCodeMapServices(
+                baseDir: runtime.DataDirectory,
+                sharedCacheDir: Environment.GetEnvironmentVariable("CODEMAP_CACHE_DIR")
+                    ?? config.SharedCacheDir);
+            services.AddHostedService<RepositorySupervisor>();
+        });
 
         var host = builder.Build();
 
@@ -81,36 +100,18 @@ internal static class Program
         using var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-        await mcpServer.RunAsync(
-            Console.OpenStandardInput(),
-            Console.OpenStandardOutput(),
-            cts.Token);
-    }
-
-    /// <summary>
-    /// Loads <c>config.json</c> from <paramref name="configPath"/>.
-    /// Returns defaults if the file is missing or contains invalid JSON.
-    /// </summary>
-    private static CodeMapConfig LoadConfig(string configPath)
-    {
-        if (!File.Exists(configPath))
-            return new CodeMapConfig();
-
+        await host.StartAsync(cts.Token).ConfigureAwait(false);
         try
         {
-            var json = File.ReadAllText(configPath);
-            return JsonSerializer.Deserialize<CodeMapConfig>(json,
-                new JsonSerializerOptions
-                {
-                    PropertyNameCaseInsensitive = true,
-                    PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
-                })
-                ?? new CodeMapConfig();
+            await mcpServer.RunAsync(
+                Console.OpenStandardInput(),
+                Console.OpenStandardOutput(),
+                cts.Token).ConfigureAwait(false);
         }
-        catch
+        finally
         {
-            // Corrupt config — use defaults
-            return new CodeMapConfig();
+            await host.StopAsync(CancellationToken.None).ConfigureAwait(false);
         }
     }
+
 }

@@ -98,10 +98,23 @@ public sealed class EngineBaselineCacheManager : IBaselineCacheManager
     }
 
     private string GetLocalBaselineDir(RepoId repoId, CommitSha commitSha)
-        => Path.Combine(_storeBaseDir, SanitizeSegment(repoId.Value), "baselines", commitSha.Value);
+        => Path.Combine(GetScopedRoot(_storeBaseDir, repoId), "baselines", commitSha.Value);
 
     private string GetCacheBaselineDir(RepoId repoId, CommitSha commitSha)
-        => Path.Combine(_sharedCacheDir!, SanitizeSegment(repoId.Value), commitSha.Value);
+        => Path.Combine(GetScopedRoot(_sharedCacheDir!, repoId), "baselines", commitSha.Value);
+
+    private static string GetScopedRoot(string root, RepoId repoId)
+    {
+        if (SolutionScope.TryParse(repoId, out var publicRepoId, out var solutionId))
+        {
+            return Path.Combine(
+                root,
+                SanitizeSegment(publicRepoId.Value),
+                "solutions",
+                SanitizeSegment(solutionId.Value));
+        }
+        return Path.Combine(root, SanitizeSegment(repoId.Value));
+    }
 
     private static async Task CopyDirectoryAsync(string source, string dest, CancellationToken ct)
     {

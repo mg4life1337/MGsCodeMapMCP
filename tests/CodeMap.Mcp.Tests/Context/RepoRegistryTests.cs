@@ -1,6 +1,7 @@
 namespace CodeMap.Mcp.Tests.Context;
 
 using CodeMap.Core.Errors;
+using CodeMap.Core.Types;
 using CodeMap.Mcp.Context;
 using FluentAssertions;
 
@@ -100,5 +101,57 @@ public sealed class RepoRegistryTests
         var result = r.Resolve("/c");
         result.IsSuccess.Should().BeTrue();
         result.RepoPath.Should().Be("/c");
+    }
+
+    [Fact]
+    public void ResolveSolution_SingleKnownSolution_AutoSelectsIt()
+    {
+        var repo = Path.Combine(Path.GetTempPath(), "repo-single");
+        var solution = Registration(repo, "App.sln");
+        var registry = new RepoRegistry();
+        registry.RegisterSolution(repo, solution);
+
+        var result = registry.ResolveSolution(repo, null, null);
+
+        result.IsSuccess.Should().BeTrue();
+        result.SolutionId.Should().Be(solution.SolutionId);
+    }
+
+    [Fact]
+    public void ResolveSolution_MultipleKnownSolutions_ReturnsStructuredAmbiguity()
+    {
+        var repo = Path.Combine(Path.GetTempPath(), "repo-many");
+        var registry = new RepoRegistry();
+        registry.RegisterSolution(repo, Registration(repo, "src/One.sln"));
+        registry.RegisterSolution(repo, Registration(repo, "src/Two.sln"));
+
+        var result = registry.ResolveSolution(repo, null, null);
+
+        result.Error!.Code.Should().Be("AMBIGUOUS_SOLUTION");
+        result.Error.Details.Should().ContainKey("available_solutions");
+    }
+
+    [Fact]
+    public void ResolveSolution_ExplicitId_SelectsMatchingSolution()
+    {
+        var repo = Path.Combine(Path.GetTempPath(), "repo-explicit");
+        var expected = Registration(repo, "Two.sln");
+        var registry = new RepoRegistry();
+        registry.RegisterSolution(repo, Registration(repo, "One.sln"));
+        registry.RegisterSolution(repo, expected);
+
+        var result = registry.ResolveSolution(repo, expected.SolutionId.Value, null);
+
+        result.SolutionId.Should().Be(expected.SolutionId);
+        result.Registration.Should().Be(expected);
+    }
+
+    private static SolutionRegistration Registration(string repo, string relativePath)
+    {
+        var absolute = Path.GetFullPath(Path.Combine(repo, relativePath));
+        return new SolutionRegistration(
+            SolutionId.FromPath(repo, absolute),
+            relativePath.Replace('\\', '/'),
+            absolute);
     }
 }

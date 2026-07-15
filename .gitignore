@@ -98,3 +98,6 @@ BenchmarkDotNet.Artifacts/
 packages.lock.json
 *.DotSettings.user
 log-debug/
+/data/
+/logs/
+/codemap.json

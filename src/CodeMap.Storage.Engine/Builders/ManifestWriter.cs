@@ -33,6 +33,8 @@ internal static class ManifestWriter
             FactCount = manifest.FactCount,
             NStringIds = manifest.NStringIds,
             RepoRootPath = manifest.RepoRootPath,
+            SolutionId = manifest.SolutionId,
+            SolutionPath = manifest.SolutionPath,
             ProjectDiagnostics = manifest.ProjectDiagnostics?.Select(d => new ProjectDiagnosticDto
             {
                 ProjectName = d.ProjectName, Compiled = d.Compiled,
@@ -71,7 +73,9 @@ internal static class ManifestWriter
             ?? new Dictionary<string, SegmentInfo>(),
             dto.RepoRootPath,
             dto.ProjectDiagnostics?.Select(d => new ProjectDiagnostic(
-                d.ProjectName ?? "", d.Compiled, d.SymbolCount, d.ReferenceCount)).ToList());
+                d.ProjectName ?? "", d.Compiled, d.SymbolCount, d.ReferenceCount)).ToList(),
+            dto.SolutionId,
+            dto.SolutionPath);
     }
 
     private sealed class ManifestDto
@@ -88,6 +92,8 @@ internal static class ManifestWriter
         public int FactCount { get; set; }
         public int NStringIds { get; set; }
         public string? RepoRootPath { get; set; }
+        public string? SolutionId { get; set; }
+        public string? SolutionPath { get; set; }
         public List<ProjectDiagnosticDto>? ProjectDiagnostics { get; set; }
         public Dictionary<string, SegmentInfoDto>? Segments { get; set; }
     }

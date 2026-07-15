@@ -1,46 +1,174 @@
-<!-- mcp-name: io.github.bbajt/codemap-mcp -->
-# CodeMap — Turn Your AI Agent Into a Semantic Dragon
+# MGsCodeMapMCP
 
-[![NuGet](https://img.shields.io/nuget/v/codemap-mcp.svg?label=nuget&color=blue)](https://www.nuget.org/packages/codemap-mcp)
-[![NuGet Downloads](https://img.shields.io/nuget/dt/codemap-mcp.svg?color=blue)](https://www.nuget.org/packages/codemap-mcp)
+[![Upstream](https://img.shields.io/badge/upstream-bbajt%2Fcsharp--code--map-1f6feb)](https://github.com/bbajt/csharp-code-map)
 [![.NET](https://img.shields.io/badge/.NET-10-512BD4)](#)
 [![MCP Server](https://img.shields.io/badge/MCP-server-1f6feb)](#)
+[![Windows](https://img.shields.io/badge/portable-win--x64-0078D4)](#portable-windows-installation)
+[![VS 2026](https://img.shields.io/badge/Visual%20Studio-2026-5C2D91)](#visual-studio-and-msbuild)
 [![C%23](https://img.shields.io/badge/C%23-Roslyn-239120)](#)
 [![VB.NET](https://img.shields.io/badge/VB.NET-Roslyn-512BD4)](#)
 [![F%23](https://img.shields.io/badge/F%23-FCS-378BBA)](#)
-[![GitHub Stars](https://img.shields.io/github/stars/bbajt/csharp-code-map?style=social)](https://github.com/bbajt/csharp-code-map/stargazers)
-[![License](https://img.shields.io/badge/license-Non--Commercial-orange.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Non--Commercial-orange.svg)](LICENSE.MD)
 
-> *Stop feeding your AI agent raw source files. Give it a semantic index instead.*
+> [!IMPORTANT]
+> **Unofficial public fork.** MGsCodeMapMCP is derived from
+> [bbajt/csharp-code-map](https://github.com/bbajt/csharp-code-map) and is not an
+> official release of, or supported by, the original author. The original
+> `LICENSE.MD` remains unchanged; this fork is distributed under the same
+> non-commercial open-source terms.
 
-CodeMap is a **Roslyn-powered MCP server** that lets AI agents navigate **C#, VB.NET, and F#** codebases by **symbol, call graph, and architectural fact** — instead of brute-reading thousands of lines of source code. One tool call. Precise answer. No context flood.
+This fork keeps CodeMap's Roslyn-powered semantic navigation and adds:
 
-**Average token savings: 90%+** versus reading files directly.
+- Visual Studio 2026 and MSBuild 18 support while retaining VS 2022 support.
+- A separate semantic index for every `repository + solution + commit` combination.
+- Multiple `.sln`/`.slnx` files in one Git repository with explicit query routing.
+- Automatic repository/solution discovery and baseline refresh after Git HEAD changes.
+- Portable `data` and `logs` directories beside the executable—never inside analyzed repositories.
+- End-to-end VB.NET multi-solution isolation tests.
 
----
+The upstream overview and tool reference remain below. Fork-specific installation and
+configuration take precedence where they differ from upstream CodeMap 2.8.0.
 
-## Install via Claude Code or manually
+## Portable Windows installation
 
-The fastest way to install is to paste the prompt below into a **Claude Code** shell. Claude will check your environment, install the tool, and register it as an MCP server — no manual steps needed.
+1. Download [`MGsCodeMapMCP-win-x64.zip`](https://github.com/mg4life1337/MGsCodeMapMCP/releases/download/v2.8.0-mgs.1/MGsCodeMapMCP-win-x64.zip), or build the package yourself as described below.
+2. Extract it to a stable writable directory, for example `C:\Tools\MGsCodeMapMCP`.
+3. Copy `codemap.example.json` to `codemap.json` and adjust repository roots or explicit solutions.
+4. Keep Visual Studio 2022/2026 or compatible MSBuild Build Tools installed. The package includes the .NET runtime, but Roslyn still needs MSBuild to evaluate real solutions.
+5. Register the absolute executable path in Codex or another MCP client.
 
-> Check whether .NET 10 SDK is installed by running `dotnet --version`. If the reported version is below 10.0, install it: on Windows run `winget install Microsoft.DotNet.SDK.10`, on macOS/Linux download from https://dotnet.microsoft.com/download/dotnet/10.0. Verify with `dotnet --version` once done. Once .NET 10 is confirmed, install CodeMap: if `codemap-mcp` is not yet installed run `dotnet tool install --global codemap-mcp`, otherwise run `dotnet tool update --global codemap-mcp` to get the latest version. Verify the binary is reachable with `codemap-mcp --version`. Finally, register it as a global MCP server in Claude Code by running `claude mcp add codemap-mcp codemap-mcp --scope user` and confirm it appears in the output of `claude mcp list`.
+Example MCP configuration for Codex:
 
-**Or install manually:**
-
-```bash
-# Install .NET 10 SDK if needed (Windows)
-winget install Microsoft.DotNet.SDK.10
-
-dotnet tool install --global codemap-mcp
-codemap-mcp --version
-claude mcp add codemap-mcp codemap-mcp --scope user
+```json
+{
+  "mcpServers": {
+    "mgs-codemap": {
+      "command": "C:\\Tools\\MGsCodeMapMCP\\CodeMap.Mcp.exe",
+      "args": [
+        "--config",
+        "C:\\Tools\\MGsCodeMapMCP\\codemap.json"
+      ]
+    }
+  }
+}
 ```
 
-Requires **.NET 10** (LTS). If you're working on a C# or VB.NET codebase you almost certainly have it already — check with `dotnet --version`.
+`CodeMap.Mcp.exe` and `CodeMap.Daemon.exe` are equivalent entry points in the
+portable package. MCP uses stdio, so do not start the executable in a separate console.
 
-### Upgrading from v1.x
+### Build the portable package yourself
 
-v2.0.0 uses a new binary storage engine (memory-mapped segments instead of SQLite). Your old `.db` baselines are not auto-migrated — run `index.ensure_baseline` once per repo to rebuild. Old baselines are harmless and can be cleaned with `index.cleanup`. If you need the old engine temporarily, set `CODEMAP_ENGINE=sqlite`.
+From a Visual Studio Developer PowerShell or a shell with .NET 10:
+
+```powershell
+.\scripts\build-portable-win-x64.ps1
+```
+
+Output: `artifacts\release\MGsCodeMapMCP` and a matching ZIP archive.
+
+### Visual Studio and MSBuild
+
+At startup the daemon logs all discovered .NET SDK and Visual Studio MSBuild instances
+and selects the newest compatible instance. Visual Studio 2026/MSBuild 18 is preferred
+when available; VS 2022 remains supported. Override selection without modifying Visual
+Studio by using one of these mechanisms, in priority order:
+
+1. `--msbuild-path "C:\path\to\MSBuild"`
+2. `CODEMAP_MSBUILD_PATH`
+3. `msBuildPath` in `codemap.json`
+
+Verify the fork and upstream version with:
+
+```powershell
+.\CodeMap.Mcp.exe --version
+```
+
+### Portable data locations
+
+Mutable files are never intentionally written into an analyzed repository. Defaults:
+
+```text
+MGsCodeMapMCP\
+  data\
+    repositories\<repo-id>\solutions\<solution-id>\baselines\<commit-sha>\
+  logs\
+```
+
+Data and log overrides are resolved in this order:
+
+1. `--data-dir` / `--log-dir`
+2. `CODEMAP_DATA_DIR` / `CODEMAP_LOG_DIR`
+3. `dataDirectory` / `logDirectory` in `codemap.json`
+4. `data` / `logs` beside the running executable
+
+Relative command-line and environment paths are EXE-relative. Relative configuration
+paths are relative to `codemap.json`, never to the current working directory.
+
+## Multi-repository and multi-solution configuration
+
+```json
+{
+  "dataDirectory": ".\\data",
+  "logDirectory": ".\\logs",
+  "repositoryRoots": [
+    {
+      "path": "D:\\Programming\\GitHub",
+      "discoverGitRepositories": true,
+      "discoverSolutions": true,
+      "autoIndex": true,
+      "watchGitHead": true,
+      "watchIntervalSeconds": 3
+    }
+  ],
+  "repositories": [
+    {
+      "root": "D:\\Programming\\GitHub\\Example\\Product",
+      "solutions": [
+        "src\\Product.Release.sln",
+        "tools\\Product.Tools.slnx"
+      ],
+      "autoIndex": true,
+      "watchGitHead": true
+    }
+  ]
+}
+```
+
+Explicit repository entries take precedence over discovered entries. Generated and tool
+directories including `bin`, `obj`, `.git`, `.vs`, `packages`, `.codemap`, and `.codex`
+are pruned during discovery. A failure in one solution does not stop other solutions.
+
+Every query tool accepts optional `solution_path` or `solution_id`. With one registered
+solution it is selected automatically. With multiple solutions, omitting the selector
+returns `AMBIGUOUS_SOLUTION` with the available IDs and paths; CodeMap never silently
+uses a different solution.
+
+## Updating and rebuilding indexes
+
+- Update an installation by stopping the MCP client, replacing the program/runtime files, preserving `codemap.json`, `data`, and `logs`, then restarting the client.
+- Rebuild a missing solution/commit index with `index.ensure_baseline` plus `repo_path` and `solution_path`.
+- Inspect all solution baselines using `index.list_baselines`.
+- Preview retention cleanup using `index.cleanup` (dry-run is the default), then repeat with `dry_run: false`.
+- Remove every cached solution index for one repository using `index.remove_repo`; this is also dry-run by default.
+- No automatic retention deletion occurs. Branch changes create or reuse a commit-specific baseline.
+
+For source updates:
+
+```powershell
+git fetch upstream
+git checkout main
+git pull --ff-only origin main
+git rebase upstream/main
+dotnet build CodeMap.sln -c Release
+.\scripts\build-portable-win-x64.ps1
+```
+
+Do not overwrite `codemap.json`, `data`, or `logs` when distributing an update.
+
+## About CodeMap
+
+CodeMap lets AI agents navigate C#, VB.NET, and F# codebases by symbol, call graph,
+type hierarchy, and architectural fact instead of repeatedly reading raw source files.
 
 ---
 
@@ -339,11 +467,16 @@ tested against the codebase that implements it.
 
 ---
 
-## Installation
+## Upstream package installation
 
-### .NET Global Tool — NuGet (recommended)
+The NuGet package below belongs to the original upstream CodeMap project and does not
+contain this fork's VS 2026, multi-solution, watcher, or portable-storage changes. Use
+the [portable Windows installation](#portable-windows-installation) for MGsCodeMapMCP.
 
-See the **[Install via Claude Code or manually](#install-via-claude-code-or-manually)** section at the top for the one-paste Claude Code prompt and manual steps.
+### Original CodeMap .NET global tool
+
+See the [original CodeMap repository](https://github.com/bbajt/csharp-code-map) for
+upstream package installation and support information.
 
 > **NuGet package:** [nuget.org/packages/codemap-mcp](https://www.nuget.org/packages/codemap-mcp)
 
@@ -365,15 +498,16 @@ Uses the .NET SDK base image (~800MB) because `MSBuildWorkspace` needs MSBuild a
 
 ## Connect to Your AI Agent
 
-### Claude Code (Claude Desktop / claude.ai)
+### Portable fork
 
-Add to `claude_desktop_config.json`:
+Use the absolute portable executable path in your client's MCP configuration:
 
 ```json
 {
   "mcpServers": {
-    "codemap": {
-      "command": "codemap-mcp"
+    "mgs-codemap": {
+      "command": "C:\\Tools\\MGsCodeMapMCP\\CodeMap.Mcp.exe",
+      "args": ["--config", "C:\\Tools\\MGsCodeMapMCP\\codemap.json"]
     }
   }
 }
@@ -460,13 +594,16 @@ Every response includes:
 - **Overlay revision** — which workspace revision answered the query
 - **Workspace ID** — which workspace context answered (null for committed mode)
 
-Structured logs to `~/.codemap/logs/codemap-{date}.log` (daily rotation, JSON lines).
-Cumulative savings to `~/.codemap/_savings.json` (persists across restarts).
-Config at `~/.codemap/config.json` (log level, cache dir, budget overrides).
+Structured logs are written to the resolved portable `logs` directory as daily JSON-lines
+files. Cumulative savings are stored under the resolved `data` directory. Configuration
+defaults to `codemap.json` beside the executable and can be overridden with `--config`.
 
 ### v2 Data Directory
 
-Baselines are stored in `~/.codemap/store/<repoId>/baselines/<commitSha>/` as binary segment files. Overlays in `~/.codemap/store/overlays/<workspaceId>/`. Use `index.list_baselines` to inspect and `index.cleanup` to reclaim space.
+Baselines are stored under
+`data/repositories/<repoId>/solutions/<solutionId>/baselines/<commitSha>/` as binary
+segment files. Solution-scoped overlays live under the same portable data root. Use
+`index.list_baselines` to inspect and `index.cleanup` to reclaim space.
 
 ---
 

@@ -54,7 +54,9 @@ internal sealed record BaselineManifest(
     int             NStringIds,
     IReadOnlyDictionary<string, SegmentInfo> Segments,
     string?         RepoRootPath = null,
-    IReadOnlyList<Core.Models.ProjectDiagnostic>? ProjectDiagnostics = null);
+    IReadOnlyList<Core.Models.ProjectDiagnostic>? ProjectDiagnostics = null,
+    string?         SolutionId = null,
+    string?         SolutionPath = null);
 
 /// <summary>Per-segment CRC32 checksum entry in the baseline manifest.</summary>
 internal sealed record SegmentInfo(string File, string Crc32Hex);
@@ -70,7 +72,9 @@ internal sealed record BaselineBuildInput(
     IReadOnlyList<ExtractedReference>   References,
     IReadOnlyList<ExtractedFact>        Facts,
     IReadOnlyList<ExtractedTypeRelation> TypeRelations,
-    IReadOnlyList<Core.Models.ProjectDiagnostic>? ProjectDiagnostics = null);
+    IReadOnlyList<Core.Models.ProjectDiagnostic>? ProjectDiagnostics = null,
+    string?                             SolutionId = null,
+    string?                             SolutionPath = null);
 
 /// <summary>Returned by IEngineBaselineBuilder.BuildAsync.</summary>
 internal sealed record BaselineBuildResult(

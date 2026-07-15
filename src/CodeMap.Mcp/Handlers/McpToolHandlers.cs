@@ -435,6 +435,11 @@ public sealed class McpToolHandlers
         string repoPath, JsonObject? args, CancellationToken ct)
     {
         var repoId = await _gitService.GetRepoIdentityAsync(repoPath, ct).ConfigureAwait(false);
+        var (storageRepoId, _, solutionError) =
+            HandlerHelpers.ResolveStorageScope(args, repoPath, repoId, _repoRegistry);
+        if (solutionError is { } scopeError)
+            return Result<RoutingContext, ToolCallResult>.Failure(scopeError);
+        repoId = storageRepoId;
 
         CommitSha sha;
         var commitShaStr = args?["commit_sha"]?.GetValue<string>();

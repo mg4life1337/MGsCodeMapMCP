@@ -76,7 +76,7 @@ public sealed class RoslynCompiler : IRoslynCompiler
         sw.Stop();
 
         var stats = result.Stats with { ElapsedSeconds = sw.Elapsed.TotalSeconds };
-        return result with { Stats = stats };
+        return result with { Stats = stats, SourcePath = Path.GetFullPath(solutionPath) };
     }
 
     /// <inheritdoc/>

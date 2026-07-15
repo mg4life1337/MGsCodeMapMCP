@@ -1,0 +1,35 @@
+{
+  "dataDirectory": ".\\data",
+  "logDirectory": ".\\logs",
+  "logLevel": "Information",
+  "repositoryRoots": [
+    {
+      "path": "D:\\Programming\\GitHub",
+      "discoverGitRepositories": true,
+      "discoverSolutions": true,
+      "autoIndex": true,
+      "watchGitHead": true,
+      "watchIntervalSeconds": 3,
+      "exclude": [
+        "**\\bin\\**",
+        "**\\obj\\**",
+        "**\\.git\\**",
+        "**\\.vs\\**",
+        "**\\packages\\**",
+        "**\\.codemap\\**",
+        "**\\.codex\\**"
+      ]
+    }
+  ],
+  "repositories": [
+    {
+      "root": "D:\\Programming\\GitHub\\Example\\Product",
+      "solutions": [
+        "src\\Product.Release.sln"
+      ],
+      "autoIndex": true,
+      "watchGitHead": true,
+      "watchIntervalSeconds": 3
+    }
+  ]
+}

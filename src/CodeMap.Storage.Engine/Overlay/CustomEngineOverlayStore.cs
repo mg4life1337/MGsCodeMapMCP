@@ -1,6 +1,8 @@
 namespace CodeMap.Storage.Engine;
 
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
 using CodeMap.Core.Enums;
 using CodeMap.Core.Interfaces;
 using CodeMap.Core.Models;
@@ -29,16 +31,17 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task CreateOverlayAsync(RepoId repoId, WorkspaceId workspaceId, CommitSha baselineCommitSha, CancellationToken ct = default)
     {
-        _wsToCommit[workspaceId.Value] = (baselineCommitSha.Value, repoId.Value);
+        var overlayKey = OverlayKey(repoId, workspaceId);
+        _wsToCommit[overlayKey] = (baselineCommitSha.Value, repoId.Value);
 
         var (reader, _) = _symbolStore.GetOrOpenBaseline(repoId.Value, baselineCommitSha.Value);
-        _symbolStore.GetOrCreateOverlay(workspaceId.Value, reader);
+        _symbolStore.GetOrCreateOverlay(overlayKey, reader);
         return Task.CompletedTask;
     }
 
     public async Task ApplyDeltaAsync(RepoId repoId, WorkspaceId workspaceId, OverlayDelta delta, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null || reader == null) return;
 
         using var batch = overlay.BeginBatch();
@@ -143,38 +146,40 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task ResetOverlayAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var found = _wsToCommit.TryGetValue(workspaceId.Value, out var entry);
+        var overlayKey = OverlayKey(repoId, workspaceId);
+        var found = _wsToCommit.TryGetValue(overlayKey, out var entry);
 
-        _symbolStore.DeleteOverlay(workspaceId.Value);
+        _symbolStore.DeleteOverlay(overlayKey);
         if (found)
         {
             var (reader, _) = _symbolStore.GetOrOpenBaseline(entry.RepoId, entry.CommitSha);
-            _symbolStore.GetOrCreateOverlay(workspaceId.Value, reader);
+            _symbolStore.GetOrCreateOverlay(overlayKey, reader);
         }
         return Task.CompletedTask;
     }
 
     public Task DeleteOverlayAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        _symbolStore.DeleteOverlay(workspaceId.Value);
-        _wsToCommit.TryRemove(workspaceId.Value, out _);
+        var overlayKey = OverlayKey(repoId, workspaceId);
+        _symbolStore.DeleteOverlay(overlayKey);
+        _wsToCommit.TryRemove(overlayKey, out _);
         return Task.CompletedTask;
     }
 
     // ── Read ─────────────────────────────────────────────────────────────────
 
     public Task<bool> OverlayExistsAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
-        => Task.FromResult(_symbolStore.OverlayExists(workspaceId.Value));
+        => Task.FromResult(_symbolStore.OverlayExists(OverlayKey(repoId, workspaceId)));
 
     public Task<int> GetRevisionAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var overlay = _symbolStore.TryGetOverlay(workspaceId.Value);
+        var overlay = _symbolStore.TryGetOverlay(OverlayKey(repoId, workspaceId));
         return Task.FromResult(overlay?.Revision ?? 0);
     }
 
     public Task<SymbolCard?> GetOverlaySymbolAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null || reader == null) return Task.FromResult<SymbolCard?>(null);
 
         SymbolRecord? rec;
@@ -197,7 +202,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlyList<SymbolSearchHit>> SearchOverlaySymbolsAsync(RepoId repoId, WorkspaceId workspaceId, string query, SymbolSearchFilters? filters, int limit, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null || reader == null)
             return Task.FromResult<IReadOnlyList<SymbolSearchHit>>([]);
 
@@ -298,7 +303,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         IReadOnlyList<SymbolKind>? kinds, SymbolSearchFilters? filters,
         int limit, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null || reader == null)
             return Task.FromResult<IReadOnlyList<SymbolSearchHit>>([]);
 
@@ -394,7 +399,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlyList<StoredReference>> GetOverlayReferencesAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, RefKind? kind, int limit, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null || reader == null) return Task.FromResult<IReadOnlyList<StoredReference>>([]);
         var intId = ResolveIntId(reader, overlay, symbolId.Value);
         var edges = overlay.GetOverlayIncomingEdges(intId);
@@ -410,7 +415,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlySet<SymbolId>> GetDeletedSymbolIdsAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null || reader == null) return Task.FromResult<IReadOnlySet<SymbolId>>(new HashSet<SymbolId>());
         var result = new HashSet<SymbolId>();
         foreach (var stableId in overlay.Tombstones)
@@ -427,7 +432,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlySet<FilePath>> GetOverlayFilePathsAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var (overlay, _) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, _) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null) return Task.FromResult<IReadOnlySet<FilePath>>(new HashSet<FilePath>());
         var snapshot = overlay.GetFilePathsSnapshot();
         var paths = new HashSet<FilePath>(
@@ -437,7 +442,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlyList<StoredOutgoingReference>> GetOutgoingOverlayReferencesAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, RefKind? kind, int limit, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null || reader == null) return Task.FromResult<IReadOnlyList<StoredOutgoingReference>>([]);
         var intId = ResolveIntId(reader, overlay, symbolId.Value);
         var edges = overlay.GetOverlayOutgoingEdges(intId);
@@ -462,7 +467,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<SymbolCard?> GetSymbolByStableIdAsync(RepoId repoId, WorkspaceId workspaceId, StableId stableId, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null || reader == null) return Task.FromResult<SymbolCard?>(null);
         var rec = overlay.TryGetOverlaySymbol(stableId.Value, out var tombstoned);
         if (rec == null || tombstoned) return Task.FromResult<SymbolCard?>(null);
@@ -474,7 +479,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlyList<StoredFact>> GetOverlayFactsForSymbolAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null || reader == null) return Task.FromResult<IReadOnlyList<StoredFact>>([]);
         var intId = ResolveIntId(reader, overlay, symbolId.Value);
         var facts = overlay.GetOverlayFacts(intId);
@@ -486,7 +491,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<int> GetOverlayFactCountAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var (overlay, _) = GetOverlayAndReader(workspaceId.Value);
+        var (overlay, _) = GetOverlayAndReader(repoId, workspaceId);
         if (overlay == null) return Task.FromResult(0);
         return Task.FromResult(overlay.GetFactCount());
     }
@@ -496,21 +501,30 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task UpgradeOverlayEdgeAsync(RepoId repoId, WorkspaceId workspaceId, EdgeUpgrade upgrade, CancellationToken ct = default)
     {
-        if (!_wsToCommit.TryGetValue(workspaceId.Value, out var entry))
+        if (!_wsToCommit.TryGetValue(OverlayKey(repoId, workspaceId), out var entry))
             return Task.CompletedTask;
         return _symbolStore.UpgradeEdgeAsync(repoId, CommitSha.From(entry.CommitSha), upgrade, ct);
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
-    private (EngineOverlay? Overlay, EngineBaselineReader? Reader) GetOverlayAndReader(string workspaceId)
+    private (EngineOverlay? Overlay, EngineBaselineReader? Reader) GetOverlayAndReader(
+        RepoId repoId,
+        WorkspaceId workspaceId)
     {
-        if (!_wsToCommit.TryGetValue(workspaceId, out var entry))
+        var overlayKey = OverlayKey(repoId, workspaceId);
+        if (!_wsToCommit.TryGetValue(overlayKey, out var entry))
             return (null, null);
 
         var (reader, _) = _symbolStore.GetOrOpenBaseline(entry.RepoId, entry.CommitSha);
-        var overlay = _symbolStore.TryGetOverlay(workspaceId);
+        var overlay = _symbolStore.TryGetOverlay(overlayKey);
         return (overlay, reader);
+    }
+
+    internal static string OverlayKey(RepoId repoId, WorkspaceId workspaceId)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes($"{repoId.Value}\n{workspaceId.Value}"));
+        return $"ovl_{Convert.ToHexString(bytes.AsSpan(0, 16)).ToLowerInvariant()}";
     }
 
     private static int ResolveIntId(EngineBaselineReader reader, EngineOverlay overlay, string symbolId)

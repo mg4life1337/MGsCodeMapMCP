@@ -132,6 +132,11 @@ public sealed class WorkspaceHandler
         try
         {
             var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+            var solutionId = SolutionId.FromPath(repoPath!, solutionPath);
+            var relativeSolutionPath = SolutionId.GetRepositoryRelativePath(repoPath!, solutionPath);
+            _repoRegistry.RegisterSolution(repoPath!, new SolutionRegistration(
+                solutionId, relativeSolutionPath, Path.GetFullPath(solutionPath)));
+            repoId = SolutionScope.ToStorageRepoId(repoId, solutionId);
 
             CommitSha sha;
             var commitShaStr = args?["commit_sha"]?.GetValue<string>();
@@ -184,6 +189,10 @@ public sealed class WorkspaceHandler
         try
         {
             var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+            var (storageRepoId, _, solutionError) =
+                HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+            if (solutionError is { } scopeError) return scopeError;
+            repoId = storageRepoId;
             var workspaceId = WorkspaceId.From(workspaceStr);
             var result = await _workspaceManager.ResetWorkspaceAsync(repoId, workspaceId, ct)
                                                       .ConfigureAwait(false);
@@ -207,6 +216,10 @@ public sealed class WorkspaceHandler
         try
         {
             var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+            var (storageRepoId, _, solutionError) =
+                HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+            if (solutionError is { } scopeError) return scopeError;
+            repoId = storageRepoId;
             var workspaces = await _workspaceManager.ListWorkspacesAsync(repoId, ct).ConfigureAwait(false);
             var currentHead = await _gitService.GetCurrentCommitAsync(repoPath!, ct).ConfigureAwait(false);
 
@@ -232,6 +245,10 @@ public sealed class WorkspaceHandler
         try
         {
             var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+            var (storageRepoId, _, solutionError) =
+                HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+            if (solutionError is { } scopeError) return scopeError;
+            repoId = storageRepoId;
             var workspaceId = WorkspaceId.From(workspaceStr);
 
             var existed = _workspaceManager.GetWorkspaceInfo(repoId, workspaceId) != null;

@@ -1,5 +1,7 @@
 namespace CodeMap.Mcp;
 
+using System.Text.Json.Nodes;
+
 /// <summary>
 /// Registry of all MCP tools available on this server.
 /// Handlers register tools here during DI setup.
@@ -10,7 +12,26 @@ public sealed class ToolRegistry
         new(StringComparer.Ordinal);
 
     /// <summary>Registers (or replaces) a tool definition.</summary>
-    public void Register(ToolDefinition tool) => _tools[tool.Name] = tool;
+    public void Register(ToolDefinition tool)
+    {
+        // Every repository-bound tool accepts a solution selector. Existing tool-specific
+        // definitions (notably index.ensure_baseline/workspace.create) take precedence.
+        if (tool.InputSchema["properties"] is JsonObject properties)
+        {
+            properties["solution_path"] ??= new JsonObject
+            {
+                ["type"] = "string",
+                ["description"] = "Optional repository-relative or absolute solution path. Required when multiple solutions are indexed for the same repository and commit.",
+            };
+            properties["solution_id"] ??= new JsonObject
+            {
+                ["type"] = "string",
+                ["description"] = "Optional stable solution identifier returned by index.ensure_baseline or index.list_baselines.",
+            };
+        }
+
+        _tools[tool.Name] = tool;
+    }
 
     /// <summary>Returns all registered tools in registration order.</summary>
     public IReadOnlyList<ToolDefinition> GetAll() => [.. _tools.Values];

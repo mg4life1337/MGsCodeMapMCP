@@ -184,6 +184,10 @@ public sealed class ContextHandler
         string repoPath, JsonObject? args, CancellationToken ct)
     {
         var repoId = await _gitService.GetRepoIdentityAsync(repoPath, ct).ConfigureAwait(false);
+        var (storageRepoId, _, solutionError) = HandlerHelpers.ResolveStorageScope(args, repoPath, repoId, _repoRegistry);
+        if (solutionError is { } scopeError)
+            return Result<RoutingContext, ToolCallResult>.Failure(scopeError);
+        repoId = storageRepoId;
         var sha = await _gitService.GetCurrentCommitAsync(repoPath, ct).ConfigureAwait(false);
         var workspaceIdStr = HandlerHelpers.ResolveWorkspaceId(args, repoPath, _stickyRegistry);
 

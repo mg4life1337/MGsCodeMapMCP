@@ -15,12 +15,12 @@ using FluentAssertions;
 /// is absent so CI doesn't break on a clean checkout without a prior build step.
 /// </summary>
 [Trait("Category", "Integration")]
-public sealed class McpSubprocessTests
+public sealed class McpSubprocessTests : IDisposable
 {
-    // Path mirrors the build-release scripts and .mcp.json configuration.
-    private static readonly string DaemonDll = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".codemap", "bin", "CodeMap.Daemon.dll");
+    // Project references copy the daemon and its BuildHost assets next to this test assembly.
+    private static readonly string DaemonDll = Path.Combine(AppContext.BaseDirectory, "CodeMap.Daemon.dll");
+    private readonly string _runtimeDir = Path.Combine(
+        Path.GetTempPath(), $"codemap-subprocess-{Guid.NewGuid():N}");
 
     private const int StartupTimeoutMs = 10_000;
 
@@ -36,16 +36,10 @@ public sealed class McpSubprocessTests
         return $"Content-Length: {bytes}\r\n\r\n{json}";
     }
 
-    private static async Task<string?> SendAndReceiveAsync(
+    private async Task<string?> SendAndReceiveAsync(
         string requestJson, bool newlineDelimited = true, int timeoutMs = StartupTimeoutMs)
     {
-        var psi = new ProcessStartInfo("dotnet", $"\"{DaemonDll}\"")
-        {
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
+        var psi = CreateStartInfo();
 
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start dotnet process.");
@@ -77,13 +71,13 @@ public sealed class McpSubprocessTests
     {
         // Explicit assertion so developers get a clear message when they need to build.
         File.Exists(DaemonDll).Should().BeTrue(
-            $"because {DaemonDll} must exist. Run: dotnet build src/CodeMap.Daemon -c Release -o ~/.codemap/bin");
+            $"because {DaemonDll} must be copied by the CodeMap.Daemon project reference");
     }
 
     [Fact]
     public async Task Subprocess_Initialize_RespondsWithinTimeoutAndReturnsValidJson()
     {
-        File.Exists(DaemonDll).Should().BeTrue($"because {DaemonDll} must exist — run: dotnet build src/CodeMap.Daemon -c Release -o ~/.codemap/bin");
+        File.Exists(DaemonDll).Should().BeTrue($"because {DaemonDll} must exist");
 
         const string request = """
             {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
@@ -121,13 +115,7 @@ public sealed class McpSubprocessTests
         const string init = """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}""";
         const string list = """{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}""";
 
-        var psi = new ProcessStartInfo("dotnet", $"\"{DaemonDll}\"")
-        {
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        };
+        var psi = CreateStartInfo();
 
         using var proc = Process.Start(psi)!;
 
@@ -180,6 +168,23 @@ public sealed class McpSubprocessTests
         await proc.WaitForExitAsync();
 
         proc.ExitCode.Should().Be(0);
-        output.Trim().Should().StartWith("codemap-mcp");
+        output.Trim().Should().StartWith("MGsCodeMapMCP")
+            .And.Contain("upstream CodeMap 2.8.0");
     }
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_runtimeDir, recursive: true); } catch { }
+    }
+
+    private ProcessStartInfo CreateStartInfo() => new(
+        "dotnet",
+        $"\"{DaemonDll}\" --data-dir \"{Path.Combine(_runtimeDir, "data")}\" " +
+        $"--log-dir \"{Path.Combine(_runtimeDir, "logs")}\"")
+    {
+        RedirectStandardInput = true,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        UseShellExecute = false,
+    };
 }

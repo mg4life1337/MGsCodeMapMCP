@@ -15,5 +15,11 @@
     <PackageReference Include="Microsoft.CodeAnalysis.VisualBasic.Workspaces" />
     <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" />
     <PackageReference Include="Microsoft.Build.Locator" />
+    <!-- MSBuild assemblies must come from the instance selected by MSBuildLocator.
+         Shipping the Workspaces.MSBuild compile-time dependency app-local causes
+         VS 2022/2026 assembly mixing in both the daemon and Roslyn BuildHost. -->
+    <PackageReference Include="Microsoft.Build.Framework"
+                      ExcludeAssets="runtime"
+                      PrivateAssets="all" />
   </ItemGroup>
 </Project>

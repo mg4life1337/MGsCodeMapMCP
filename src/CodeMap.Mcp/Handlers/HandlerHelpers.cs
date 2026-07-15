@@ -69,6 +69,28 @@ internal static class HandlerHelpers
     }
 
     /// <summary>
+    /// Resolves a solution selector and encodes it for the storage boundary.
+    /// The returned public repository ID remains unchanged when using a legacy baseline.
+    /// </summary>
+    internal static (RepoId StorageRepoId, SolutionId? SolutionId, ToolCallResult? Error)
+        ResolveStorageScope(
+            JsonObject? args,
+            string repoPath,
+            RepoId repoId,
+            IRepoRegistry registry)
+    {
+        var resolved = registry.ResolveSolution(
+            repoPath,
+            args?["solution_id"]?.GetValue<string>(),
+            args?["solution_path"]?.GetValue<string>());
+        if (resolved.Error is { } error)
+            return (repoId, null, Err(error));
+        return resolved.SolutionId is { } solutionId
+            ? (SolutionScope.ToStorageRepoId(repoId, solutionId), solutionId, null)
+            : (repoId, null, null);
+    }
+
+    /// <summary>
     /// Resolves the <c>workspace_id</c> argument, falling back to the sticky default
     /// for the given repo when the key is absent. Explicit empty string
     /// (<c>"workspace_id": ""</c>) is treated as "committed mode" and does NOT fall

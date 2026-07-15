@@ -72,11 +72,14 @@ public sealed class RepoStatusHandler
         try
         {
             var repoId = await _git.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+            var (storageRepoId, solutionId, solutionError) =
+                HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+            if (solutionError is { } scopeError) return scopeError;
             var commitSha = await _git.GetCurrentCommitAsync(repoPath!, ct).ConfigureAwait(false);
             var branch = await _git.GetCurrentBranchAsync(repoPath!, ct).ConfigureAwait(false);
             var isClean = await _git.IsCleanAsync(repoPath!, ct).ConfigureAwait(false);
-            var hasIndex = await _store.BaselineExistsAsync(repoId, commitSha, ct).ConfigureAwait(false);
-            var workspaces = await _workspaceManager.ListWorkspacesAsync(repoId, ct).ConfigureAwait(false);
+            var hasIndex = await _store.BaselineExistsAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
+            var workspaces = await _workspaceManager.ListWorkspacesAsync(storageRepoId, ct).ConfigureAwait(false);
 
             var response = new RepoStatusResponse(
                 RepoId: repoId,
@@ -84,7 +87,8 @@ public sealed class RepoStatusHandler
                 BranchName: branch,
                 IsClean: isClean,
                 BaselineIndexExists: hasIndex,
-                Workspaces: workspaces);
+                Workspaces: workspaces,
+                SolutionId: solutionId);
 
             _logger.LogInformation(
                 "repo.status {RepoId}: branch={Branch} sha={Sha} clean={Clean} indexed={Indexed}",
@@ -113,5 +117,6 @@ public sealed class RepoStatusHandler
         string BranchName,
         bool IsClean,
         bool BaselineIndexExists,
-        IReadOnlyList<WorkspaceSummary> Workspaces);
+        IReadOnlyList<WorkspaceSummary> Workspaces,
+        SolutionId? SolutionId);
 }

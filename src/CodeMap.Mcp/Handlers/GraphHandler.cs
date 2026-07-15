@@ -131,6 +131,10 @@ public sealed class GraphHandler
         var limit = Math.Clamp(args.GetInt("limit", DefaultTraceLimit), 1, MaxTraceLimitCap);
 
         var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+        var (storageRepoId, _, solutionError) =
+            HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+        if (solutionError is { } scopeError) return scopeError;
+        repoId = storageRepoId;
         var sha = await _gitService.GetCurrentCommitAsync(repoPath!, ct).ConfigureAwait(false);
         var routing = BuildRouting(repoId, sha, args, repoPath!);
 
@@ -176,6 +180,10 @@ public sealed class GraphHandler
         var limitPerLevel = Math.Clamp(args.GetInt("limit_per_level", DefaultLimitPerLevel), 1, MaxLimitHardCap);
 
         var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+        var (storageRepoId, _, solutionError) =
+            HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+        if (solutionError is { } scopeError) return scopeError;
+        repoId = storageRepoId;
         var sha = await _gitService.GetCurrentCommitAsync(repoPath!, ct).ConfigureAwait(false);
         var routing = BuildRouting(repoId, sha, args, repoPath!);
 

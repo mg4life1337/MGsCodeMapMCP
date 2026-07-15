@@ -24,8 +24,7 @@ public static class ServiceRegistration
     /// </summary>
     /// <param name="services">The service collection to populate.</param>
     /// <param name="baseDir">
-    /// Base directory for data storage. Use <c>~/.codemap</c> to resolve
-    /// to the user's home directory at runtime.
+    /// Portable data directory resolved by <see cref="RuntimeConfiguration"/>.
     /// </param>
     /// <remarks>
     /// Registration order is significant:
@@ -46,13 +45,10 @@ public static class ServiceRegistration
     /// </remarks>
     public static IServiceCollection AddCodeMapServices(
         this IServiceCollection services,
-        string baseDir = "~/.codemap")
+        string baseDir,
+        string? sharedCacheDir = null)
     {
-        var resolvedBaseDir = baseDir.StartsWith("~/", StringComparison.Ordinal)
-            ? Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                baseDir[2..])
-            : baseDir;
+        var resolvedBaseDir = Path.GetFullPath(baseDir);
 
         // ── Git ───────────────────────────────────────────────────────────────
         services.AddSingleton<IGitService, GitService>();
@@ -63,14 +59,13 @@ public static class ServiceRegistration
 
         // ── Storage ────────────────────────────────────────────────────────────
         // v2 custom storage engine — all ISymbolStore methods + IOverlayStore adapter.
-        var storeDir = Path.Combine(resolvedBaseDir, "store");
+        var storeDir = Path.Combine(resolvedBaseDir, "repositories");
         var customStore = new CustomSymbolStore(storeDir);
         services.AddSingleton<ISymbolStore>(customStore);
         services.AddSingleton<IOverlayStore>(new CustomEngineOverlayStore(customStore, storeDir));
 
         // ── Shared baseline cache ─────────────────────────────────────────────
         // CODEMAP_CACHE_DIR env var sets the shared cache directory (null = disabled).
-        var sharedCacheDir = Environment.GetEnvironmentVariable("CODEMAP_CACHE_DIR");
         services.AddSingleton<IBaselineCacheManager>(sp =>
             new EngineBaselineCacheManager(storeDir, sharedCacheDir,
                 sp.GetRequiredService<ILogger<EngineBaselineCacheManager>>()));

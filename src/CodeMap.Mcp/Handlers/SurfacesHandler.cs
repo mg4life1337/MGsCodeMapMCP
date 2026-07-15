@@ -113,6 +113,9 @@ public sealed class SurfacesHandler
         var limit = args.GetInt("limit", 50);
 
         var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+        var (storageRepoId, _, solutionError) = HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+        if (solutionError is { } scopeError) return scopeError;
+        repoId = storageRepoId;
         var sha = await _gitService.GetCurrentCommitAsync(repoPath!, ct).ConfigureAwait(false);
         var routing = BuildRouting(repoId, sha, args, repoPath!);
 
@@ -130,6 +133,9 @@ public sealed class SurfacesHandler
         var limit = args.GetInt("limit", 50);
 
         var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+        var (storageRepoId, _, solutionError) = HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+        if (solutionError is { } scopeError) return scopeError;
+        repoId = storageRepoId;
         var sha = await _gitService.GetCurrentCommitAsync(repoPath!, ct).ConfigureAwait(false);
         var routing = BuildRouting(repoId, sha, args, repoPath!);
 
@@ -147,6 +153,9 @@ public sealed class SurfacesHandler
         var limit = args.GetInt("limit", 50);
 
         var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+        var (storageRepoId, _, solutionError) = HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+        if (solutionError is { } scopeError) return scopeError;
+        repoId = storageRepoId;
         var sha = await _gitService.GetCurrentCommitAsync(repoPath!, ct).ConfigureAwait(false);
         var routing = BuildRouting(repoId, sha, args, repoPath!);
 

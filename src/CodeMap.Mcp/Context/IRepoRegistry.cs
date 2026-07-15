@@ -18,6 +18,9 @@ public interface IRepoRegistry
     /// <summary>Records a repo as open. Safe to call multiple times for the same path.</summary>
     void Register(string repoPath);
 
+    /// <summary>Records a solution available for a repository.</summary>
+    void RegisterSolution(string repoPath, SolutionRegistration solution);
+
     /// <summary>Removes a repo from the registry. No-op if not present.</summary>
     void Forget(string repoPath);
 
@@ -34,6 +37,30 @@ public interface IRepoRegistry
     /// </list>
     /// </summary>
     ResolveRepoResult Resolve(string? explicitRepoPath);
+
+    /// <summary>
+    /// Resolves optional solution_id/solution_path input. A single known solution is selected
+    /// automatically; multiple solutions produce a structured ambiguity error.
+    /// </summary>
+    ResolveSolutionResult ResolveSolution(
+        string repoPath,
+        string? explicitSolutionId,
+        string? explicitSolutionPath);
+}
+
+/// <summary>One registered repository solution.</summary>
+public sealed record SolutionRegistration(
+    Core.Types.SolutionId SolutionId,
+    string RelativePath,
+    string AbsolutePath);
+
+/// <summary>Outcome of solution routing.</summary>
+public readonly record struct ResolveSolutionResult(
+    Core.Types.SolutionId? SolutionId,
+    CodeMapError? Error,
+    SolutionRegistration? Registration = null)
+{
+    public bool IsSuccess => Error is null;
 }
 
 /// <summary>

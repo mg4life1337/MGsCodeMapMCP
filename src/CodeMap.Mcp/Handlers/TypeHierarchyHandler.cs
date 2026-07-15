@@ -73,6 +73,10 @@ public sealed class TypeHierarchyHandler
         if (repoErr is { } re) return re;
 
         var repoId = await _gitService.GetRepoIdentityAsync(repoPath!, ct).ConfigureAwait(false);
+        var (storageRepoId, _, solutionError) =
+            HandlerHelpers.ResolveStorageScope(args, repoPath!, repoId, _repoRegistry);
+        if (solutionError is { } scopeError) return scopeError;
+        repoId = storageRepoId;
         var sha = await _gitService.GetCurrentCommitAsync(repoPath!, ct).ConfigureAwait(false);
         var routing = BuildRouting(repoId, sha, args, repoPath!);
 

@@ -39,7 +39,8 @@ public record CompilationResult(
     IndexStats Stats,
     IReadOnlyList<ExtractedTypeRelation>? TypeRelations = null,
     IReadOnlyList<ExtractedFact>? Facts = null,
-    string? DllFingerprint = null
+    string? DllFingerprint = null,
+    string? SourcePath = null
 );
 
 /// <summary>

@@ -30,6 +30,10 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public async Task CreateBaselineAsync(RepoId repoId, CommitSha commitSha, CompilationResult data, string repoRootPath = "", CancellationToken ct = default)
     {
+        var hasSolution = SolutionScope.TryParse(repoId, out _, out var solutionId);
+        var solutionPath = hasSolution && data.SourcePath is not null && !string.IsNullOrWhiteSpace(repoRootPath)
+            ? SolutionId.GetRepositoryRelativePath(repoRootPath, data.SourcePath)
+            : null;
         var input = new BaselineBuildInput(
             CommitSha: commitSha.Value,
             RepoRootPath: repoRootPath,
@@ -38,7 +42,9 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
             References: data.References,
             Facts: data.Facts ?? [],
             TypeRelations: data.TypeRelations ?? [],
-            ProjectDiagnostics: data.Stats.ProjectDiagnostics);
+            ProjectDiagnostics: data.Stats.ProjectDiagnostics,
+            SolutionId: hasSolution ? solutionId.Value : null,
+            SolutionPath: solutionPath);
 
         // Builder places baselines at <storeDir>/baselines/<commitSha>/
         // We scope storeDir by repoId so final path = <baseDir>/<repoId>/baselines/<commitSha>/
@@ -651,10 +657,21 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
     // ── Path helpers ─────────────────────────────────────────────────────────
 
     private string RepoStoreDir(string repoId)
-        => Path.Combine(_storeBaseDir, SanitizeRepoId(repoId));
+    {
+        var storageRepoId = RepoId.From(repoId);
+        if (SolutionScope.TryParse(storageRepoId, out var publicRepoId, out var solutionId))
+        {
+            return Path.Combine(
+                _storeBaseDir,
+                SanitizeRepoId(publicRepoId.Value),
+                "solutions",
+                SanitizeRepoId(solutionId.Value));
+        }
+        return Path.Combine(_storeBaseDir, SanitizeRepoId(repoId));
+    }
 
     private string BaselineDir(string repoId, string commitSha)
-        => Path.Combine(_storeBaseDir, SanitizeRepoId(repoId), "baselines", commitSha);
+        => Path.Combine(RepoStoreDir(repoId), "baselines", commitSha);
 
     private static string CacheKey(string repoId, string commitSha)
         => $"{repoId}|{commitSha}";

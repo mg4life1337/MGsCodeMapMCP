@@ -358,7 +358,9 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
                 NStringIds: nStringIds,
                 Segments: segments,
                 RepoRootPath: input.RepoRootPath,
-                ProjectDiagnostics: input.ProjectDiagnostics);
+                ProjectDiagnostics: input.ProjectDiagnostics,
+                SolutionId: input.SolutionId,
+                SolutionPath: input.SolutionPath);
 
             ManifestWriter.Write(Path.Combine(tempDir, "manifest.json"), manifest);
 

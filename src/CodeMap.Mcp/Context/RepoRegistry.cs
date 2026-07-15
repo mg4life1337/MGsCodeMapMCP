@@ -2,6 +2,7 @@ namespace CodeMap.Mcp.Context;
 
 using System.Collections.Concurrent;
 using CodeMap.Core.Errors;
+using CodeMap.Core.Types;
 
 /// <summary>
 /// Thread-safe default <see cref="IRepoRegistry"/> backed by a
@@ -12,6 +13,8 @@ public sealed class RepoRegistry : IRepoRegistry
 {
     private readonly ConcurrentDictionary<string, byte> _repos =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, SolutionRegistration>> _solutions =
+        new(StringComparer.OrdinalIgnoreCase);
 
     /// <inheritdoc/>
     public void Register(string repoPath)
@@ -21,10 +24,21 @@ public sealed class RepoRegistry : IRepoRegistry
     }
 
     /// <inheritdoc/>
+    public void RegisterSolution(string repoPath, SolutionRegistration solution)
+    {
+        Register(repoPath);
+        var solutions = _solutions.GetOrAdd(
+            Normalize(repoPath),
+            _ => new ConcurrentDictionary<string, SolutionRegistration>(StringComparer.OrdinalIgnoreCase));
+        solutions[solution.SolutionId.Value] = solution;
+    }
+
+    /// <inheritdoc/>
     public void Forget(string repoPath)
     {
         if (string.IsNullOrWhiteSpace(repoPath)) return;
         _repos.TryRemove(Normalize(repoPath), out _);
+        _solutions.TryRemove(Normalize(repoPath), out _);
     }
 
     /// <inheritdoc/>
@@ -48,6 +62,72 @@ public sealed class RepoRegistry : IRepoRegistry
                 "Pass one explicitly.")),
         };
     }
+
+    /// <inheritdoc/>
+    public ResolveSolutionResult ResolveSolution(
+        string repoPath,
+        string? explicitSolutionId,
+        string? explicitSolutionPath)
+    {
+        var repoKey = Normalize(repoPath);
+        var known = _solutions.TryGetValue(repoKey, out var values)
+            ? values.Values.OrderBy(v => v.RelativePath, StringComparer.OrdinalIgnoreCase).ToList()
+            : [];
+
+        if (!string.IsNullOrWhiteSpace(explicitSolutionId))
+        {
+            var match = known.FirstOrDefault(s =>
+                string.Equals(s.SolutionId.Value, explicitSolutionId, StringComparison.OrdinalIgnoreCase));
+            if (match is not null)
+                return new ResolveSolutionResult(match.SolutionId, null, match);
+            return Failure($"Unknown solution_id '{explicitSolutionId}'.", known);
+        }
+
+        if (!string.IsNullOrWhiteSpace(explicitSolutionPath))
+        {
+            try
+            {
+                var id = SolutionId.FromPath(repoPath, explicitSolutionPath);
+                var match = known.FirstOrDefault(s => s.SolutionId == id);
+                var absolute = Path.GetFullPath(Path.IsPathRooted(explicitSolutionPath)
+                    ? explicitSolutionPath
+                    : Path.Combine(repoPath, explicitSolutionPath));
+                var registration = match ?? new SolutionRegistration(
+                    id,
+                    SolutionId.GetRepositoryRelativePath(repoPath, absolute),
+                    absolute);
+                return new ResolveSolutionResult(id, null, registration);
+            }
+            catch (ArgumentException ex)
+            {
+                return new ResolveSolutionResult(null, CodeMapError.InvalidArgument(ex.Message));
+            }
+        }
+
+        return known.Count switch
+        {
+            0 => new ResolveSolutionResult(null, null), // legacy single-solution baseline compatibility
+            1 => new ResolveSolutionResult(known[0].SolutionId, null, known[0]),
+            _ => Failure(
+                $"Repository has {known.Count} indexed solutions. Pass solution_path or solution_id.",
+                known),
+        };
+    }
+
+    private static ResolveSolutionResult Failure(
+        string message,
+        IReadOnlyList<SolutionRegistration> known) =>
+        new(null, new CodeMapError(
+            "AMBIGUOUS_SOLUTION",
+            message,
+            new Dictionary<string, object>
+            {
+                ["available_solutions"] = known.Select(s => new
+                {
+                    solution_id = s.SolutionId.Value,
+                    solution_path = s.RelativePath,
+                }).ToList(),
+            }));
 
     /// <summary>
     /// Normalizes for registry storage only: absolute path, forward slashes, no trailing slash.
