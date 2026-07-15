@@ -2,34 +2,22 @@
   "dataDirectory": ".\\data",
   "logDirectory": ".\\logs",
   "logLevel": "Information",
-  "repositoryRoots": [
+  "repositories": [
     {
-      "path": "D:\\Programming\\GitHub",
-      "discoverGitRepositories": true,
+      "root": "C:\\Source\\SampleRepository",
       "discoverSolutions": true,
+      "defaultSolution": "src\\Primary.slnx",
+      "indexMode": "rollingBranch",
+      "updateStrategy": "incremental",
+      "checkAllSolutions": true,
+      "skipUnaffectedSolutions": true,
+      "servePreviousIndexWhileUpdating": true,
       "autoIndex": true,
       "watchGitHead": true,
       "watchIntervalSeconds": 3,
-      "exclude": [
-        "**\\bin\\**",
-        "**\\obj\\**",
-        "**\\.git\\**",
-        "**\\.vs\\**",
-        "**\\packages\\**",
-        "**\\.codemap\\**",
-        "**\\.codex\\**"
-      ]
-    }
-  ],
-  "repositories": [
-    {
-      "root": "D:\\Programming\\GitHub\\Example\\Product",
-      "solutions": [
-        "src\\Product.Release.sln"
-      ],
-      "autoIndex": true,
-      "watchGitHead": true,
-      "watchIntervalSeconds": 3
+      "retentionDays": 30,
+      "maxRollingBranches": 8,
+      "fullRebuildChangeThreshold": 5000
     }
   ]
 }

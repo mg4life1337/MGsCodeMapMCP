@@ -92,7 +92,7 @@ public sealed class TypeHierarchyHandler
 
     private RoutingContext BuildRouting(RepoId repoId, CommitSha sha, JsonObject? args, string repoPath)
     {
-        var workspaceIdStr = HandlerHelpers.ResolveWorkspaceId(args, repoPath, _stickyRegistry);
+        var workspaceIdStr = HandlerHelpers.ResolveWorkspaceId(args, repoPath, _stickyRegistry, _repoRegistry);
         if (!string.IsNullOrEmpty(workspaceIdStr))
         {
             var workspaceId = WorkspaceId.From(workspaceIdStr);

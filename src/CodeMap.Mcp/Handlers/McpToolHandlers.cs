@@ -466,7 +466,7 @@ public sealed class McpToolHandlers
 
         // Read workspace_id with sticky-default fallback. Empty string (explicit opt-out)
         // is passed through so the committed-mode branch below still fires.
-        var workspaceIdStr = HandlerHelpers.ResolveWorkspaceId(args, repoPath, _stickyRegistry);
+        var workspaceIdStr = HandlerHelpers.ResolveWorkspaceId(args, repoPath, _stickyRegistry, _repoRegistry);
 
         // Ephemeral mode: virtual files present
         if (virtualFiles is { Count: > 0 })

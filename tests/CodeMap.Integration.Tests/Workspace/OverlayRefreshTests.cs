@@ -143,6 +143,57 @@ public sealed class OverlayRefreshTests : IDisposable
     }
 
     [Fact]
+    public async Task Refresh_BlockingCompiler_KeepsPreviousRevisionReadableUntilAtomicCommit()
+    {
+        await _manager.CreateWorkspaceAsync(Repo, WsId, Sha, SlnPath, _tempDir);
+        var changedFile = FilePath.From("src/Pending.cs");
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<OverlayDelta>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _compiler.ComputeDeltaAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IReadOnlyList<FilePath>>(),
+                Arg.Any<ISymbolStore>(), Arg.Any<RepoId>(), Arg.Any<CommitSha>(),
+                Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns(_ =>
+            {
+                entered.TrySetResult();
+                return release.Task;
+            });
+
+        var refresh = _manager.RefreshOverlayAsync(Repo, WsId, [changedFile]);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        (await _overlay.GetRevisionAsync(Repo, WsId)).Should().Be(0);
+        (await _overlay.GetOverlaySymbolAsync(Repo, WsId, SymbolId.From("T:Pending")))
+            .Should().BeNull();
+
+        release.SetResult(new OverlayDelta(
+            [new ExtractedFile("pending", changedFile, "deadbeef", null)],
+            [MakeSymbol("T:Pending", changedFile)], [], [], [], 1));
+        (await refresh).IsSuccess.Should().BeTrue();
+
+        (await _overlay.GetRevisionAsync(Repo, WsId)).Should().Be(1);
+        (await _overlay.GetOverlaySymbolAsync(Repo, WsId, SymbolId.From("T:Pending")))
+            .Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Refresh_CompilerFailure_LeavesPreviousRevisionReadable()
+    {
+        await _manager.CreateWorkspaceAsync(Repo, WsId, Sha, SlnPath, _tempDir);
+        _compiler.ComputeDeltaAsync(
+                Arg.Any<string>(), Arg.Any<string>(), Arg.Any<IReadOnlyList<FilePath>>(),
+                Arg.Any<ISymbolStore>(), Arg.Any<RepoId>(), Arg.Any<CommitSha>(),
+                Arg.Any<int>(), Arg.Any<CancellationToken>())
+            .Returns<Task<OverlayDelta>>(_ => throw new InvalidOperationException("controlled failure"));
+
+        var act = async () => await _manager.RefreshOverlayAsync(
+            Repo, WsId, [FilePath.From("src/Failure.cs")]);
+
+        await act.Should().ThrowAsync<InvalidOperationException>();
+        (await _overlay.GetRevisionAsync(Repo, WsId)).Should().Be(0);
+    }
+
+    [Fact]
     public async Task Refresh_NoChanges_ReturnsZeroReindexed()
     {
         await _manager.CreateWorkspaceAsync(Repo, WsId, Sha, SlnPath, _tempDir);

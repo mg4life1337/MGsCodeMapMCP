@@ -38,7 +38,9 @@ public sealed class InterfaceContractTests
     [Fact]
     public void IGitService_HasGetChangedFilesAsync_Method()
     {
-        var method = typeof(IGitService).GetMethod("GetChangedFilesAsync");
+        var method = typeof(IGitService).GetMethod(
+            "GetChangedFilesAsync",
+            [typeof(string), typeof(CommitSha), typeof(CancellationToken)]);
         method.Should().NotBeNull();
         method!.ReturnType.Should().Be(typeof(Task<IReadOnlyList<FileChange>>));
     }
@@ -61,8 +63,8 @@ public sealed class InterfaceContractTests
     }
 
     [Fact]
-    public void IGitService_Defines6Methods() =>
-        typeof(IGitService).GetMethods().Should().HaveCount(6);
+    public void IGitService_Defines9Methods() =>
+        typeof(IGitService).GetMethods().Should().HaveCount(9);
 
     // ─── IRoslynCompiler ──────────────────────────────────────────────────────
 

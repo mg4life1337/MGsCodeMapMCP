@@ -88,7 +88,7 @@ public sealed class GitService : IGitService
                 $"Commit {baseline.Value} not found in repository.");
 
         // Track changes: path → FileChangeKind, working directory overrides committed
-        var changes = new Dictionary<string, FileChangeKind>(StringComparer.Ordinal);
+        var changes = new Dictionary<string, FileChange>(StringComparer.Ordinal);
 
         // 1. Diff baseline tree vs HEAD tree (committed changes since baseline)
         if (repo.Head.Tip is not null)
@@ -99,8 +99,7 @@ public sealed class GitService : IGitService
 
             foreach (TreeEntryChanges entry in committedDiff)
             {
-                string key = entry.OldPath ?? entry.Path;
-                changes[entry.Path] = MapChangeKind(entry.Status);
+                changes[entry.Path] = ToFileChange(entry);
             }
 
             // 2. Diff HEAD tree vs working directory (uncommitted changes)
@@ -110,15 +109,67 @@ public sealed class GitService : IGitService
 
             foreach (TreeEntryChanges entry in workingDiff)
             {
-                changes[entry.Path] = MapChangeKind(entry.Status);
+                changes[entry.Path] = ToFileChange(entry);
             }
         }
 
-        var result = changes
-            .Select(kvp => new FileChange(GitPathValidator.ToRepoRelativePath(kvp.Key), kvp.Value))
-            .ToList();
+        var result = changes.Values.ToList();
 
         return Task.FromResult<IReadOnlyList<FileChange>>(result);
+    }
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<FileChange>> GetChangedFilesAsync(
+        string repoPath,
+        CommitSha fromCommit,
+        CommitSha toCommit,
+        CancellationToken ct = default)
+    {
+        string validatedPath = GitPathValidator.ValidateAndNormalize(repoPath);
+        using var repo = new Repository(validatedPath);
+        var from = repo.Lookup<Commit>(fromCommit.Value)
+            ?? throw new InvalidOperationException($"Commit {fromCommit.Value} not found in repository.");
+        var to = repo.Lookup<Commit>(toCommit.Value)
+            ?? throw new InvalidOperationException($"Commit {toCommit.Value} not found in repository.");
+        var result = repo.Diff.Compare<TreeChanges>(from.Tree, to.Tree)
+            .Select(ToFileChange)
+            .ToList();
+        return Task.FromResult<IReadOnlyList<FileChange>>(result);
+    }
+
+    /// <inheritdoc/>
+    public Task<bool> IsAncestorAsync(
+        string repoPath,
+        CommitSha ancestor,
+        CommitSha descendant,
+        CancellationToken ct = default)
+    {
+        string validatedPath = GitPathValidator.ValidateAndNormalize(repoPath);
+        using var repo = new Repository(validatedPath);
+        var ancestorCommit = repo.Lookup<Commit>(ancestor.Value);
+        var descendantCommit = repo.Lookup<Commit>(descendant.Value);
+        if (ancestorCommit is null || descendantCommit is null) return Task.FromResult(false);
+        var divergence = repo.ObjectDatabase.CalculateHistoryDivergence(ancestorCommit, descendantCommit);
+        return Task.FromResult(divergence?.AheadBy == 0);
+    }
+
+    /// <inheritdoc/>
+    public Task<CommitSha?> FindMergeBaseAsync(
+        string repoPath,
+        CommitSha first,
+        CommitSha second,
+        CancellationToken ct = default)
+    {
+        string validatedPath = GitPathValidator.ValidateAndNormalize(repoPath);
+        using var repo = new Repository(validatedPath);
+        var firstCommit = repo.Lookup<Commit>(first.Value);
+        var secondCommit = repo.Lookup<Commit>(second.Value);
+        if (firstCommit is null || secondCommit is null)
+            return Task.FromResult<CommitSha?>(null);
+        var mergeBase = repo.ObjectDatabase.FindMergeBase(firstCommit, secondCommit);
+        return Task.FromResult(mergeBase is null
+            ? (CommitSha?)null
+            : CommitSha.From(mergeBase.Sha));
     }
 
     /// <inheritdoc/>
@@ -216,4 +267,15 @@ public sealed class GitService : IGitService
         ChangeKind.TypeChanged => FileChangeKind.Modified,
         _ => FileChangeKind.Modified,
     };
+
+    private static FileChange ToFileChange(TreeEntryChanges entry)
+    {
+        var oldPath = entry.Status == ChangeKind.Renamed && !string.IsNullOrWhiteSpace(entry.OldPath)
+            ? GitPathValidator.ToRepoRelativePath(entry.OldPath)
+            : (FilePath?)null;
+        return new FileChange(
+            GitPathValidator.ToRepoRelativePath(entry.Path),
+            MapChangeKind(entry.Status),
+            oldPath);
+    }
 }

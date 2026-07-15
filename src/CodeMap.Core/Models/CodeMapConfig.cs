@@ -1,7 +1,7 @@
 namespace CodeMap.Core.Models;
 
 /// <summary>
-/// Settings loaded from the portable <c>codemap.json</c> file at startup.
+/// Settings loaded from <c>codemap.json</c> at startup.
 /// Relative paths are resolved against the directory containing that file.
 /// Changes require a daemon restart (hot-reload is not supported).
 /// </summary>
@@ -24,7 +24,16 @@ public record RepositoryRootConfig(
     bool AutoIndex = false,
     bool WatchGitHead = false,
     int WatchIntervalSeconds = 3,
-    IReadOnlyList<string>? Exclude = null
+    IReadOnlyList<string>? Exclude = null,
+    string? DefaultSolution = null,
+    string IndexMode = "commit",
+    string UpdateStrategy = "full",
+    bool CheckAllSolutions = true,
+    bool SkipUnaffectedSolutions = true,
+    bool ServePreviousIndexWhileUpdating = true,
+    int RetentionDays = 30,
+    int MaxRollingBranches = 8,
+    int FullRebuildChangeThreshold = 5000
 );
 
 /// <summary>Explicit repository configuration. Explicit solutions take precedence over discovery.</summary>
@@ -33,7 +42,17 @@ public record RepositoryConfig(
     IReadOnlyList<string>? Solutions = null,
     bool AutoIndex = false,
     bool WatchGitHead = false,
-    int WatchIntervalSeconds = 3
+    int WatchIntervalSeconds = 3,
+    bool DiscoverSolutions = true,
+    string? DefaultSolution = null,
+    string IndexMode = "commit",
+    string UpdateStrategy = "full",
+    bool CheckAllSolutions = true,
+    bool SkipUnaffectedSolutions = true,
+    bool ServePreviousIndexWhileUpdating = true,
+    int RetentionDays = 30,
+    int MaxRollingBranches = 8,
+    int FullRebuildChangeThreshold = 5000
 );
 
 /// <summary>Budget limit overrides for hardcap enforcement.</summary>

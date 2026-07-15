@@ -3,6 +3,7 @@ namespace CodeMap.Mcp.Handlers;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using CodeMap.Core.Interfaces;
+using CodeMap.Core.Models;
 using CodeMap.Core.Types;
 using CodeMap.Mcp.Context;
 using CodeMap.Mcp.Serialization;
@@ -25,6 +26,7 @@ public sealed class RepoStatusHandler
     private readonly ISymbolStore _store;
     private readonly WorkspaceManager _workspaceManager;
     private readonly IRepoRegistry _repoRegistry;
+    private readonly IRollingIndexStatusProvider _rollingStatus;
     private readonly ILogger<RepoStatusHandler> _logger;
 
     public RepoStatusHandler(
@@ -32,12 +34,14 @@ public sealed class RepoStatusHandler
         ISymbolStore store,
         WorkspaceManager workspaceManager,
         IRepoRegistry repoRegistry,
-        ILogger<RepoStatusHandler> logger)
+        ILogger<RepoStatusHandler> logger,
+        IRollingIndexStatusProvider? rollingStatus = null)
     {
         _git = git;
         _store = store;
         _workspaceManager = workspaceManager;
         _repoRegistry = repoRegistry;
+        _rollingStatus = rollingStatus ?? new NullRollingIndexStatusProvider();
         _logger = logger;
     }
 
@@ -57,6 +61,16 @@ public sealed class RepoStatusHandler
                     {
                         ["type"] = "string",
                         ["description"] = "Absolute path to the repository root",
+                    },
+                    ["solution_path"] = new System.Text.Json.Nodes.JsonObject
+                    {
+                        ["type"] = "string",
+                        ["description"] = "Optional solution path",
+                    },
+                    ["solution_id"] = new System.Text.Json.Nodes.JsonObject
+                    {
+                        ["type"] = "string",
+                        ["description"] = "Optional stable solution identifier",
                     },
                 },
             },
@@ -80,15 +94,22 @@ public sealed class RepoStatusHandler
             var isClean = await _git.IsCleanAsync(repoPath!, ct).ConfigureAwait(false);
             var hasIndex = await _store.BaselineExistsAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
             var workspaces = await _workspaceManager.ListWorkspacesAsync(storageRepoId, ct).ConfigureAwait(false);
+            var rollingSolutions = _rollingStatus.GetStatuses(repoPath!);
+            var rollingAvailable = rollingSolutions.Any(status =>
+                status.SolutionId == solutionId &&
+                status.IndexState is RollingIndexState.UpToDate or RollingIndexState.Checking or
+                    RollingIndexState.Updating or RollingIndexState.Stale or RollingIndexState.Failed);
 
             var response = new RepoStatusResponse(
                 RepoId: repoId,
                 CurrentCommitSha: commitSha,
                 BranchName: branch,
                 IsClean: isClean,
-                BaselineIndexExists: hasIndex,
+                BaselineIndexExists: hasIndex || rollingAvailable,
                 Workspaces: workspaces,
-                SolutionId: solutionId);
+                SolutionId: solutionId,
+                RollingSolutions: rollingSolutions,
+                PossiblyStale: rollingSolutions.Any(status => status.PossiblyStale));
 
             _logger.LogInformation(
                 "repo.status {RepoId}: branch={Branch} sha={Sha} clean={Clean} indexed={Indexed}",
@@ -117,6 +138,8 @@ public sealed class RepoStatusHandler
         string BranchName,
         bool IsClean,
         bool BaselineIndexExists,
-        IReadOnlyList<WorkspaceSummary> Workspaces,
-        SolutionId? SolutionId);
+        IReadOnlyList<CodeMap.Query.WorkspaceSummary> Workspaces,
+        SolutionId? SolutionId,
+        IReadOnlyList<RollingSolutionStatus> RollingSolutions,
+        bool PossiblyStale);
 }

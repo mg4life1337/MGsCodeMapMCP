@@ -105,6 +105,57 @@ public sealed class ConfigLoadingTests : IDisposable
     }
 
     [Fact]
+    public void LoadConfig_RollingRepository_ReadsNewOptions()
+    {
+        var configPath = Path.Combine(_tempDir, "codemap.json");
+        File.WriteAllText(configPath, """
+            {
+              "repositories": [
+                {
+                  "root": ".\\repositories\\sample",
+                  "discoverSolutions": true,
+                  "defaultSolution": "src\\Primary.slnx",
+                  "indexMode": "rollingBranch",
+                  "updateStrategy": "incremental",
+                  "checkAllSolutions": true,
+                  "skipUnaffectedSolutions": true,
+                  "servePreviousIndexWhileUpdating": true,
+                  "retentionDays": 14,
+                  "maxRollingBranches": 4,
+                  "fullRebuildChangeThreshold": 1200
+                }
+              ]
+            }
+            """);
+
+        var repository = RuntimeConfiguration.LoadConfig(configPath).Repositories.Should().ContainSingle().Subject;
+
+        repository.DefaultSolution.Should().Be("src\\Primary.slnx");
+        repository.IndexMode.Should().Be("rollingBranch");
+        repository.UpdateStrategy.Should().Be("incremental");
+        repository.CheckAllSolutions.Should().BeTrue();
+        repository.SkipUnaffectedSolutions.Should().BeTrue();
+        repository.ServePreviousIndexWhileUpdating.Should().BeTrue();
+        repository.RetentionDays.Should().Be(14);
+        repository.MaxRollingBranches.Should().Be(4);
+        repository.FullRebuildChangeThreshold.Should().Be(1200);
+    }
+
+    [Fact]
+    public void LoadConfig_ExistingRepository_KeepsCommitModeDefaults()
+    {
+        var configPath = Path.Combine(_tempDir, "codemap.json");
+        File.WriteAllText(configPath, """
+            { "repositories": [{ "root": ".\\repositories\\sample" }] }
+            """);
+
+        var repository = RuntimeConfiguration.LoadConfig(configPath).Repositories.Should().ContainSingle().Subject;
+
+        repository.IndexMode.Should().Be("commit");
+        repository.UpdateStrategy.Should().Be("full");
+    }
+
+    [Fact]
     public void CodeMapConfig_DefaultRecord_HasPortableDefaults()
     {
         var config = new CodeMapConfig();

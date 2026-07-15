@@ -5,7 +5,8 @@ namespace CodeMap.Core.Models;
 /// </summary>
 public record FileChange(
     Types.FilePath FilePath,
-    FileChangeKind Kind
+    FileChangeKind Kind,
+    Types.FilePath? OldFilePath = null
 );
 
 /// <summary>

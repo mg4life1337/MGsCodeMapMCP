@@ -57,19 +57,26 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
                 batch.Tombstone(0, rec?.SymbolIntId ?? 0, stableId);
         }
 
-        // Upsert files
+        // Upsert files and retain their overlay-local IDs so symbols can point back
+        // to the correct path. FileIntId=0 loses source locations in workspace queries.
+        var fileIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in delta.ReindexedFiles)
         {
             var pathSid = batch.InternString(file.Path.Value);
             var normalizedSid = batch.InternString(file.Path.Value.ToLowerInvariant());
             var (hashHigh, hashLow) = RecordMappers.SplitSha256(file.Sha256Hash);
-            var fileRecord = new FileRecord(overlay.NextOverlayFileIntId--,
-                pathSid, normalizedSid, 0, hashHigh, hashLow,
+            var fileIntId = overlay.NextOverlayFileIntId--;
+            var projectIntId = ResolveBaselineProjectId(reader, file.ProjectName);
+            var fileRecord = new FileRecord(fileIntId,
+                pathSid, normalizedSid, projectIntId, hashHigh, hashLow,
                 RecordMappers.DetectLanguage(file.Path.Value), 0, 0);
             batch.UpsertFile(fileRecord);
+            fileIds[file.Path.Value] = fileIntId;
         }
 
-        // Upsert symbols
+        // Upsert symbols. Keep the pending IDs because edges in this same atomic
+        // batch must be able to target newly created symbols before commit.
+        var symbolIds = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (var sym in delta.AddedOrUpdatedSymbols)
         {
             // Skip unaddressable symbols (empty SymbolId, e.g. SymbolId.Empty from a
@@ -90,22 +97,29 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
             var tokens = tokenStr.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
             var intId = overlay.NextOverlaySymbolIntId--;
+            var fileIntId = fileIds.GetValueOrDefault(sym.FilePath.Value);
+            if (fileIntId == 0)
+                fileIntId = reader.GetFileByPath(sym.FilePath.Value)?.FileIntId ?? 0;
             var record = new SymbolRecord(intId, stableIdSid, fqnSid, displaySid, nsSid,
-                0, 0, 0, RecordMappers.MapSymbolKind(sym.Kind),
+                0, fileIntId, 0, RecordMappers.MapSymbolKind(sym.Kind),
                 RecordMappers.MapAccessibility(sym.Visibility),
                 RecordMappers.BuildSymbolFlags(sym),
                 sym.SpanStart, sym.SpanEnd, tokensSid, 0);
             batch.UpsertSymbol(record, tokens);
+            symbolIds[fqn] = intId;
         }
 
         // Add references as edges
         foreach (var r in delta.AddedOrUpdatedReferences)
         {
-            var fromIntId = ResolveIntId(reader, overlay, r.FromSymbol.Value);
-            var toIntId = ResolveIntId(reader, overlay, r.ToSymbol.Value);
+            var fromIntId = ResolveDeltaIntId(reader, overlay, symbolIds, r.FromSymbol.Value);
+            var toIntId = ResolveDeltaIntId(reader, overlay, symbolIds, r.ToSymbol.Value);
             var toNameSid = !string.IsNullOrEmpty(r.ToName) ? batch.InternString(r.ToName) : 0;
+            var fileIntId = fileIds.GetValueOrDefault(r.FilePath.Value);
+            if (fileIntId == 0)
+                fileIntId = reader.GetFileByPath(r.FilePath.Value)?.FileIntId ?? 0;
             var edge = new EdgeRecord(overlay.NextOverlayEdgeIntId--, fromIntId, toIntId, toNameSid,
-                0, r.LineStart, r.LineEnd, RecordMappers.MapEdgeKind(r.Kind),
+                fileIntId, r.LineStart, r.LineEnd, RecordMappers.MapEdgeKind(r.Kind),
                 RecordMappers.MapResolutionState(r.ResolutionState),
                 r.IsDecompiled ? 1 : 0, 1);
             batch.AddEdge(edge);
@@ -116,8 +130,8 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         {
             foreach (var tr in delta.TypeRelations)
             {
-                var fromIntId = ResolveIntId(reader, overlay, tr.TypeSymbolId.Value);
-                var toIntId = ResolveIntId(reader, overlay, tr.RelatedSymbolId.Value);
+                var fromIntId = ResolveDeltaIntId(reader, overlay, symbolIds, tr.TypeSymbolId.Value);
+                var toIntId = ResolveDeltaIntId(reader, overlay, symbolIds, tr.RelatedSymbolId.Value);
                 short edgeKind = tr.RelationKind == TypeRelationKind.BaseType ? (short)4 : (short)5;
                 var edge = new EdgeRecord(overlay.NextOverlayEdgeIntId--, fromIntId, toIntId, 0,
                     0, 0, 0, edgeKind, 0, 0, 1);
@@ -130,11 +144,14 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         {
             foreach (var f in delta.Facts)
             {
-                var ownerIntId = ResolveIntId(reader, overlay, f.SymbolId.Value);
+                var ownerIntId = ResolveDeltaIntId(reader, overlay, symbolIds, f.SymbolId.Value);
                 var (primary, secondary) = RecordMappers.SplitFactValue(f.Value);
                 var primarySid = batch.InternString(primary);
                 var secondarySid = batch.InternString(secondary);
-                var fact = new FactRecord(overlay.NextOverlayFactIntId--, ownerIntId, 0,
+                var fileIntId = fileIds.GetValueOrDefault(f.FilePath.Value);
+                if (fileIntId == 0)
+                    fileIntId = reader.GetFileByPath(f.FilePath.Value)?.FileIntId ?? 0;
+                var fact = new FactRecord(overlay.NextOverlayFactIntId--, ownerIntId, fileIntId,
                     f.LineStart, f.LineEnd, RecordMappers.MapFactKind(f.Kind),
                     primarySid, secondarySid, RecordMappers.MapConfidence(f.Confidence), 0);
                 batch.AddFact(fact);
@@ -142,6 +159,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         }
 
         await batch.CommitAsync(ct);
+        await overlay.CheckpointIfNeededAsync(ct).ConfigureAwait(false);
     }
 
     public Task ResetOverlayAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
@@ -197,7 +215,11 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         if (rec == null) return Task.FromResult<SymbolCard?>(null);
         // Overlay-local symbols may have StringIds beyond the baseline dictionary range.
         // Use overlay.ResolveString which handles both baseline and overlay string pools.
-        return Task.FromResult<SymbolCard?>(RecordToCoreMappings.ToSymbolCard(rec.Value, reader, overlay.ResolveString));
+        var card = RecordToCoreMappings.ToSymbolCard(rec.Value, reader, overlay.ResolveString);
+        var filePath = ResolveOverlaySymbolFilePath(overlay, reader, rec.Value.FileIntId);
+        if (!string.IsNullOrWhiteSpace(filePath))
+            card = card with { FilePath = FilePath.From(filePath) };
+        return Task.FromResult<SymbolCard?>(card);
     }
 
     public Task<IReadOnlyList<SymbolSearchHit>> SearchOverlaySymbolsAsync(RepoId repoId, WorkspaceId workspaceId, string query, SymbolSearchFilters? filters, int limit, CancellationToken ct = default)
@@ -282,7 +304,8 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
                 Kind: RecordToCoreMappings.ReverseSymbolKind(sym.Kind),
                 Signature: displayName,
                 DocumentationSnippet: null,
-                FilePath: FilePath.From("overlay"),
+                FilePath: FilePath.From(
+                    ResolveOverlaySymbolFilePath(overlay, reader, sym.FileIntId) ?? "unknown"),
                 Line: sym.SpanStart,
                 Score: 1.0));
 
@@ -352,7 +375,8 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
                 Kind: RecordToCoreMappings.ReverseSymbolKind(sym.Kind),
                 Signature: displayName,
                 DocumentationSnippet: null,
-                FilePath: FilePath.From("overlay"),
+                FilePath: FilePath.From(
+                    ResolveOverlaySymbolFilePath(overlay, reader, sym.FileIntId) ?? "unknown"),
                 Line: sym.SpanStart,
                 Score: 0));
 
@@ -397,6 +421,28 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         return proj.NameStringId > 0 ? reader.ResolveString(proj.NameStringId) : null;
     }
 
+    private static int ResolveBaselineProjectId(EngineBaselineReader reader, string? projectName)
+    {
+        if (string.IsNullOrWhiteSpace(projectName)) return 0;
+        for (var projectIntId = 1; projectIntId <= reader.ProjectCount; projectIntId++)
+        {
+            ref readonly var project = ref reader.GetProjectByIntId(projectIntId);
+            var name = project.NameStringId > 0 ? reader.ResolveString(project.NameStringId) : "";
+            if (string.Equals(name, projectName, StringComparison.OrdinalIgnoreCase))
+                return projectIntId;
+        }
+        return 0;
+    }
+
+    private static int ResolveDeltaIntId(
+        EngineBaselineReader reader,
+        EngineOverlay overlay,
+        IReadOnlyDictionary<string, int> pendingSymbolIds,
+        string symbolId)
+        => pendingSymbolIds.TryGetValue(symbolId, out var pendingIntId)
+            ? pendingIntId
+            : ResolveIntId(reader, overlay, symbolId);
+
     public Task<IReadOnlyList<StoredReference>> GetOverlayReferencesAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, RefKind? kind, int limit, CancellationToken ct = default)
     {
         var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
@@ -407,7 +453,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         foreach (var e in edges)
         {
             if (kind.HasValue && e.EdgeKind != RecordMappers.MapEdgeKind(kind.Value)) continue;
-            refs.Add(RecordToCoreMappings.ToStoredReference(e, reader, overlay.ResolveString));
+            refs.Add(ToOverlayIncomingReference(e, reader, overlay));
             if (refs.Count >= limit) break;
         }
         return Task.FromResult<IReadOnlyList<StoredReference>>(refs);
@@ -450,17 +496,41 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         foreach (var e in edges)
         {
             if (kind.HasValue && e.EdgeKind != RecordMappers.MapEdgeKind(kind.Value)) continue;
-            refs.Add(RecordToCoreMappings.ToOutgoingReference(e, reader, overlay.ResolveString));
+            refs.Add(ToOverlayOutgoingReference(e, reader, overlay));
             if (refs.Count >= limit) break;
         }
         return Task.FromResult<IReadOnlyList<StoredOutgoingReference>>(refs);
     }
 
     public Task<IReadOnlyList<StoredTypeRelation>> GetOverlayTypeRelationsAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, CancellationToken ct = default)
-        => Task.FromResult<IReadOnlyList<StoredTypeRelation>>([]);
+    {
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
+        if (overlay == null || reader == null)
+            return Task.FromResult<IReadOnlyList<StoredTypeRelation>>([]);
+        var typeIntId = ResolveIntId(reader, overlay, symbolId.Value);
+        var relations = overlay.GetOverlayOutgoingEdges(typeIntId)
+            .Where(edge => edge.EdgeKind is 4 or 5)
+            .Select(edge => ToOverlayTypeRelation(edge, reader, overlay))
+            .Where(relation => relation is not null)
+            .Select(relation => relation!)
+            .ToList();
+        return Task.FromResult<IReadOnlyList<StoredTypeRelation>>(relations);
+    }
 
     public Task<IReadOnlyList<StoredTypeRelation>> GetOverlayDerivedTypesAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, CancellationToken ct = default)
-        => Task.FromResult<IReadOnlyList<StoredTypeRelation>>([]);
+    {
+        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
+        if (overlay == null || reader == null)
+            return Task.FromResult<IReadOnlyList<StoredTypeRelation>>([]);
+        var relatedIntId = ResolveIntId(reader, overlay, symbolId.Value);
+        var relations = overlay.GetOverlayIncomingEdges(relatedIntId)
+            .Where(edge => edge.EdgeKind is 4 or 5)
+            .Select(edge => ToOverlayTypeRelation(edge, reader, overlay))
+            .Where(relation => relation is not null)
+            .Select(relation => relation!)
+            .ToList();
+        return Task.FromResult<IReadOnlyList<StoredTypeRelation>>(relations);
+    }
 
     public Task<SemanticLevel?> GetOverlaySemanticLevelAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
         => Task.FromResult<SemanticLevel?>(SemanticLevel.Full);
@@ -529,12 +599,73 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     private static int ResolveIntId(EngineBaselineReader reader, EngineOverlay overlay, string symbolId)
     {
-        var rec = reader.GetSymbolByFqn(symbolId);
-        if (rec != null) return rec.Value.SymbolIntId;
+        // Overlay wins for reindexed symbols, including symbols whose FQN stayed
+        // unchanged. Their current edges are keyed by the overlay-local IntId.
         foreach (var sym in overlay.GetOverlayNewSymbols())
         {
             if (overlay.ResolveString(sym.FqnStringId) == symbolId) return sym.SymbolIntId;
         }
+        var rec = reader.GetSymbolByFqn(symbolId);
+        if (rec != null) return rec.Value.SymbolIntId;
         return 0;
+    }
+
+    private static StoredReference ToOverlayIncomingReference(
+        in EdgeRecord edge,
+        EngineBaselineReader reader,
+        EngineOverlay overlay)
+    {
+        var fromFqn = ResolveSymbolFqn(reader, overlay, edge.FromSymbolIntId);
+        var filePath = ResolveOverlaySymbolFilePath(overlay, reader, edge.FileIntId) ?? "unknown";
+        var toName = edge.ToNameStringId > 0 ? overlay.ResolveString(edge.ToNameStringId) : null;
+        return new StoredReference(
+            RecordToCoreMappings.ReverseEdgeKind(edge.EdgeKind),
+            string.IsNullOrWhiteSpace(fromFqn) ? SymbolId.Empty : SymbolId.From(fromFqn),
+            FilePath.From(filePath), edge.SpanStart, edge.SpanEnd, null,
+            RecordToCoreMappings.ReverseResolutionState(edge.ResolutionState), toName);
+    }
+
+    private static StoredOutgoingReference ToOverlayOutgoingReference(
+        in EdgeRecord edge,
+        EngineBaselineReader reader,
+        EngineOverlay overlay)
+    {
+        var toFqn = ResolveSymbolFqn(reader, overlay, edge.ToSymbolIntId);
+        var filePath = ResolveOverlaySymbolFilePath(overlay, reader, edge.FileIntId) ?? "unknown";
+        var toName = edge.ToNameStringId > 0 ? overlay.ResolveString(edge.ToNameStringId) : null;
+        return new StoredOutgoingReference(
+            RecordToCoreMappings.ReverseEdgeKind(edge.EdgeKind),
+            string.IsNullOrWhiteSpace(toFqn) ? SymbolId.Empty : SymbolId.From(toFqn),
+            FilePath.From(filePath), edge.SpanStart, edge.SpanEnd,
+            RecordToCoreMappings.ReverseResolutionState(edge.ResolutionState), toName);
+    }
+
+    private static string? ResolveSymbolFqn(
+        EngineBaselineReader reader,
+        EngineOverlay overlay,
+        int symbolIntId)
+    {
+        if (symbolIntId >= 1 && symbolIntId <= reader.SymbolCount)
+            return reader.ResolveString(reader.GetSymbolByIntId(symbolIntId).FqnStringId);
+        foreach (var symbol in overlay.GetOverlayNewSymbols())
+            if (symbol.SymbolIntId == symbolIntId)
+                return overlay.ResolveString(symbol.FqnStringId);
+        return null;
+    }
+
+    private static StoredTypeRelation? ToOverlayTypeRelation(
+        in EdgeRecord edge,
+        EngineBaselineReader reader,
+        EngineOverlay overlay)
+    {
+        var typeFqn = ResolveSymbolFqn(reader, overlay, edge.FromSymbolIntId);
+        var relatedFqn = ResolveSymbolFqn(reader, overlay, edge.ToSymbolIntId);
+        if (string.IsNullOrWhiteSpace(typeFqn) || string.IsNullOrWhiteSpace(relatedFqn))
+            return null;
+        return new StoredTypeRelation(
+            SymbolId.From(typeFqn),
+            SymbolId.From(relatedFqn),
+            edge.EdgeKind == 4 ? TypeRelationKind.BaseType : TypeRelationKind.Interface,
+            relatedFqn);
     }
 }

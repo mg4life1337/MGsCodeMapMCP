@@ -43,3 +43,23 @@ public sealed class FilePathJsonConverter : JsonConverter<FilePath>
     public override void Write(Utf8JsonWriter writer, FilePath value, JsonSerializerOptions options)
         => writer.WriteStringValue(value.Value);
 }
+
+/// <summary>Serializes SolutionId as a plain string.</summary>
+public sealed class SolutionIdJsonConverter : JsonConverter<SolutionId>
+{
+    public override SolutionId Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        => SolutionId.From(reader.GetString()!);
+
+    public override void Write(Utf8JsonWriter writer, SolutionId value, JsonSerializerOptions options)
+        => writer.WriteStringValue(value.Value);
+}
+
+/// <summary>Serializes WorkspaceId as a plain string.</summary>
+public sealed class WorkspaceIdJsonConverter : JsonConverter<WorkspaceId>
+{
+    public override WorkspaceId Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        => WorkspaceId.From(reader.GetString()!);
+
+    public override void Write(Utf8JsonWriter writer, WorkspaceId value, JsonSerializerOptions options)
+        => writer.WriteStringValue(value.Value);
+}

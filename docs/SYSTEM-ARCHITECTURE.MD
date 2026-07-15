@@ -855,7 +855,30 @@ for the definitive plan with phase-level detail, task breakdowns, and dependenci
 
 ---
 
-# 17. Future Extensions
+# 17. Rolling branch update path
+
+The optional rolling mode adds a repository-level control plane without changing the
+baseline query engine:
+
+```text
+RepositorySupervisor (HEAD polling, non-blocking)
+  -> RollingIndexCoordinator (latest-only queue, default first)
+      -> SolutionImpactMap (all solutions, repository-relative inputs)
+      -> WorkspaceManager + IncrementalCompiler (shadow workspace)
+      -> EngineOverlay (atomic batch, WAL checkpoint)
+      -> solution-specific WorkspaceStickyRegistry switch
+  -> MergedQueryEngine (last consistent baseline + overlay)
+```
+
+`RollingIndexStateStore` persists hashed branch state and impact maps below the configured
+data directory. A successful update switches only the affected solution's sticky workspace.
+The old workspace remains addressable through retained history until cleanup proves that no
+active state references it. Commit mode remains the default and continues to provide
+immutable baselines and comparisons. See [Rolling branch indexing](ROLLING-BRANCH-INDEXING.MD).
+
+---
+
+# 18. Future Extensions
 
 * Multi-language plugins (TypeScript, Go, Java via their respective compilers)
 * Static analysis enhancements (null flow, dispose tracking)

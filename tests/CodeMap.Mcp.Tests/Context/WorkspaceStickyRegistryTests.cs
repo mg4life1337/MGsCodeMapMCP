@@ -1,5 +1,6 @@
 namespace CodeMap.Mcp.Tests.Context;
 
+using CodeMap.Core.Types;
 using CodeMap.Mcp.Context;
 using FluentAssertions;
 
@@ -76,5 +77,30 @@ public sealed class WorkspaceStickyRegistryTests
         r.Set("", "ws-1");
         r.Set("/repo", "");
         r.Get("/repo").Should().BeNull();
+    }
+
+    [Fact]
+    public void SolutionSpecificWorkspace_WinsForThatSolutionOnly()
+    {
+        var r = new WorkspaceStickyRegistry();
+        var first = SolutionId.From("solution-first");
+        var second = SolutionId.From("solution-second");
+        r.Set("/repo", "fallback");
+        r.Set("/repo", first, "first-workspace");
+
+        r.Get("/repo", first).Should().Be("first-workspace");
+        r.Get("/repo", second).Should().Be("fallback");
+    }
+
+    [Fact]
+    public void Clear_RemovesMatchingSolutionSpecificWorkspace()
+    {
+        var r = new WorkspaceStickyRegistry();
+        var solution = SolutionId.From("solution-first");
+        r.Set("/repo", solution, "workspace");
+
+        r.Clear("/repo", "workspace");
+
+        r.Get("/repo", solution).Should().BeNull();
     }
 }

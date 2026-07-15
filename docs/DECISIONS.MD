@@ -1219,3 +1219,26 @@ tail so the existing explicit-impl prefix-strip logic applies.
   text adapts to "already applied". 1635 unit tests pass.
 - Deferred to future milestones: `graph.callees` inverse (interface → impls),
   `virtual`/`override` upward walk, member-level storage edges.
+
+---
+
+## ADR-023: Rolling branch state is an opt-in control plane over existing overlays
+
+**Decision:** Keep immutable commit baselines as the compatibility and reproducibility
+layer. Add `indexMode: "rollingBranch"` as an opt-in mode that persists a logical
+repository/branch/solution state consisting of a compatible baseline, a shadow workspace
+overlay, indexed HEAD, revision, and status. Determine affected solutions from a persisted
+repository-relative impact map. Switch the active solution workspace only after a complete
+atomic overlay update.
+
+**Rationale:** Creating a full baseline for every solution and commit duplicates data and
+blocks HEAD observation. Existing `WorkspaceManager`, `IncrementalCompiler`, `EngineOverlay`,
+and `MergedQueryEngine` already provide the required copy-on-write and merge semantics. A
+control plane reuses those proven components and leaves commit-specific tools intact.
+
+**Consequences:** Existing configuration stays in commit mode. Rolling mode can serve the
+previous consistent revision during checking, update, or failure; `repo.status` marks it as
+possibly stale. Branch directory names are hashes. New branches at known commits reuse state.
+Rebase/reset uses a merge base when possible and logs a concrete full-build reason otherwise.
+Retention operates only after reference checks, and overlay WAL checkpointing provides
+threshold-based compaction without rebuilding on every pull.

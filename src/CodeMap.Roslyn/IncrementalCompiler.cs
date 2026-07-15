@@ -100,39 +100,42 @@ public class IncrementalCompiler : IIncrementalCompiler
 
             // Build path → DocumentId index once (O(D)) rather than scanning per changed file (O(N×D))
             var docByPath = BuildDocumentPathIndex(solution);
-
-            foreach (var changedFile in changedFiles)
+            var requiresReload = changedFiles.Any(changedFile =>
             {
                 var absolutePath = NormalizePath(Path.Combine(repoRootPath, changedFile.Value));
-                if (!File.Exists(absolutePath)) continue;
+                var extension = Path.GetExtension(absolutePath).ToLowerInvariant();
+                var buildInput = extension is ".sln" or ".slnx" or ".csproj" or ".vbproj" or ".fsproj" or ".props" or ".targets";
+                var newlyIncludedSource = File.Exists(absolutePath) &&
+                    extension is ".cs" or ".vb" or ".fs" && !docByPath.ContainsKey(absolutePath);
+                return buildInput || newlyIncludedSource;
+            });
 
-                if (!docByPath.TryGetValue(absolutePath, out var documentId))
+            if (requiresReload)
+            {
+                solution = await OpenSolutionAsync(solutionPath, ct).ConfigureAwait(false);
+            }
+            else
+            {
+
+                foreach (var changedFile in changedFiles)
                 {
-                    _logger.LogDebug("Document not found in solution for {Path}", absolutePath);
-                    continue;
-                }
+                    var absolutePath = NormalizePath(Path.Combine(repoRootPath, changedFile.Value));
+                    if (!File.Exists(absolutePath)) continue;
 
-                var newText = SourceText.From(await File.ReadAllTextAsync(absolutePath, ct).ConfigureAwait(false));
-                solution = solution.WithDocumentText(documentId, newText);
+                    if (!docByPath.TryGetValue(absolutePath, out var documentId))
+                    {
+                        _logger.LogDebug("Document not found in solution for {Path}", absolutePath);
+                        continue;
+                    }
+
+                    var newText = SourceText.From(await File.ReadAllTextAsync(absolutePath, ct).ConfigureAwait(false));
+                    solution = solution.WithDocumentText(documentId, newText);
+                }
             }
         }
         else
         {
-            // === COLD PATH — create a fresh workspace ===
-            _logger.LogInformation("Opening solution for incremental compile: {Path}", solutionPath);
-
-            _cachedWorkspace?.Dispose();
-            _cachedWorkspace = null;
-            _cachedSolution = null;
-
-            var workspace = MSBuildWorkspace.Create();
-            workspace.RegisterWorkspaceFailedHandler((args) =>
-                _logger.LogWarning("Workspace diagnostic [{Kind}]: {Message}",
-                    args.Diagnostic.Kind, args.Diagnostic.Message));
-
-            solution = await workspace.OpenSolutionAsync(solutionPath, cancellationToken: ct);
-            _cachedWorkspace = workspace;
-            _cachedSolutionPath = solutionPath;
+            solution = await OpenSolutionAsync(solutionPath, ct).ConfigureAwait(false);
         }
 
         // Cache the (possibly document-updated) solution for the next call
@@ -146,6 +149,12 @@ public class IncrementalCompiler : IIncrementalCompiler
         var affectedProjectIds = new HashSet<ProjectId>();
         foreach (var project in solution.Projects)
         {
+            var projectFile = project.FilePath is null ? null : NormalizePath(project.FilePath);
+            if (projectFile is not null && changedAbsolute.Contains(projectFile))
+            {
+                affectedProjectIds.Add(project.Id);
+                continue;
+            }
             foreach (var doc in project.Documents)
             {
                 if (doc.FilePath is null) continue;
@@ -155,13 +164,38 @@ public class IncrementalCompiler : IIncrementalCompiler
                     break;
                 }
             }
+
+            if (project.AnalyzerConfigDocuments.Any(doc =>
+                    doc.FilePath is not null && changedAbsolute.Contains(NormalizePath(doc.FilePath))) ||
+                project.AdditionalDocuments.Any(doc =>
+                    doc.FilePath is not null && changedAbsolute.Contains(NormalizePath(doc.FilePath))))
+                affectedProjectIds.Add(project.Id);
         }
+
+        if (changedFiles.Any(file =>
+                Path.GetFileName(file.Value).Equals("Directory.Build.props", StringComparison.OrdinalIgnoreCase) ||
+                Path.GetFileName(file.Value).Equals("Directory.Build.targets", StringComparison.OrdinalIgnoreCase) ||
+                Path.GetFileName(file.Value).Equals("Directory.Packages.props", StringComparison.OrdinalIgnoreCase)))
+            foreach (var project in solution.Projects) affectedProjectIds.Add(project.Id);
+
+        var dependencyGraph = solution.GetProjectDependencyGraph();
+        foreach (var directProject in affectedProjectIds.ToArray())
+            affectedProjectIds.UnionWith(dependencyGraph.GetProjectsThatTransitivelyDependOnThisProject(directProject));
 
         if (affectedProjectIds.Count == 0)
         {
             _logger.LogInformation("No projects affected by changed files — returning empty delta");
             return OverlayDelta.Empty(currentRevision + 1);
         }
+
+        var reindexedAbsolute = affectedProjectIds
+            .Select(id => solution.GetProject(id))
+            .Where(project => project is not null)
+            .SelectMany(project => project!.Documents)
+            .Where(document => document.FilePath is not null)
+            .Select(document => NormalizePath(document.FilePath!))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        reindexedAbsolute.UnionWith(changedAbsolute);
 
         var affectedGroups = RoslynProjectGrouping.GroupByFilePath(
             affectedProjectIds.Select(id => solution.GetProject(id)!));
@@ -181,9 +215,18 @@ public class IncrementalCompiler : IIncrementalCompiler
         var newRefs = new List<ExtractedReference>();
         var newFiles = new List<ExtractedFile>();
         var newFacts = new List<ExtractedFact>();
+        var newTypeRelations = new List<ExtractedTypeRelation>();
 
         string normalizedDir = repoRootPath.Replace('\\', '/').TrimEnd('/') + '/';
 
+        // Pass 1 extracts every affected project's symbols before any references.
+        // This makes cross-project calls resolve regardless of solution/project order.
+        var passes = new List<(
+            RoslynProjectGrouping.ProjectGroup Group,
+            Project Project,
+            Compilation Compilation,
+            IReadOnlyList<SymbolCard> Symbols,
+            IReadOnlyDictionary<string, StableId> StableIds)>();
         foreach (var group in affectedGroups)
         {
             ct.ThrowIfCancellationRequested();
@@ -198,13 +241,24 @@ public class IncrementalCompiler : IIncrementalCompiler
                 continue;
             }
 
-            // Extract all symbols (with stable IDs) and refs (with cross-project support).
-            // Pass canonical name so stable-ID hashes and ExtractedFile.ProjectName
-            // stay TFM-invariant (see RoslynCompiler.ExtractFiles XML doc).
             var (projectSymbols, stableIdMap) = SymbolExtractor.ExtractAllWithStableIds(
                 compilation, group.CanonicalName, repoRootPath);
+            foreach (var symbol in projectSymbols)
+                allSymbolIds.Add(symbol.SymbolId.Value);
+            passes.Add((group, project, compilation, projectSymbols, stableIdMap));
+        }
+
+        // Pass 2 extracts references and facts against the complete affected symbol set.
+        foreach (var pass in passes)
+        {
+            var group = pass.Group;
+            var project = pass.Project;
+            var compilation = pass.Compilation;
+            var projectSymbols = pass.Symbols;
+            var stableIdMap = pass.StableIds;
             var projectRefs = ReferenceExtractor.ExtractAll(
                 compilation, repoRootPath, stableIdMap, allSymbolIds);
+            newTypeRelations.AddRange(TypeRelationExtractor.ExtractAll(compilation, stableIdMap));
 
             // Skip fact extraction for test/benchmark projects. Use canonical name
             // so multi-target test projects ("MyLib.Tests(net8.0)") still match.
@@ -226,15 +280,15 @@ public class IncrementalCompiler : IIncrementalCompiler
 
             // Filter to only changed files
             var filteredSymbols = projectSymbols
-                .Where(s => changedAbsolute.Contains(
+                .Where(s => reindexedAbsolute.Contains(
                     NormalizePath(Path.Combine(repoRootPath, s.FilePath.Value))))
                 .ToList();
             var filteredFacts = projectFacts
-                .Where(f => changedAbsolute.Contains(
+                .Where(f => reindexedAbsolute.Contains(
                     NormalizePath(Path.Combine(repoRootPath, f.FilePath.Value))))
                 .ToList();
             var filteredRefs = projectRefs
-                .Where(r => changedAbsolute.Contains(
+                .Where(r => reindexedAbsolute.Contains(
                     NormalizePath(Path.Combine(repoRootPath, r.FilePath.Value))))
                 .ToList();
 
@@ -242,15 +296,11 @@ public class IncrementalCompiler : IIncrementalCompiler
             newRefs.AddRange(filteredRefs);
             newFacts.AddRange(filteredFacts);
 
-            // Extend cross-project set with newly extracted symbols for subsequent projects
-            foreach (var sym in projectSymbols)
-                allSymbolIds.Add(sym.SymbolId.Value);
-
             // Collect file metadata for changed documents in this project
             foreach (var doc in project.Documents)
             {
                 if (doc.FilePath is null) continue;
-                if (!changedAbsolute.Contains(NormalizePath(doc.FilePath))) continue;
+                if (!reindexedAbsolute.Contains(NormalizePath(doc.FilePath))) continue;
 
                 try
                 {
@@ -277,14 +327,39 @@ public class IncrementalCompiler : IIncrementalCompiler
             }
         }
 
-        // Use changedFiles (repo-relative) for the diff — these are the authoritative paths
+        var reindexedFilePaths = reindexedAbsolute
+            .Where(path => path.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase))
+            .Select(path => FilePath.From(path[normalizedDir.Length..]))
+            .Concat(changedFiles)
+            .Distinct()
+            .ToList();
+
         var delta = await _differ.ComputeDeltaAsync(
             baselineStore, repoId, commitSha,
-            changedFiles, newSymbols, newRefs, newFiles,
+            reindexedFilePaths, newSymbols, newRefs, newFiles,
             currentRevision, ct);
 
-        // Attach extracted facts (not part of SymbolDiffer — additive)
-        return newFacts.Count > 0 ? delta with { Facts = newFacts } : delta;
+        return delta with
+        {
+            Facts = newFacts,
+            TypeRelations = newTypeRelations,
+        };
+    }
+
+    private async Task<Solution> OpenSolutionAsync(string solutionPath, CancellationToken ct)
+    {
+        _logger.LogInformation("Opening solution for incremental compile: {Path}", solutionPath);
+        _cachedWorkspace?.Dispose();
+        _cachedWorkspace = null;
+        _cachedSolution = null;
+        var workspace = MSBuildWorkspace.Create();
+        workspace.RegisterWorkspaceFailedHandler(args =>
+            _logger.LogWarning("Workspace diagnostic [{Kind}]: {Message}",
+                args.Diagnostic.Kind, args.Diagnostic.Message));
+        var solution = await workspace.OpenSolutionAsync(solutionPath, cancellationToken: ct).ConfigureAwait(false);
+        _cachedWorkspace = workspace;
+        _cachedSolutionPath = solutionPath;
+        return solution;
     }
 
     /// <summary>

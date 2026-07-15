@@ -189,7 +189,7 @@ public sealed class ContextHandler
             return Result<RoutingContext, ToolCallResult>.Failure(scopeError);
         repoId = storageRepoId;
         var sha = await _gitService.GetCurrentCommitAsync(repoPath, ct).ConfigureAwait(false);
-        var workspaceIdStr = HandlerHelpers.ResolveWorkspaceId(args, repoPath, _stickyRegistry);
+        var workspaceIdStr = HandlerHelpers.ResolveWorkspaceId(args, repoPath, _stickyRegistry, _repoRegistry);
 
         if (!string.IsNullOrEmpty(workspaceIdStr))
             return Result<RoutingContext, ToolCallResult>.Success(

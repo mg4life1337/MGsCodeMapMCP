@@ -4,7 +4,7 @@ using System.Text.Json;
 using CodeMap.Core.Models;
 
 /// <summary>
-/// Resolves portable runtime configuration without consulting the current working directory.
+/// Resolves runtime configuration without consulting the current working directory.
 /// </summary>
 public sealed record RuntimeConfiguration(
     CodeMapConfig Config,

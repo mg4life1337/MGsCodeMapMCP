@@ -16,7 +16,7 @@ include the project files and `Directory.Packages.props` needed to reproduce tha
 ## Material fork changes
 
 - Visual Studio 2026/MSBuild 18 discovery and compatible Roslyn BuildHost behavior.
-- Portable executable-relative configuration, data, and log locations.
+- Executable-relative configuration, data, and log locations.
 - Solution-scoped baseline, cache, workspace, overlay, diff, and query routing.
 - Multiple solution discovery per Git repository and automatic Git HEAD monitoring.
 - Additional VB.NET and multi-solution isolation tests.

@@ -97,11 +97,23 @@ internal static class HandlerHelpers
     /// back to sticky — lets callers opt out of the default explicitly.
     /// </summary>
     internal static string? ResolveWorkspaceId(
-        JsonObject? args, string repoPath, IWorkspaceStickyRegistry sticky)
+        JsonObject? args,
+        string repoPath,
+        IWorkspaceStickyRegistry sticky,
+        IRepoRegistry? repoRegistry = null)
     {
         var node = args?["workspace_id"];
         if (node is not null)
             return node.GetValue<string>();
+        if (repoRegistry is not null)
+        {
+            var solution = repoRegistry.ResolveSolution(
+                repoPath,
+                args?["solution_id"]?.GetValue<string>(),
+                args?["solution_path"]?.GetValue<string>());
+            if (solution.Error is null && solution.SolutionId is { } solutionId)
+                return sticky.Get(repoPath, solutionId);
+        }
         return sticky.Get(repoPath);
     }
     /// <summary>

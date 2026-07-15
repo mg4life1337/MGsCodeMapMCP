@@ -15,6 +15,8 @@ public sealed class RepoRegistry : IRepoRegistry
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, SolutionRegistration>> _solutions =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, SolutionId> _defaults =
+        new(StringComparer.OrdinalIgnoreCase);
 
     /// <inheritdoc/>
     public void Register(string repoPath)
@@ -34,15 +36,32 @@ public sealed class RepoRegistry : IRepoRegistry
     }
 
     /// <inheritdoc/>
+    public void SetDefaultSolution(string repoPath, SolutionId solutionId)
+    {
+        Register(repoPath);
+        _defaults[Normalize(repoPath)] = solutionId;
+    }
+
+    /// <inheritdoc/>
     public void Forget(string repoPath)
     {
         if (string.IsNullOrWhiteSpace(repoPath)) return;
         _repos.TryRemove(Normalize(repoPath), out _);
         _solutions.TryRemove(Normalize(repoPath), out _);
+        _defaults.TryRemove(Normalize(repoPath), out _);
     }
 
     /// <inheritdoc/>
     public IReadOnlyList<string> KnownRepos => _repos.Keys.ToList();
+
+    /// <inheritdoc/>
+    public IReadOnlyList<SolutionRegistration> GetSolutions(string repoPath)
+    {
+        var key = Normalize(repoPath);
+        return _solutions.TryGetValue(key, out var values)
+            ? values.Values.OrderBy(v => v.RelativePath, StringComparer.OrdinalIgnoreCase).ToList()
+            : [];
+    }
 
     /// <inheritdoc/>
     public ResolveRepoResult Resolve(string? explicitRepoPath)
@@ -70,9 +89,7 @@ public sealed class RepoRegistry : IRepoRegistry
         string? explicitSolutionPath)
     {
         var repoKey = Normalize(repoPath);
-        var known = _solutions.TryGetValue(repoKey, out var values)
-            ? values.Values.OrderBy(v => v.RelativePath, StringComparer.OrdinalIgnoreCase).ToList()
-            : [];
+        var known = GetSolutions(repoPath);
 
         if (!string.IsNullOrWhiteSpace(explicitSolutionId))
         {
@@ -102,6 +119,14 @@ public sealed class RepoRegistry : IRepoRegistry
             {
                 return new ResolveSolutionResult(null, CodeMapError.InvalidArgument(ex.Message));
             }
+        }
+
+        if (_defaults.TryGetValue(repoKey, out var defaultSolutionId))
+        {
+            var configuredDefault = known.FirstOrDefault(s => s.SolutionId == defaultSolutionId);
+            if (configuredDefault is not null)
+                return new ResolveSolutionResult(
+                    configuredDefault.SolutionId, null, configuredDefault);
         }
 
         return known.Count switch

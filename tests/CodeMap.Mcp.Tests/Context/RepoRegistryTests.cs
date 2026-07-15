@@ -146,6 +146,54 @@ public sealed class RepoRegistryTests
         result.Registration.Should().Be(expected);
     }
 
+    [Fact]
+    public void ResolveSolution_ConfiguredDefault_SelectsItFromMultipleSolutions()
+    {
+        var repo = Path.Combine(Path.GetTempPath(), "repo-default");
+        var expected = Registration(repo, "src/Primary.sln");
+        var registry = new RepoRegistry();
+        registry.RegisterSolution(repo, Registration(repo, "src/Secondary.sln"));
+        registry.RegisterSolution(repo, expected);
+        registry.SetDefaultSolution(repo, expected.SolutionId);
+
+        var result = registry.ResolveSolution(repo, null, null);
+
+        result.SolutionId.Should().Be(expected.SolutionId);
+        result.Registration.Should().Be(expected);
+    }
+
+    [Fact]
+    public void ResolveSolution_ExplicitPath_WinsOverConfiguredDefault()
+    {
+        var repo = Path.Combine(Path.GetTempPath(), "repo-path-precedence");
+        var configuredDefault = Registration(repo, "src/Primary.sln");
+        var explicitSolution = Registration(repo, "src/Secondary.sln");
+        var registry = new RepoRegistry();
+        registry.RegisterSolution(repo, configuredDefault);
+        registry.RegisterSolution(repo, explicitSolution);
+        registry.SetDefaultSolution(repo, configuredDefault.SolutionId);
+
+        var result = registry.ResolveSolution(repo, null, explicitSolution.RelativePath);
+
+        result.SolutionId.Should().Be(explicitSolution.SolutionId);
+    }
+
+    [Fact]
+    public void ResolveSolution_ExplicitId_WinsOverConfiguredDefault()
+    {
+        var repo = Path.Combine(Path.GetTempPath(), "repo-id-precedence");
+        var configuredDefault = Registration(repo, "src/Primary.sln");
+        var explicitSolution = Registration(repo, "src/Secondary.sln");
+        var registry = new RepoRegistry();
+        registry.RegisterSolution(repo, configuredDefault);
+        registry.RegisterSolution(repo, explicitSolution);
+        registry.SetDefaultSolution(repo, configuredDefault.SolutionId);
+
+        var result = registry.ResolveSolution(repo, explicitSolution.SolutionId.Value, null);
+
+        result.SolutionId.Should().Be(explicitSolution.SolutionId);
+    }
+
     private static SolutionRegistration Registration(string repo, string relativePath)
     {
         var absolute = Path.GetFullPath(Path.Combine(repo, relativePath));

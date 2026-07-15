@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.8.0-mgs.1"
+    [string]$Version = "2.8.0-mgs.2"
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,5 +54,5 @@ New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "logs") | Out-N
 
 Compress-Archive -LiteralPath $releaseDir -DestinationPath $zipPath -CompressionLevel Optimal
 
-Write-Host "Portable release: $releaseDir"
+Write-Host "Windows x64 release: $releaseDir"
 Write-Host "Archive:          $zipPath"

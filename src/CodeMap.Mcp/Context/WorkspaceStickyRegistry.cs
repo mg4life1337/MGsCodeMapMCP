@@ -1,6 +1,7 @@
 namespace CodeMap.Mcp.Context;
 
 using System.Collections.Concurrent;
+using CodeMap.Core.Types;
 
 /// <summary>
 /// Thread-safe default <see cref="IWorkspaceStickyRegistry"/> backed by a
@@ -11,12 +12,22 @@ public sealed class WorkspaceStickyRegistry : IWorkspaceStickyRegistry
 {
     private readonly ConcurrentDictionary<string, string> _sticky =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, string> _solutionSticky =
+        new(StringComparer.OrdinalIgnoreCase);
+    private Action<string, SolutionId>? _solutionRequested;
 
     /// <inheritdoc/>
     public void Set(string repoPath, string workspaceId)
     {
         if (string.IsNullOrWhiteSpace(repoPath) || string.IsNullOrWhiteSpace(workspaceId)) return;
         _sticky[Normalize(repoPath)] = workspaceId;
+    }
+
+    /// <inheritdoc/>
+    public void Set(string repoPath, SolutionId solutionId, string workspaceId)
+    {
+        if (string.IsNullOrWhiteSpace(repoPath) || string.IsNullOrWhiteSpace(workspaceId)) return;
+        _solutionSticky[SolutionKey(repoPath, solutionId)] = workspaceId;
     }
 
     /// <inheritdoc/>
@@ -27,6 +38,10 @@ public sealed class WorkspaceStickyRegistry : IWorkspaceStickyRegistry
         // Conditional remove: only clear if the sticky currently matches the deleted workspace.
         if (_sticky.TryGetValue(key, out var current) && string.Equals(current, workspaceId, StringComparison.Ordinal))
             _sticky.TryRemove(new KeyValuePair<string, string>(key, current));
+        foreach (var entry in _solutionSticky)
+            if (entry.Key.StartsWith(key + "|", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Value, workspaceId, StringComparison.Ordinal))
+                _solutionSticky.TryRemove(new KeyValuePair<string, string>(entry.Key, entry.Value));
     }
 
     /// <inheritdoc/>
@@ -36,6 +51,23 @@ public sealed class WorkspaceStickyRegistry : IWorkspaceStickyRegistry
         return _sticky.TryGetValue(Normalize(repoPath), out var ws) ? ws : null;
     }
 
+    /// <inheritdoc/>
+    public string? Get(string repoPath, SolutionId solutionId)
+    {
+        if (string.IsNullOrWhiteSpace(repoPath)) return null;
+        Volatile.Read(ref _solutionRequested)?.Invoke(repoPath, solutionId);
+        return _solutionSticky.TryGetValue(SolutionKey(repoPath, solutionId), out var workspace)
+            ? workspace
+            : Get(repoPath);
+    }
+
+    /// <inheritdoc/>
+    public void SetSolutionRequestedCallback(Action<string, SolutionId>? callback) =>
+        Volatile.Write(ref _solutionRequested, callback);
+
     private static string Normalize(string path) =>
         Path.GetFullPath(path).Replace('\\', '/').TrimEnd('/');
+
+    private static string SolutionKey(string path, SolutionId solutionId) =>
+        Normalize(path) + "|" + solutionId.Value;
 }

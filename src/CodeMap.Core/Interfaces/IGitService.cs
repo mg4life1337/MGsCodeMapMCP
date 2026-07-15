@@ -30,6 +30,28 @@ public interface IGitService
         CommitSha baseline,
         CancellationToken ct = default);
 
+    /// <summary>Gets committed changes between two explicit commits.</summary>
+    Task<IReadOnlyList<FileChange>> GetChangedFilesAsync(
+        string repoPath,
+        CommitSha fromCommit,
+        CommitSha toCommit,
+        CancellationToken ct = default) =>
+        GetChangedFilesAsync(repoPath, fromCommit, ct);
+
+    /// <summary>Returns whether one commit is an ancestor of another.</summary>
+    Task<bool> IsAncestorAsync(
+        string repoPath,
+        CommitSha ancestor,
+        CommitSha descendant,
+        CancellationToken ct = default) => Task.FromResult(false);
+
+    /// <summary>Finds the merge base of two commits, or null when none exists.</summary>
+    Task<CommitSha?> FindMergeBaseAsync(
+        string repoPath,
+        CommitSha first,
+        CommitSha second,
+        CancellationToken ct = default) => Task.FromResult<CommitSha?>(null);
+
     /// <summary>
     /// Returns true if the working tree has no uncommitted changes.
     /// </summary>

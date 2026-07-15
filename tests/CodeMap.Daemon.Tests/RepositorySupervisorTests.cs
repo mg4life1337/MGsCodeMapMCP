@@ -37,4 +37,27 @@ public sealed class RepositorySupervisorTests : IDisposable
 
         RepositorySupervisor.DiscoverGitRepositories(_root).Should().ContainSingle().Which.Should().Be(visible);
     }
+
+    [Fact]
+    public void ResolveAndValidateDefault_AcceptsDiscoveredRelativeSolution()
+    {
+        var solution = Path.Combine(_root, "src", "Primary.sln");
+        Directory.CreateDirectory(Path.GetDirectoryName(solution)!);
+        File.WriteAllText(solution, "");
+
+        var result = RepositorySupervisor.ResolveAndValidateDefault(
+            _root, "src\\Primary.sln", [solution]);
+
+        result.Should().Be(solution);
+    }
+
+    [Fact]
+    public void ResolveAndValidateDefault_RejectsUnknownSolutionClearly()
+    {
+        var act = () => RepositorySupervisor.ResolveAndValidateDefault(
+            _root, "src\\Missing.sln", []);
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*defaultSolution*discovered solutions*");
+    }
 }

@@ -311,6 +311,35 @@ public class GitServiceTests
         result[0].FilePath.Value.Should().NotStartWith("/");
     }
 
+    [Fact]
+    public async Task GetChangedFilesAsync_ExplicitCommits_UsesOnlyCommittedDelta()
+    {
+        using var repo = TempGitRepo.Create();
+        var first = repo.CommitFile("src/Service.cs", "first");
+        var second = repo.CommitFile("src/Service.cs", "second");
+        repo.ModifyFile("src/Service.cs", "uncommitted");
+        var svc = CreateService();
+
+        var result = await svc.GetChangedFilesAsync(
+            repo.Path, CommitSha.From(first), CommitSha.From(second));
+
+        result.Should().ContainSingle(change =>
+            change.FilePath.Value == "src/Service.cs" &&
+            change.Kind == Core.Models.FileChangeKind.Modified);
+    }
+
+    [Fact]
+    public async Task IsAncestorAsync_FastForwardHistory_ReturnsTrueInOneDirection()
+    {
+        using var repo = TempGitRepo.Create();
+        var first = CommitSha.From(repo.CommitFile("src/Service.cs", "first"));
+        var second = CommitSha.From(repo.CommitFile("src/Service.cs", "second"));
+        var svc = CreateService();
+
+        (await svc.IsAncestorAsync(repo.Path, first, second)).Should().BeTrue();
+        (await svc.IsAncestorAsync(repo.Path, second, first)).Should().BeFalse();
+    }
+
     // ===== IsCleanAsync =====
 
     [Fact]

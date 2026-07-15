@@ -4,13 +4,14 @@ using System.Collections.Concurrent;
 using System.Text.Json.Nodes;
 using CodeMap.Core.Interfaces;
 using CodeMap.Core.Models;
+using CodeMap.Core.Types;
 using CodeMap.Mcp.Handlers;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
-/// Discovers configured repositories/solutions and maintains a baseline for each watched HEAD.
-/// Work is serialized per solution and failures are isolated so one broken solution cannot stop others.
+/// Discovers configured repositories and solutions, observes HEAD without waiting for indexing,
+/// and delegates rolling updates to a latest-only per-repository queue.
 /// </summary>
 public sealed class RepositorySupervisor : BackgroundService
 {
@@ -22,21 +23,26 @@ public sealed class RepositorySupervisor : BackgroundService
     private readonly RuntimeConfiguration _runtime;
     private readonly IndexHandler _indexHandler;
     private readonly IGitService _git;
+    private readonly RollingIndexCoordinator _rolling;
     private readonly ILogger<RepositorySupervisor> _logger;
     private readonly ConcurrentDictionary<string, string> _lastObservedHead =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _solutionLocks =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, string> _lastScheduledRepositoryState =
         new(StringComparer.OrdinalIgnoreCase);
 
     public RepositorySupervisor(
         RuntimeConfiguration runtime,
         IndexHandler indexHandler,
         IGitService git,
+        RollingIndexCoordinator rolling,
         ILogger<RepositorySupervisor> logger)
     {
         _runtime = runtime;
         _indexHandler = indexHandler;
         _git = git;
+        _rolling = rolling;
         _logger = logger;
     }
 
@@ -44,118 +50,180 @@ public sealed class RepositorySupervisor : BackgroundService
     {
         if ((_runtime.Config.RepositoryRoots?.Count ?? 0) == 0 &&
             (_runtime.Config.Repositories?.Count ?? 0) == 0)
-        {
             return;
-        }
 
-        _logger.LogInformation("Repository supervisor started using {ConfigPath}", _runtime.ConfigPath);
-        while (!stoppingToken.IsCancellationRequested)
+        _logger.LogInformation("Repository supervisor started");
+        try
         {
-            var targets = DiscoverTargets();
-            foreach (var target in targets)
+            while (!stoppingToken.IsCancellationRequested)
             {
-                if (stoppingToken.IsCancellationRequested) break;
-                await ObserveTargetAsync(target, stoppingToken).ConfigureAwait(false);
-            }
+                var targets = DiscoverTargets();
 
-            var delaySeconds = targets.Count == 0 ? 3 : Math.Max(1, targets.Min(t => t.WatchIntervalSeconds));
-            await Task.Delay(TimeSpan.FromSeconds(delaySeconds), stoppingToken).ConfigureAwait(false);
+                foreach (var repositoryGroup in targets
+                             .Where(target => target.IsRolling)
+                             .GroupBy(target => target.RepositoryPath, StringComparer.OrdinalIgnoreCase))
+                {
+                    if (stoppingToken.IsCancellationRequested) break;
+                    await ObserveRollingRepositoryAsync(repositoryGroup.ToList(), stoppingToken).ConfigureAwait(false);
+                }
+
+                foreach (var target in targets.Where(target => !target.IsRolling))
+                {
+                    if (stoppingToken.IsCancellationRequested) break;
+                    await ObserveCommitTargetAsync(target, stoppingToken).ConfigureAwait(false);
+                }
+
+                var delaySeconds = targets.Count == 0
+                    ? 3
+                    : Math.Max(1, targets.Min(target => target.WatchIntervalSeconds));
+                await Task.Delay(TimeSpan.FromSeconds(delaySeconds), stoppingToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            await _rolling.StopAsync().ConfigureAwait(false);
         }
     }
 
     internal IReadOnlyList<RepositorySolutionTarget> DiscoverTargets()
     {
-        var configDir = Path.GetDirectoryName(_runtime.ConfigPath) ?? _runtime.BaseDirectory;
+        var configDirectory = Path.GetDirectoryName(_runtime.ConfigPath) ?? _runtime.BaseDirectory;
         var targets = new Dictionary<string, RepositorySolutionTarget>(StringComparer.OrdinalIgnoreCase);
-        var explicitlyConfiguredRepos = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var explicitlyConfiguredRepositories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var repository in _runtime.Config.Repositories ?? [])
         {
-            var repoRoot = RuntimeConfiguration.ResolvePath(repository.Root, configDir);
-            explicitlyConfiguredRepos.Add(repoRoot);
-            foreach (var solution in ResolveExplicitSolutions(repoRoot, repository.Solutions))
-            {
-                AddTarget(targets, new RepositorySolutionTarget(
-                    repoRoot, solution, repository.AutoIndex, repository.WatchGitHead,
-                    Math.Max(1, repository.WatchIntervalSeconds)));
-            }
+            var repositoryRoot = RuntimeConfiguration.ResolvePath(repository.Root, configDirectory);
+            explicitlyConfiguredRepositories.Add(repositoryRoot);
+            var solutions = ResolveExplicitSolutions(
+                repositoryRoot, repository.Solutions, repository.DiscoverSolutions);
+            var defaultSolution = ResolveAndValidateDefault(
+                repositoryRoot, repository.DefaultSolution, solutions);
+            foreach (var solution in solutions)
+                AddTarget(targets, CreateTarget(
+                    repositoryRoot, solution, defaultSolution,
+                    repository.AutoIndex, repository.WatchGitHead, repository.WatchIntervalSeconds,
+                    repository.IndexMode, repository.UpdateStrategy,
+                    repository.SkipUnaffectedSolutions, repository.RetentionDays,
+                    repository.MaxRollingBranches, repository.FullRebuildChangeThreshold));
         }
 
         foreach (var rootConfig in _runtime.Config.RepositoryRoots ?? [])
         {
-            var root = RuntimeConfiguration.ResolvePath(rootConfig.Path, configDir);
+            var root = RuntimeConfiguration.ResolvePath(rootConfig.Path, configDirectory);
             var repositories = rootConfig.DiscoverGitRepositories
-                ? DiscoverGitRepositories(root)
+                ? DiscoverGitRepositories(root, rootConfig.Exclude)
                 : IsGitRepository(root) ? [root] : [];
 
-            foreach (var repoRoot in repositories)
+            foreach (var repositoryRoot in repositories)
             {
-                if (explicitlyConfiguredRepos.Contains(repoRoot)) continue;
+                if (explicitlyConfiguredRepositories.Contains(repositoryRoot)) continue;
                 var solutions = rootConfig.DiscoverSolutions
-                    ? IndexHandler.DiscoverSolutionPaths(repoRoot)
+                    ? IndexHandler.DiscoverSolutionPaths(repositoryRoot)
                     : [];
+                var defaultSolution = ResolveAndValidateDefault(
+                    repositoryRoot, rootConfig.DefaultSolution, solutions);
                 foreach (var solution in solutions)
-                {
-                    AddTarget(targets, new RepositorySolutionTarget(
-                        repoRoot, solution, rootConfig.AutoIndex, rootConfig.WatchGitHead,
-                        Math.Max(1, rootConfig.WatchIntervalSeconds)));
-                }
+                    AddTarget(targets, CreateTarget(
+                        repositoryRoot, solution, defaultSolution,
+                        rootConfig.AutoIndex, rootConfig.WatchGitHead, rootConfig.WatchIntervalSeconds,
+                        rootConfig.IndexMode, rootConfig.UpdateStrategy,
+                        rootConfig.SkipUnaffectedSolutions, rootConfig.RetentionDays,
+                        rootConfig.MaxRollingBranches, rootConfig.FullRebuildChangeThreshold));
             }
         }
 
         return targets.Values
-            .OrderBy(t => t.RepositoryPath, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(t => t.SolutionPath, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(target => target.RepositoryPath, StringComparer.OrdinalIgnoreCase)
+            .ThenByDescending(target => target.IsDefault)
+            .ThenBy(target => target.SolutionPath, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
 
-    private async Task ObserveTargetAsync(RepositorySolutionTarget target, CancellationToken ct)
+    private async Task ObserveRollingRepositoryAsync(
+        IReadOnlyList<RepositorySolutionTarget> targets,
+        CancellationToken ct)
+    {
+        var first = targets[0];
+        try
+        {
+            var head = await _git.GetCurrentCommitAsync(first.RepositoryPath, ct).ConfigureAwait(false);
+            var branch = await _git.GetCurrentBranchAsync(first.RepositoryPath, ct).ConfigureAwait(false);
+            var observation = branch + "\n" + head.Value;
+            var firstObservation = !_lastScheduledRepositoryState.TryGetValue(first.RepositoryPath, out var previous);
+            var changed = !firstObservation && !string.Equals(previous, observation, StringComparison.Ordinal);
+            _lastScheduledRepositoryState[first.RepositoryPath] = observation;
+            if (!(firstObservation && first.AutoIndex) && !(changed && first.WatchGitHead)) return;
+
+            _rolling.Schedule(new RollingRepositoryRequest(
+                first.RepositoryPath,
+                branch,
+                head,
+                targets.Select(target => new RollingSolutionTarget(
+                    target.SolutionPath,
+                    SolutionId.GetRepositoryRelativePath(target.RepositoryPath, target.SolutionPath),
+                    SolutionId.FromPath(target.RepositoryPath, target.SolutionPath),
+                    target.IsDefault)).ToList(),
+                first.IsIncremental,
+                first.SkipUnaffectedSolutions,
+                first.RetentionDays,
+                first.MaxRollingBranches,
+                first.FullRebuildChangeThreshold));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Rolling repository observation failed for {Repository}",
+                Path.GetFileName(first.RepositoryPath.TrimEnd(Path.DirectorySeparatorChar)));
+        }
+    }
+
+    private async Task ObserveCommitTargetAsync(RepositorySolutionTarget target, CancellationToken ct)
     {
         if (!target.AutoIndex && !target.WatchGitHead) return;
-        var key = target.Key;
         try
         {
             var head = await _git.GetCurrentCommitAsync(target.RepositoryPath, ct).ConfigureAwait(false);
-            var firstObservation = !_lastObservedHead.TryGetValue(key, out var previous);
+            var firstObservation = !_lastObservedHead.TryGetValue(target.Key, out var previous);
             var changed = !firstObservation && !string.Equals(previous, head.Value, StringComparison.OrdinalIgnoreCase);
-            _lastObservedHead[key] = head.Value;
+            _lastObservedHead[target.Key] = head.Value;
             if (!(firstObservation && target.AutoIndex) && !(changed && target.WatchGitHead)) return;
 
-            var gate = _solutionLocks.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+            var gate = _solutionLocks.GetOrAdd(target.Key, _ => new SemaphoreSlim(1, 1));
             if (!await gate.WaitAsync(0, ct).ConfigureAwait(false)) return;
             try
             {
-                // The observed SHA is fixed for this job. If HEAD changes while indexing, the
-                // next observation schedules the newer commit and the stale job is never relabelled.
                 var result = await _indexHandler.HandleAsync(new JsonObject
                 {
                     ["repo_path"] = target.RepositoryPath,
                     ["solution_path"] = target.SolutionPath,
                     ["commit_sha"] = head.Value,
                 }, ct).ConfigureAwait(false);
-
                 if (result.IsError)
-                    _logger.LogError("Auto-index failed for {Repo} / {Solution}: {Error}",
-                        target.RepositoryPath, target.SolutionPath, result.Content);
+                    _logger.LogError("Commit index failed for {Solution}: {Error}",
+                        Path.GetFileName(target.SolutionPath), result.Content);
                 else
-                    _logger.LogInformation("Baseline ready for {Repo} / {Solution} at {Head}",
-                        target.RepositoryPath, target.SolutionPath, head.Value[..8]);
+                    _logger.LogInformation("Commit baseline ready for {Solution} at {Head}",
+                        Path.GetFileName(target.SolutionPath), head.Value[..8]);
             }
-            finally
-            {
-                gate.Release();
-            }
+            finally { gate.Release(); }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "Repository observation failed for {Repo} / {Solution}",
-                target.RepositoryPath, target.SolutionPath);
+            _logger.LogError(ex, "Repository observation failed for {Solution}",
+                Path.GetFileName(target.SolutionPath));
         }
     }
 
-    internal static IReadOnlyList<string> DiscoverGitRepositories(string rootPath)
+    internal static IReadOnlyList<string> DiscoverGitRepositories(
+        string rootPath,
+        IReadOnlyList<string>? configuredExcludes = null)
     {
         if (!Directory.Exists(rootPath)) return [];
+        var excludedNames = new HashSet<string>(ExcludedDirectoryNames, StringComparer.OrdinalIgnoreCase);
+        foreach (var pattern in configuredExcludes ?? [])
+            foreach (var segment in pattern.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries))
+                if (segment is not "**" and not "*") excludedNames.Add(segment.Trim('*'));
+
         var results = new List<string>();
         var pending = new Stack<string>();
         pending.Push(Path.GetFullPath(rootPath));
@@ -166,13 +234,9 @@ public sealed class RepositorySupervisor : BackgroundService
             {
                 if (IsGitRepository(directory)) results.Add(directory);
                 foreach (var child in Directory.GetDirectories(directory))
-                    if (!ExcludedDirectoryNames.Contains(Path.GetFileName(child)))
-                        pending.Push(child);
+                    if (!excludedNames.Contains(Path.GetFileName(child))) pending.Push(child);
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                // Continue with other repositories when one subtree cannot be read.
-            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
         return results.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }
@@ -181,18 +245,62 @@ public sealed class RepositorySupervisor : BackgroundService
         Directory.Exists(Path.Combine(path, ".git")) || File.Exists(Path.Combine(path, ".git"));
 
     private static IReadOnlyList<string> ResolveExplicitSolutions(
-        string repoRoot,
-        IReadOnlyList<string>? configuredSolutions)
+        string repositoryRoot,
+        IReadOnlyList<string>? configuredSolutions,
+        bool discoverSolutions)
     {
         if (configuredSolutions is not { Count: > 0 })
-            return IndexHandler.DiscoverSolutionPaths(repoRoot);
-
+            return discoverSolutions ? IndexHandler.DiscoverSolutionPaths(repositoryRoot) : [];
         return configuredSolutions
-            .Select(path => Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(repoRoot, path)))
+            .Select(path => Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(repositoryRoot, path)))
             .Where(File.Exists)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
+
+    internal static string? ResolveAndValidateDefault(
+        string repositoryRoot,
+        string? configuredDefault,
+        IReadOnlyList<string> solutions)
+    {
+        if (string.IsNullOrWhiteSpace(configuredDefault)) return null;
+        var resolved = Path.GetFullPath(Path.IsPathRooted(configuredDefault)
+            ? configuredDefault
+            : Path.Combine(repositoryRoot, configuredDefault));
+        var match = solutions.FirstOrDefault(solution =>
+            string.Equals(Path.GetFullPath(solution), resolved, StringComparison.OrdinalIgnoreCase));
+        if (match is null)
+            throw new InvalidOperationException(
+                "Configured defaultSolution must exist and be one of the discovered solutions.");
+        return match;
+    }
+
+    private static RepositorySolutionTarget CreateTarget(
+        string repositoryRoot,
+        string solution,
+        string? defaultSolution,
+        bool autoIndex,
+        bool watchGitHead,
+        int watchIntervalSeconds,
+        string indexMode,
+        string updateStrategy,
+        bool skipUnaffectedSolutions,
+        int retentionDays,
+        int maxRollingBranches,
+        int fullRebuildChangeThreshold) =>
+        new(
+            repositoryRoot,
+            solution,
+            autoIndex,
+            watchGitHead,
+            Math.Max(1, watchIntervalSeconds),
+            string.Equals(indexMode, "rollingBranch", StringComparison.OrdinalIgnoreCase),
+            string.Equals(updateStrategy, "incremental", StringComparison.OrdinalIgnoreCase),
+            defaultSolution is not null && string.Equals(solution, defaultSolution, StringComparison.OrdinalIgnoreCase),
+            skipUnaffectedSolutions,
+            Math.Max(1, retentionDays),
+            Math.Max(1, maxRollingBranches),
+            Math.Max(1, fullRebuildChangeThreshold));
 
     private static void AddTarget(
         IDictionary<string, RepositorySolutionTarget> targets,
@@ -204,7 +312,14 @@ internal sealed record RepositorySolutionTarget(
     string SolutionPath,
     bool AutoIndex,
     bool WatchGitHead,
-    int WatchIntervalSeconds)
+    int WatchIntervalSeconds,
+    bool IsRolling,
+    bool IsIncremental,
+    bool IsDefault,
+    bool SkipUnaffectedSolutions,
+    int RetentionDays,
+    int MaxRollingBranches,
+    int FullRebuildChangeThreshold)
 {
     public string Key => $"{Path.GetFullPath(RepositoryPath)}|{Path.GetFullPath(SolutionPath)}";
 }

@@ -3,7 +3,7 @@
 [![Upstream](https://img.shields.io/badge/upstream-bbajt%2Fcsharp--code--map-1f6feb)](https://github.com/bbajt/csharp-code-map)
 [![.NET](https://img.shields.io/badge/.NET-10-512BD4)](#)
 [![MCP Server](https://img.shields.io/badge/MCP-server-1f6feb)](#)
-[![Windows](https://img.shields.io/badge/portable-win--x64-0078D4)](#portable-windows-installation)
+[![Windows](https://img.shields.io/badge/Windows-x64-0078D4)](#windows-x64-installation)
 [![VS 2026](https://img.shields.io/badge/Visual%20Studio-2026-5C2D91)](#visual-studio-and-msbuild)
 [![C%23](https://img.shields.io/badge/C%23-Roslyn-239120)](#)
 [![VB.NET](https://img.shields.io/badge/VB.NET-Roslyn-512BD4)](#)
@@ -17,21 +17,27 @@
 > `LICENSE.MD` remains unchanged; this fork is distributed under the same
 > non-commercial open-source terms.
 
-This fork keeps CodeMap's Roslyn-powered semantic navigation and adds:
+## What MGsCodeMapMCP changes
+
+MGsCodeMapMCP keeps CodeMap's Roslyn-powered semantic navigation and adds:
 
 - Visual Studio 2026 and MSBuild 18 support while retaining VS 2022 support.
-- A separate semantic index for every `repository + solution + commit` combination.
-- Multiple `.sln`/`.slnx` files in one Git repository with explicit query routing.
-- Automatic repository/solution discovery and baseline refresh after Git HEAD changes.
-- Portable `data` and `logs` directories beside the executable—never inside analyzed repositories.
-- End-to-end VB.NET multi-solution isolation tests.
+- Rolling branch indexes: one shared immutable baseline plus small solution-specific overlays.
+- Fast impact checks across every discovered `.sln`/`.slnx`; unaffected solutions are skipped.
+- A configurable default solution, while explicit `solution_id` or `solution_path` still wins.
+- Non-blocking HEAD observation and atomic workspace switching: queries keep using the last
+  consistent index while an update is built.
+- Persisted branch state, safe hashed branch directories, retention, and overlay checkpoints.
+- Correct incremental C# and VB.NET updates across project references, renames, deletions,
+  partial/Designer files, caller graphs, and type relations.
+- Data and logs only below the configured MCP directories—never inside analyzed repositories.
 
 The upstream overview and tool reference remain below. Fork-specific installation and
 configuration take precedence where they differ from upstream CodeMap 2.8.0.
 
-## Portable Windows installation
+## Windows x64 installation
 
-1. Download [`MGsCodeMapMCP-win-x64.zip`](https://github.com/mg4life1337/MGsCodeMapMCP/releases/download/v2.8.0-mgs.1/MGsCodeMapMCP-win-x64.zip), or build the package yourself as described below.
+1. Download [`MGsCodeMapMCP-win-x64.zip`](https://github.com/mg4life1337/MGsCodeMapMCP/releases/latest/download/MGsCodeMapMCP-win-x64.zip), or build the package yourself as described below.
 2. Extract it to a stable writable directory, for example `C:\Tools\MGsCodeMapMCP`.
 3. Copy `codemap.example.json` to `codemap.json` and adjust repository roots or explicit solutions.
 4. Keep Visual Studio 2022/2026 or compatible MSBuild Build Tools installed. The package includes the .NET runtime, but Roslyn still needs MSBuild to evaluate real solutions.
@@ -54,14 +60,14 @@ Example MCP configuration for Codex:
 ```
 
 `CodeMap.Mcp.exe` and `CodeMap.Daemon.exe` are equivalent entry points in the
-portable package. MCP uses stdio, so do not start the executable in a separate console.
+Windows package. MCP uses stdio, so do not start the executable in a separate console.
 
-### Build the portable package yourself
+### Build the Windows package yourself
 
 From a Visual Studio Developer PowerShell or a shell with .NET 10:
 
 ```powershell
-.\scripts\build-portable-win-x64.ps1
+.\scripts\build-win-x64.ps1
 ```
 
 Output: `artifacts\release\MGsCodeMapMCP` and a matching ZIP archive.
@@ -83,7 +89,7 @@ Verify the fork and upstream version with:
 .\CodeMap.Mcp.exe --version
 ```
 
-### Portable data locations
+### Data locations
 
 Mutable files are never intentionally written into an analyzed repository. Defaults:
 
@@ -104,44 +110,55 @@ Data and log overrides are resolved in this order:
 Relative command-line and environment paths are EXE-relative. Relative configuration
 paths are relative to `codemap.json`, never to the current working directory.
 
-## Multi-repository and multi-solution configuration
+## Rolling multi-solution configuration
 
 ```json
 {
   "dataDirectory": ".\\data",
   "logDirectory": ".\\logs",
-  "repositoryRoots": [
-    {
-      "path": "D:\\Programming\\GitHub",
-      "discoverGitRepositories": true,
-      "discoverSolutions": true,
-      "autoIndex": true,
-      "watchGitHead": true,
-      "watchIntervalSeconds": 3
-    }
-  ],
   "repositories": [
     {
-      "root": "D:\\Programming\\GitHub\\Example\\Product",
-      "solutions": [
-        "src\\Product.Release.sln",
-        "tools\\Product.Tools.slnx"
-      ],
+      "root": "C:\\Source\\SampleRepository",
+      "discoverSolutions": true,
+      "defaultSolution": "src\\Primary.slnx",
+      "indexMode": "rollingBranch",
+      "updateStrategy": "incremental",
+      "checkAllSolutions": true,
+      "skipUnaffectedSolutions": true,
+      "servePreviousIndexWhileUpdating": true,
       "autoIndex": true,
-      "watchGitHead": true
+      "watchGitHead": true,
+      "watchIntervalSeconds": 3,
+      "retentionDays": 30,
+      "maxRollingBranches": 8
     }
   ]
 }
 ```
+
+Use either `repositoryRoots` for automatic discovery beneath a common source folder or
+`repositories` for repository-specific settings such as `defaultSolution`; do not duplicate
+the same repository in both arrays. With `discoverGitRepositories: true` and
+`discoverSolutions: true`, a root entry finds repositories and their solutions without any
+separate `repositories` entries.
 
 Explicit repository entries take precedence over discovered entries. Generated and tool
 directories including `bin`, `obj`, `.git`, `.vs`, `packages`, `.codemap`, and `.codex`
 are pruned during discovery. A failure in one solution does not stop other solutions.
 
 Every query tool accepts optional `solution_path` or `solution_id`. With one registered
-solution it is selected automatically. With multiple solutions, omitting the selector
-returns `AMBIGUOUS_SOLUTION` with the available IDs and paths; CodeMap never silently
-uses a different solution.
+solution it is selected automatically. With multiple solutions, selection order is explicit
+`solution_id`, explicit `solution_path`, configured `defaultSolution`, the only known solution,
+then `AMBIGUOUS_SOLUTION`. The default solution is also updated first.
+
+At every observed HEAD change all discovered solutions are checked against a persisted impact
+map. Only affected solutions are recompiled; documentation-only and unrelated changes are
+skipped. A branch created at an already indexed commit reuses that state without a full build.
+During `checking` or `updating`, `repo.status` reports `possibly_stale: true` and queries continue
+against the previous consistent workspace until the new overlay is atomically selected.
+
+See [Rolling branch indexing](docs/ROLLING-BRANCH-INDEXING.MD) for configuration, consistency,
+fallback, retention, migration, and troubleshooting details.
 
 ## Updating and rebuilding indexes
 
@@ -150,7 +167,8 @@ uses a different solution.
 - Inspect all solution baselines using `index.list_baselines`.
 - Preview retention cleanup using `index.cleanup` (dry-run is the default), then repeat with `dry_run: false`.
 - Remove every cached solution index for one repository using `index.remove_repo`; this is also dry-run by default.
-- No automatic retention deletion occurs. Branch changes create or reuse a commit-specific baseline.
+- Rolling branch state is retained according to `retentionDays` and `maxRollingBranches`.
+  Commit-specific baselines and the existing cleanup tools remain available.
 
 For source updates:
 
@@ -160,7 +178,7 @@ git checkout main
 git pull --ff-only origin main
 git rebase upstream/main
 dotnet build CodeMap.sln -c Release
-.\scripts\build-portable-win-x64.ps1
+.\scripts\build-win-x64.ps1
 ```
 
 Do not overwrite `codemap.json`, `data`, or `logs` when distributing an update.
@@ -470,8 +488,8 @@ tested against the codebase that implements it.
 ## Upstream package installation
 
 The NuGet package below belongs to the original upstream CodeMap project and does not
-contain this fork's VS 2026, multi-solution, watcher, or portable-storage changes. Use
-the [portable Windows installation](#portable-windows-installation) for MGsCodeMapMCP.
+contain this fork's VS 2026, multi-solution, watcher, or configured-storage changes. Use
+the [Windows x64 installation](#windows-x64-installation) for MGsCodeMapMCP.
 
 ### Original CodeMap .NET global tool
 
@@ -498,9 +516,9 @@ Uses the .NET SDK base image (~800MB) because `MSBuildWorkspace` needs MSBuild a
 
 ## Connect to Your AI Agent
 
-### Portable fork
+### MGsCodeMapMCP on Windows
 
-Use the absolute portable executable path in your client's MCP configuration:
+Use the absolute executable path in your client's MCP configuration:
 
 ```json
 {
@@ -594,7 +612,7 @@ Every response includes:
 - **Overlay revision** — which workspace revision answered the query
 - **Workspace ID** — which workspace context answered (null for committed mode)
 
-Structured logs are written to the resolved portable `logs` directory as daily JSON-lines
+Structured logs are written to the resolved `logs` directory as daily JSON-lines
 files. Cumulative savings are stored under the resolved `data` directory. Configuration
 defaults to `codemap.json` beside the executable and can be overridden with `--config`.
 
@@ -602,7 +620,7 @@ defaults to `codemap.json` beside the executable and can be overridden with `--c
 
 Baselines are stored under
 `data/repositories/<repoId>/solutions/<solutionId>/baselines/<commitSha>/` as binary
-segment files. Solution-scoped overlays live under the same portable data root. Use
+segment files. Solution-scoped overlays live under the same configured data root. Use
 `index.list_baselines` to inspect and `index.cleanup` to reclaim space.
 
 ---

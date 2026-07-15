@@ -84,12 +84,17 @@ public class WorkspaceManager
         await _overlayStore.CreateOverlayAsync(repoId, workspaceId, baselineCommitSha, ct)
                             .ConfigureAwait(false);
 
+        // Persisted overlays may already contain revisions from an earlier daemon process.
+        // Reattach to that exact revision instead of incorrectly reporting revision zero.
+        var persistedRevision = await _overlayStore.GetRevisionAsync(repoId, workspaceId, ct)
+                                                   .ConfigureAwait(false);
+
         // 4. Register in memory
         var info = new WorkspaceInfo(
             WorkspaceId: workspaceId,
             RepoId: repoId,
             BaselineCommitSha: baselineCommitSha,
-            CurrentRevision: 0,
+            CurrentRevision: persistedRevision,
             SolutionPath: solutionPath,
             RepoRootPath: repoRootPath,
             CreatedAt: DateTimeOffset.UtcNow);
@@ -99,7 +104,7 @@ public class WorkspaceManager
             workspaceId.Value, repoId.Value, baselineCommitSha.Value[..8]);
 
         return Result<CreateWorkspaceResponse, CodeMapError>.Success(
-            new CreateWorkspaceResponse(workspaceId, baselineCommitSha, 0));
+            new CreateWorkspaceResponse(workspaceId, baselineCommitSha, persistedRevision));
     }
 
     // ── RefreshOverlayAsync ───────────────────────────────────────────────────
@@ -146,6 +151,10 @@ public class WorkspaceManager
             deletedFiles = fileChanges
                 .Where(fc => fc.Kind == FileChangeKind.Deleted)
                 .Select(fc => fc.FilePath)
+                .Concat(fileChanges
+                    .Where(fc => fc.Kind == FileChangeKind.Renamed && fc.OldFilePath.HasValue)
+                    .Select(fc => fc.OldFilePath!.Value))
+                .Distinct()
                 .ToList();
         }
 

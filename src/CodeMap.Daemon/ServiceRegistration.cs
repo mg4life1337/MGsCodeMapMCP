@@ -1,6 +1,7 @@
 namespace CodeMap.Daemon;
 
 using CodeMap.Core.Interfaces;
+using CodeMap.Core.Models;
 using CodeMap.Git;
 using CodeMap.Mcp;
 using CodeMap.Mcp.Context;
@@ -11,6 +12,7 @@ using CodeMap.Roslyn;
 using CodeMap.Roslyn.Extraction;
 using CodeMap.Storage.Engine;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
@@ -24,7 +26,7 @@ public static class ServiceRegistration
     /// </summary>
     /// <param name="services">The service collection to populate.</param>
     /// <param name="baseDir">
-    /// Portable data directory resolved by <see cref="RuntimeConfiguration"/>.
+    /// Data directory resolved by <see cref="RuntimeConfiguration"/>.
     /// </param>
     /// <remarks>
     /// Registration order is significant:
@@ -49,6 +51,13 @@ public static class ServiceRegistration
         string? sharedCacheDir = null)
     {
         var resolvedBaseDir = Path.GetFullPath(baseDir);
+        services.TryAddSingleton(new RuntimeConfiguration(
+            new CodeMapConfig(),
+            resolvedBaseDir,
+            Path.Combine(resolvedBaseDir, "codemap.json"),
+            resolvedBaseDir,
+            Path.Combine(resolvedBaseDir, "logs"),
+            null));
 
         // ── Git ───────────────────────────────────────────────────────────────
         services.AddSingleton<IGitService, GitService>();
@@ -111,6 +120,9 @@ public static class ServiceRegistration
         // Context registries — in-memory, per-process. No persistence across daemon restarts.
         services.AddSingleton<IRepoRegistry, RepoRegistry>();
         services.AddSingleton<IWorkspaceStickyRegistry, WorkspaceStickyRegistry>();
+        services.AddSingleton<RollingIndexCoordinator>();
+        services.AddSingleton<IRollingIndexStatusProvider>(sp =>
+            sp.GetRequiredService<RollingIndexCoordinator>());
         services.AddSingleton<RepoStatusHandler>();
         services.AddSingleton<IBaselineScanner>(new EngineBaselineScanner(storeDir));
         services.AddSingleton<IndexHandler>(sp => new IndexHandler(

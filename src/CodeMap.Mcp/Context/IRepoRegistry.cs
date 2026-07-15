@@ -21,11 +21,17 @@ public interface IRepoRegistry
     /// <summary>Records a solution available for a repository.</summary>
     void RegisterSolution(string repoPath, SolutionRegistration solution);
 
+    /// <summary>Sets the configured default solution for a repository.</summary>
+    void SetDefaultSolution(string repoPath, Core.Types.SolutionId solutionId);
+
     /// <summary>Removes a repo from the registry. No-op if not present.</summary>
     void Forget(string repoPath);
 
     /// <summary>Snapshot of all known repo paths (normalized).</summary>
     IReadOnlyList<string> KnownRepos { get; }
+
+    /// <summary>Returns all registered solutions for a repository.</summary>
+    IReadOnlyList<SolutionRegistration> GetSolutions(string repoPath);
 
     /// <summary>
     /// Resolves an argument value into a concrete repo path.
@@ -40,7 +46,7 @@ public interface IRepoRegistry
 
     /// <summary>
     /// Resolves optional solution_id/solution_path input. A single known solution is selected
-    /// automatically; multiple solutions produce a structured ambiguity error.
+    /// automatically; a configured default is preferred when multiple solutions are known.
     /// </summary>
     ResolveSolutionResult ResolveSolution(
         string repoPath,

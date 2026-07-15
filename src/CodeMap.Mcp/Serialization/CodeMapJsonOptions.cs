@@ -27,6 +27,8 @@ public static class CodeMapJsonOptions
         opts.Converters.Add(new CommitShaJsonConverter());
         opts.Converters.Add(new SymbolIdJsonConverter());
         opts.Converters.Add(new FilePathJsonConverter());
+        opts.Converters.Add(new SolutionIdJsonConverter());
+        opts.Converters.Add(new WorkspaceIdJsonConverter());
         opts.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower));
 
         return opts;
