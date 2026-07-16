@@ -78,14 +78,32 @@ public sealed record RuntimeConfiguration(
         try
         {
             var json = File.ReadAllText(configPath);
-            return JsonSerializer.Deserialize<CodeMapConfig>(json, JsonOptions)
+            var config = JsonSerializer.Deserialize<CodeMapConfig>(json, JsonOptions)
                 ?? throw new InvalidOperationException("The configuration file contains JSON null.");
+            ValidateIndexingResources(config.IndexingResources);
+            return config;
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
         {
             throw new InvalidOperationException(
                 $"Could not read CodeMap configuration '{configPath}': {ex.Message}", ex);
         }
+    }
+
+    private static void ValidateIndexingResources(IndexingResourceConfig? resources)
+    {
+        if (resources is null) return;
+        ValidateRange(resources.MaxConcurrentIndexes, 1, 16, "indexingResources.maxConcurrentIndexes");
+        ValidateRange(resources.MaxParallelProjects, 1, 64, "indexingResources.maxParallelProjects");
+        ValidateRange(resources.IncrementalSolutionCacheSize, 1, 16, "indexingResources.incrementalSolutionCacheSize");
+        ValidateRange(resources.IncrementalSolutionCacheIdleMinutes, 1, 1440, "indexingResources.incrementalSolutionCacheIdleMinutes");
+    }
+
+    private static void ValidateRange(int value, int minimum, int maximum, string name)
+    {
+        if (value < minimum || value > maximum)
+            throw new InvalidOperationException(
+                $"{name} must be between {minimum} and {maximum}; configured value was {value}.");
     }
 
     internal static string ResolvePath(string value, string relativeTo)

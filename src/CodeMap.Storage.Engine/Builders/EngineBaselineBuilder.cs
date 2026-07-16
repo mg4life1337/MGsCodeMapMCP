@@ -1,6 +1,7 @@
 namespace CodeMap.Storage.Engine;
 
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using CodeMap.Core.Enums;
 using CodeMap.Core.Interfaces;
@@ -88,8 +89,6 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
 
             // ── Phase 2: Map symbols to SymbolRecords ────────────────────────
             var symbolRecords = new SymbolRecord[validSymbols.Count];
-            var searchData = new List<(int SymbolIntId, string Fqn, string DisplayName, string? Namespace, string? Signature, string? Documentation)>(validSymbols.Count);
-
             for (var i = 0; i < validSymbols.Count; i++)
             {
                 ct.ThrowIfCancellationRequested();
@@ -136,12 +135,11 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
                     signatureHash: 0 // Phase 3: not computed
                 );
 
-                searchData.Add((intId, fqn, displayName, sym.Namespace, sym.Signature, sym.Documentation));
             }
 
             // ── Phase 3: Map files to FileRecords + collect content ──────────
             var fileRecords = new FileRecord[input.Files.Count];
-            var contentBodies = new List<byte[]>(input.Files.Count);
+            var contentCount = 0;
 
             for (var i = 0; i < input.Files.Count; i++)
             {
@@ -157,8 +155,7 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
                 var contentId = 0;
                 if (file.Content != null)
                 {
-                    contentBodies.Add(Encoding.UTF8.GetBytes(file.Content));
-                    contentId = contentBodies.Count; // 1-based
+                    contentId = ++contentCount; // 1-based
                 }
 
                 fileRecords[i] = new FileRecord(
@@ -257,8 +254,6 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
                 ));
             }
 
-            var edgeRecords = validEdges.ToArray();
-
             // ── Phase 6: Map facts to FactRecords ────────────────────────────
             var validFacts = new List<FactRecord>();
             var factId = 0;
@@ -292,20 +287,19 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
                 ));
             }
 
-            var factRecords = validFacts.ToArray();
-
             // ── Phase 7: Write dictionary.seg ────────────────────────────────
             var dictPath = Path.Combine(tempDir, "dictionary.seg");
             // SearchIndexBuilder also interns tokens into the dictionary
             var searchPath = Path.Combine(tempDir, "search.idx");
-            SearchIndexBuilder.Build(searchPath, searchData, dictBuilder);
+            SearchIndexBuilder.Build(searchPath, validSymbols, dictBuilder);
 
             var nStringIds = dictBuilder.Count;
             using var dictReader = dictBuilder.Build(dictPath);
+            IndexMemoryTelemetry.MarkPhase("storage-dictionary-written");
 
             // ── Phase 8: Write content.seg ───────────────────────────────────
             var contentPath = Path.Combine(tempDir, "content.seg");
-            ContentSegmentWriter.Write(contentPath, contentBodies);
+            ContentSegmentWriter.WriteFiles(contentPath, input.Files);
 
             // ── Phase 9: Write record segments ───────────────────────────────
             var symbolsPath = Path.Combine(tempDir, "symbols.seg");
@@ -317,13 +311,15 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
             SegmentWriter.Write(symbolsPath, symbolRecords);
             SegmentWriter.Write(filesPath, fileRecords);
             SegmentWriter.Write(projectsPath, projectRecords);
-            SegmentWriter.Write(edgesPath, edgeRecords);
-            SegmentWriter.Write(factsPath, factRecords);
+            SegmentWriter.Write<EdgeRecord>(edgesPath, CollectionsMarshal.AsSpan(validEdges));
+            SegmentWriter.Write<FactRecord>(factsPath, CollectionsMarshal.AsSpan(validFacts));
 
             // ── Phase 10: Build adjacency indexes ────────────────────────────
             var adjOutPath = Path.Combine(tempDir, "adjacency-out.idx");
             var adjInPath = Path.Combine(tempDir, "adjacency-in.idx");
-            AdjacencyIndexBuilder.Build(adjOutPath, adjInPath, edgeRecords, validSymbols.Count);
+            AdjacencyIndexBuilder.Build(
+                adjOutPath, adjInPath, CollectionsMarshal.AsSpan(validEdges), validSymbols.Count);
+            IndexMemoryTelemetry.MarkPhase("storage-segments-written");
 
             // search.idx was already written in Phase 7
 
@@ -360,8 +356,8 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
                 SymbolCount: symbolRecords.Length,
                 FileCount: fileRecords.Length,
                 ProjectCount: projectRecords.Length,
-                EdgeCount: edgeRecords.Length,
-                FactCount: factRecords.Length,
+                EdgeCount: validEdges.Count,
+                FactCount: validFacts.Count,
                 NStringIds: nStringIds,
                 Segments: segments,
                 RepoRootPath: input.RepoRootPath,
@@ -390,8 +386,8 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
                 BaselinePath: finalDir,
                 Elapsed: sw.Elapsed,
                 SymbolCount: symbolRecords.Length,
-                EdgeCount: edgeRecords.Length,
-                FactCount: factRecords.Length,
+                EdgeCount: validEdges.Count,
+                FactCount: validFacts.Count,
                 FileCount: fileRecords.Length,
                 Success: true);
         }

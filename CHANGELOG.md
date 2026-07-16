@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.8.0-mgs.4
+
+- Bounded full baseline builds to one concurrent index and Roslyn reference extraction to two
+  projects by default; discovery and solution-impact checks remain independent.
+- Reduced peak allocations by streaming source content, dictionary values, search postings,
+  adjacency postings, edges, and facts directly into immutable baseline segments.
+- Limited the incremental workspace cache to one solution with five-minute idle eviction.
+- Added configurable indexing resource limits and optional peak working-set, private-memory,
+  managed-heap, and phase telemetry without repository names or paths in memory log entries.
+- Renamed the native host output to `MGsCodeMap.Mcp` on every supported platform. Windows
+  releases no longer include either legacy executable name; MCP clients must update `command`.
+- Added resource-limit, concurrency, cache eviction, storage parity, executable archive, and
+  large-solution measurement coverage.
+- Measured a 4.60 GiB median peak working set across three cold large VB.NET runs, about 49%
+  below the previously observed 9 GiB, while preserving 164,162 symbols and 1,001,683 references.
+
 ## 2.8.0-mgs.3
 
 - Added Roslyn change classification for semantic no-ops, method bodies, project-local API,

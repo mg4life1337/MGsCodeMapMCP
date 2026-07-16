@@ -156,6 +156,50 @@ public sealed class ConfigLoadingTests : IDisposable
     }
 
     [Fact]
+    public void LoadConfig_IndexingResources_ReadsAllOptions()
+    {
+        var configPath = Path.Combine(_tempDir, "codemap.json");
+        File.WriteAllText(configPath, """
+            {
+              "indexingResources": {
+                "maxConcurrentIndexes": 2,
+                "maxParallelProjects": 3,
+                "incrementalSolutionCacheSize": 2,
+                "incrementalSolutionCacheIdleMinutes": 10,
+                "memoryTelemetry": false
+              }
+            }
+            """);
+
+        var resources = RuntimeConfiguration.LoadConfig(configPath).IndexingResources;
+
+        resources.Should().NotBeNull();
+        resources!.MaxConcurrentIndexes.Should().Be(2);
+        resources.MaxParallelProjects.Should().Be(3);
+        resources.IncrementalSolutionCacheSize.Should().Be(2);
+        resources.IncrementalSolutionCacheIdleMinutes.Should().Be(10);
+        resources.MemoryTelemetry.Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("maxConcurrentIndexes", 0)]
+    [InlineData("maxParallelProjects", 0)]
+    [InlineData("incrementalSolutionCacheSize", 0)]
+    [InlineData("incrementalSolutionCacheIdleMinutes", 0)]
+    public void LoadConfig_InvalidIndexingResource_RejectsValue(string property, int value)
+    {
+        var configPath = Path.Combine(_tempDir, "codemap.json");
+        File.WriteAllText(configPath, $$"""
+            { "indexingResources": { "{{property}}": {{value}} } }
+            """);
+
+        var act = () => RuntimeConfiguration.LoadConfig(configPath);
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage($"*indexingResources.{property}*");
+    }
+
+    [Fact]
     public void CodeMapConfig_DefaultRecord_HasPortableDefaults()
     {
         var config = new CodeMapConfig();
@@ -167,5 +211,13 @@ public sealed class ConfigLoadingTests : IDisposable
         config.MsBuildPath.Should().BeNull();
         config.RepositoryRoots.Should().BeNull();
         config.Repositories.Should().BeNull();
+        config.IndexingResources.Should().BeNull();
+
+        var resources = config.IndexingResources ?? new IndexingResourceConfig();
+        resources.MaxConcurrentIndexes.Should().Be(1);
+        resources.MaxParallelProjects.Should().Be(2);
+        resources.IncrementalSolutionCacheSize.Should().Be(1);
+        resources.IncrementalSolutionCacheIdleMinutes.Should().Be(5);
+        resources.MemoryTelemetry.Should().BeTrue();
     }
 }

@@ -17,7 +17,7 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodeMap.Query", "src\CodeMa
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodeMap.Mcp", "src\CodeMap.Mcp\CodeMap.Mcp.csproj", "{9FC89166-9CCB-446F-A3CE-D720436FEB53}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodeMap.Daemon", "src\CodeMap.Daemon\CodeMap.Daemon.csproj", "{044FB897-9A05-490C-97D3-4854DF990007}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MGsCodeMap.Mcp", "src\CodeMap.Daemon\MGsCodeMap.Mcp.csproj", "{044FB897-9A05-490C-97D3-4854DF990007}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CodeMap.TestUtilities", "tests\CodeMap.TestUtilities\CodeMap.TestUtilities.csproj", "{10FDD3FA-6AB8-4E66-ACE2-E6D50A7A0DD5}"
 EndProject

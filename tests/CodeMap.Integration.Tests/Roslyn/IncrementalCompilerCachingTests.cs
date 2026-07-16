@@ -2,6 +2,7 @@ namespace CodeMap.Integration.Tests.Roslyn;
 
 using System.Diagnostics;
 using CodeMap.Core.Types;
+using CodeMap.Core.Models;
 using CodeMap.Roslyn;
 using CodeMap.Storage;
 using FluentAssertions;
@@ -50,7 +51,12 @@ public sealed class IncrementalCompilerCachingTests : IAsyncLifetime
         _baseline = store;
 
         var differ = new SymbolDiffer(NullLogger<SymbolDiffer>.Instance);
-        _compiler = new IncrementalCompiler(differ, NullLogger<IncrementalCompiler>.Instance);
+        _compiler = new IncrementalCompiler(
+            differ,
+            NullLogger<IncrementalCompiler>.Instance,
+            new IndexingResourceConfig(
+                IncrementalSolutionCacheSize: 1,
+                IncrementalSolutionCacheIdleMinutes: 5));
     }
 
     public ValueTask DisposeAsync()
@@ -156,5 +162,44 @@ public sealed class IncrementalCompilerCachingTests : IAsyncLifetime
         // Should not throw even if called before any ComputeDeltaAsync
         var act = () => _compiler.Dispose();
         act.Should().NotThrow();
+    }
+
+    [Fact]
+    public async Task Cache_IdleSolution_IsReleasedAfterConfiguredTimeout()
+    {
+        await _compiler.ComputeDeltaAsync(
+            SampleSolutionPath, SampleSolutionDir,
+            [ChangedFile], _baseline, Repo, Sha, currentRevision: 0);
+
+        _compiler.CachedSolutionCount.Should().Be(1);
+        _compiler.TrimIdleSolutions(DateTimeOffset.UtcNow.AddMinutes(6)).Should().Be(1);
+        _compiler.CachedSolutionCount.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Cache_SecondSolution_EvictsLeastRecentlyUsedSolution()
+    {
+        await _compiler.ComputeDeltaAsync(
+            SampleSolutionPath, SampleSolutionDir,
+            [ChangedFile], _baseline, Repo, Sha, currentRevision: 0);
+
+        var copyRoot = Path.Combine(_tempDir, "second-solution");
+        CopyDirectory(SampleSolutionDir, copyRoot);
+        var secondSolution = Path.Combine(copyRoot, Path.GetFileName(SampleSolutionPath));
+
+        await _compiler.ComputeDeltaAsync(
+            secondSolution, copyRoot,
+            [ChangedFile], _baseline, Repo, Sha, currentRevision: 1);
+
+        _compiler.CachedSolutionCount.Should().Be(1);
+    }
+
+    private static void CopyDirectory(string source, string destination)
+    {
+        Directory.CreateDirectory(destination);
+        foreach (var file in Directory.EnumerateFiles(source))
+            File.Copy(file, Path.Combine(destination, Path.GetFileName(file)));
+        foreach (var directory in Directory.EnumerateDirectories(source))
+            CopyDirectory(directory, Path.Combine(destination, Path.GetFileName(directory)));
     }
 }

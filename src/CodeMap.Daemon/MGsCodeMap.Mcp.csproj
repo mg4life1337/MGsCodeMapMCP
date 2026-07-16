@@ -2,12 +2,14 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <RootNamespace>CodeMap.Daemon</RootNamespace>
+    <AssemblyName>MGsCodeMap.Mcp</AssemblyName>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 
     <!-- .NET Global Tool -->
     <PackAsTool>true</PackAsTool>
-    <ToolCommandName>codemap-mcp</ToolCommandName>
-    <PackageId>codemap-mcp</PackageId>
-    <Version>2.8.0-mgs.3</Version>
+    <ToolCommandName>mgscodemap-mcp</ToolCommandName>
+    <PackageId>MGsCodeMapMCP</PackageId>
+    <Version>2.8.0-mgs.4</Version>
     <PackageOutputPath>..\..\dist\nupkg</PackageOutputPath>
 
     <!-- NuGet package description (overrides Directory.Build.props for the tool package) -->
@@ -25,7 +27,7 @@ Key capabilities:
 - Workspace mode — see uncommitted edits via incremental overlay (~63ms refresh)
 - Shared baseline cache — index once, reuse across machines (CODEMAP_CACHE_DIR)
 
-Usage: add 'codemap-mcp' as an MCP server in your AI agent config. See README for setup.</PackageDescription>
+Usage: add 'mgscodemap-mcp' as an MCP server in your AI agent config. See README for setup.</PackageDescription>
 
     <!-- Single-file publish: only when a RID is specified (self-contained builds).
          dotnet pack does not set RuntimeIdentifier, so this is a no-op during pack.

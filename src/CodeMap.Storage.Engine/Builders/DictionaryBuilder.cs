@@ -1,5 +1,6 @@
 namespace CodeMap.Storage.Engine;
 
+using System.Buffers;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -12,7 +13,7 @@ using System.Text;
 internal sealed class DictionaryBuilder : IDictionaryBuilder
 {
     private readonly Dictionary<string, int> _map = new(StringComparer.Ordinal);
-    private readonly List<byte[]> _utf8Values = [];
+    private readonly List<string> _values = [];
     private bool _built;
 
     /// <inheritdoc />
@@ -31,7 +32,7 @@ internal sealed class DictionaryBuilder : IDictionaryBuilder
 
         var id = _map.Count + 1; // 1-based
         _map[value] = id;
-        _utf8Values.Add(Encoding.UTF8.GetBytes(value));
+        _values.Add(value);
         return id;
     }
 
@@ -61,7 +62,7 @@ internal sealed class DictionaryBuilder : IDictionaryBuilder
         for (var i = 0; i < count; i++)
         {
             offsets[i] = runningOffset;
-            runningOffset += (uint)_utf8Values[i].Length;
+            runningOffset += (uint)Encoding.UTF8.GetByteCount(_values[i]);
         }
         offsets[count] = runningOffset; // sentinel = total blob size
 
@@ -82,13 +83,27 @@ internal sealed class DictionaryBuilder : IDictionaryBuilder
                 bw.Write(offset);
 
             // DataBlob
-            foreach (var utf8 in _utf8Values)
-                bw.Write(utf8);
+            foreach (var value in _values)
+            {
+                var byteCount = Encoding.UTF8.GetByteCount(value);
+                var buffer = ArrayPool<byte>.Shared.Rent(byteCount);
+                try
+                {
+                    var written = Encoding.UTF8.GetBytes(value, buffer);
+                    bw.Write(buffer, 0, written);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            }
 
             bw.Flush();
             fs.Flush(true);
         }
 
+        _map.Clear();
+        _values.Clear();
         return new DictionaryReader(targetPath);
     }
 
@@ -96,5 +111,7 @@ internal sealed class DictionaryBuilder : IDictionaryBuilder
     {
         // No unmanaged resources; just mark as unusable.
         _built = true;
+        _map.Clear();
+        _values.Clear();
     }
 }

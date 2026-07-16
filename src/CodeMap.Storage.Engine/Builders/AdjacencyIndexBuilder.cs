@@ -15,40 +15,36 @@ internal static class AdjacencyIndexBuilder
     /// </summary>
     public static void Build(string outPath, string inPath, ReadOnlySpan<EdgeRecord> edges, int maxSymbolId)
     {
-        // Collect outgoing (From → EdgeIntId) and incoming (To → EdgeIntId)
-        var outgoing = new Dictionary<int, List<int>>();
-        var incoming = new Dictionary<int, List<int>>();
-
-        foreach (ref readonly var edge in edges)
-        {
-            if (edge.FromSymbolIntId > 0)
-            {
-                if (!outgoing.TryGetValue(edge.FromSymbolIntId, out var outList))
-                {
-                    outList = [];
-                    outgoing[edge.FromSymbolIntId] = outList;
-                }
-                outList.Add(edge.EdgeIntId);
-            }
-
-            if (edge.ToSymbolIntId > 0)
-            {
-                if (!incoming.TryGetValue(edge.ToSymbolIntId, out var inList))
-                {
-                    inList = [];
-                    incoming[edge.ToSymbolIntId] = inList;
-                }
-                inList.Add(edge.EdgeIntId);
-            }
-        }
-
-        WriteIndex(outPath, outgoing, maxSymbolId);
-        WriteIndex(inPath, incoming, maxSymbolId);
+        // Build and release one direction at a time. Keeping both posting maps alive
+        // duplicates the largest adjacency intermediate on reference-heavy solutions.
+        BuildDirection(outPath, edges, maxSymbolId, outgoing: true);
+        BuildDirection(inPath, edges, maxSymbolId, outgoing: false);
     }
 
     /// <summary>Array overload for convenience.</summary>
     public static void Build(string outPath, string inPath, EdgeRecord[] edges, int maxSymbolId)
         => Build(outPath, inPath, (ReadOnlySpan<EdgeRecord>)edges, maxSymbolId);
+
+    private static void BuildDirection(
+        string path,
+        ReadOnlySpan<EdgeRecord> edges,
+        int maxSymbolId,
+        bool outgoing)
+    {
+        var adjacency = new Dictionary<int, List<int>>();
+        foreach (ref readonly var edge in edges)
+        {
+            var symbolId = outgoing ? edge.FromSymbolIntId : edge.ToSymbolIntId;
+            if (symbolId <= 0) continue;
+            if (!adjacency.TryGetValue(symbolId, out var list))
+            {
+                list = [];
+                adjacency[symbolId] = list;
+            }
+            list.Add(edge.EdgeIntId);
+        }
+        WriteIndex(path, adjacency, maxSymbolId);
+    }
 
     private static void WriteIndex(string path, Dictionary<int, List<int>> adjacency, int maxSymbolId)
     {
@@ -56,10 +52,14 @@ internal static class AdjacencyIndexBuilder
         foreach (var list in adjacency.Values)
             list.Sort();
 
-        // Build postings region into memory
-        using var postingsStream = new MemoryStream();
         var headerTable = new uint[maxSymbolId + 2]; // indices [0..maxSymbolId+1]
-        var intBuf = new byte[4]; // reusable buffer for int32 writes
+        var recordCount = adjacency.Count;
+
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+        var postingsStart = StorageConstants.SegFileHeaderSize +
+            (long)headerTable.Length * sizeof(uint);
+        fs.Position = postingsStart;
+        Span<byte> intBuf = stackalloc byte[4];
 
         for (var symbolId = 1; symbolId <= maxSymbolId; symbolId++)
         {
@@ -71,35 +71,24 @@ internal static class AdjacencyIndexBuilder
 
             // Block offset relative to PostingsRegion start
             // +1 because offset 0 means "no edges", so we use 1-based offsets
-            headerTable[symbolId] = (uint)postingsStream.Position + 1;
+            headerTable[symbolId] = checked((uint)(fs.Position - postingsStart)) + 1;
 
             // Write [Count][EdgeIntIds...]
             BitConverter.TryWriteBytes(intBuf, edgeIds.Count);
-            postingsStream.Write(intBuf);
+            fs.Write(intBuf);
 
             foreach (var edgeId in edgeIds)
             {
                 BitConverter.TryWriteBytes(intBuf, edgeId);
-                postingsStream.Write(intBuf);
+                fs.Write(intBuf);
             }
+            adjacency.Remove(symbolId);
         }
 
         // Sentinel: total postings region size + 1
-        headerTable[maxSymbolId + 1] = (uint)postingsStream.Position + 1;
+        headerTable[maxSymbolId + 1] = checked((uint)(fs.Position - postingsStart)) + 1;
 
-        var postingsBytes = postingsStream.ToArray();
-
-        // Count symbols with edges for RecordCount (exclude sentinel at maxSymbolId+1)
-        var recordCount = 0;
-        for (var symbolId = 1; symbolId <= maxSymbolId; symbolId++)
-        {
-            if (headerTable[symbolId] != 0) recordCount++;
-        }
-
-        // Write file
-        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
-
-        // SegmentFileHeader
+        fs.Position = 0;
         Span<byte> header = stackalloc byte[StorageConstants.SegFileHeaderSize];
         BitConverter.TryWriteBytes(header, StorageConstants.SegmentMagic);
         BitConverter.TryWriteBytes(header[4..], (ushort)StorageConstants.FormatMajor);
@@ -108,11 +97,7 @@ internal static class AdjacencyIndexBuilder
         BitConverter.TryWriteBytes(header[12..], 0u);
         fs.Write(header);
 
-        // HeaderTable
         fs.Write(MemoryMarshal.AsBytes(headerTable.AsSpan()));
-
-        // PostingsRegion
-        fs.Write(postingsBytes);
         fs.Flush(true);
     }
 

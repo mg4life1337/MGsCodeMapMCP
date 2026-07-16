@@ -13,7 +13,21 @@ public record CodeMapConfig(
     string? LogDirectory = null,
     string? MsBuildPath = null,
     IReadOnlyList<RepositoryRootConfig>? RepositoryRoots = null,
-    IReadOnlyList<RepositoryConfig>? Repositories = null
+    IReadOnlyList<RepositoryConfig>? Repositories = null,
+    IndexingResourceConfig? IndexingResources = null
+);
+
+/// <summary>
+/// Process-wide resource limits for semantic indexing. Missing configuration uses these
+/// conservative defaults so repository discovery cannot start several memory-intensive
+/// Roslyn builds at once.
+/// </summary>
+public sealed record IndexingResourceConfig(
+    int MaxConcurrentIndexes = 1,
+    int MaxParallelProjects = 2,
+    int IncrementalSolutionCacheSize = 1,
+    int IncrementalSolutionCacheIdleMinutes = 5,
+    bool MemoryTelemetry = true
 );
 
 /// <summary>Automatic repository and solution discovery beneath a common root.</summary>

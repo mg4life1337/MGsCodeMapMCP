@@ -139,6 +139,23 @@ wrote four symbols, updated only that document's relations, and completed in 4.3
 resulting overlay data for both changes was 1,429 bytes. These measurements are evidence for
 that isolated repository, not universal timing guarantees.
 
+### Indexing resource limits
+
+Starting with `2.8.0-mgs.4`, full baseline builds share a process-wide concurrency gate. The
+default permits one memory-intensive build while discovery and solution-impact checks continue
+independently. Roslyn reference and fact extraction processes at most two projects concurrently.
+The rolling workspace cache retains one solution and releases it after five idle minutes.
+
+These defaults are configurable under `indexingResources`. Peak working set, private memory,
+and managed heap are returned in `IndexStats` when `memoryTelemetry` is enabled. Phase telemetry
+contains only phase names, durations, and memory values; it does not add repository names or paths.
+
+Three cold full-index measurements on the same isolated large VB.NET copy returned 164,162
+symbols and 1,001,683 references in every run. Peak working set was 4,750.1, 4,622.5, and
+4,705.6 MiB, giving a 4,705.6 MiB (4.60 GiB) median. This is about 49% below the previously
+observed 9 GiB. Median end-to-end duration was 87.63 seconds, compared with the earlier
+103.48-second reference run. These values are specific to the validation input.
+
 ## Consistency and status
 
 Each update is built in a new shadow workspace. The active solution-specific workspace is

@@ -1,6 +1,7 @@
 namespace CodeMap.Roslyn.Tests;
 
 using CodeMap.Core.Types;
+using CodeMap.Core.Models;
 using CodeMap.Roslyn;
 using CodeMap.Roslyn.Tests.Helpers;
 using FluentAssertions;
@@ -16,6 +17,17 @@ using Microsoft.Extensions.Logging.Abstractions;
 /// </summary>
 public class Pass2ParallelExecutionTests
 {
+    [Fact]
+    public void GetPass2Parallelism_UsesConfiguredLimit()
+    {
+        var compiler = new RoslynCompiler(
+            NullLogger<RoslynCompiler>.Instance,
+            new IndexingResourceConfig(MaxParallelProjects: 2));
+
+        compiler.GetPass2Parallelism(8).Should().Be(2);
+        compiler.GetPass2Parallelism(1).Should().Be(1);
+    }
+
     private static RoslynCompiler.ProjectPassData BuildPassData(
         string canonicalName, string source, string projectFileName)
     {

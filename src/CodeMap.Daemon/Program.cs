@@ -28,8 +28,8 @@ internal static class Program
         {
             var version = typeof(Program).Assembly
                 .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
-                ?.InformationalVersion ?? "1.0.0";
-            Console.WriteLine($"MGsCodeMapMCP {version} (upstream CodeMap 2.8.0)");
+                ?.InformationalVersion ?? "2.8.0-mgs.4";
+            Console.WriteLine($"MGsCodeMapMCP {version}");
             return;
         }
 

@@ -1,5 +1,5 @@
 # === Build stage ===
-FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
 # Copy solution and project files first for layer caching
@@ -11,11 +11,11 @@ COPY src/CodeMap.Storage/*.csproj src/CodeMap.Storage/
 COPY src/CodeMap.Query/*.csproj src/CodeMap.Query/
 COPY src/CodeMap.Mcp/*.csproj src/CodeMap.Mcp/
 COPY src/CodeMap.Daemon/*.csproj src/CodeMap.Daemon/
-RUN dotnet restore src/CodeMap.Daemon/CodeMap.Daemon.csproj
+RUN dotnet restore src/CodeMap.Daemon/MGsCodeMap.Mcp.csproj
 
 # Copy source and publish
 COPY src/ src/
-RUN dotnet publish src/CodeMap.Daemon -c Release -o /app/publish --no-restore
+RUN dotnet publish src/CodeMap.Daemon/MGsCodeMap.Mcp.csproj -c Release -o /app/publish --no-restore
 
 # === Runtime stage ===
 # NOTE: Using the SDK image (not runtime-only) because MSBuildWorkspace requires
@@ -25,7 +25,7 @@ RUN dotnet publish src/CodeMap.Daemon -c Release -o /app/publish --no-restore
 # Alternatives:
 # (b) Copy MSBuild from build stage into the runtime image — more complex, smaller.
 # (c) Use runtime image + pre-built baselines from shared cache only (no indexing).
-FROM mcr.microsoft.com/dotnet/sdk:9.0
+FROM mcr.microsoft.com/dotnet/sdk:10.0
 WORKDIR /app
 
 COPY --from=build /app/publish .
@@ -38,5 +38,5 @@ ENV CODEMAP_CACHE_DIR=/cache
 #   /cache  — shared baseline cache (persistent, read-write)
 VOLUME ["/repo", "/cache"]
 
-# MCP protocol uses stdin/stdout. Run with: docker run -i codemap-mcp
-ENTRYPOINT ["dotnet", "CodeMap.Daemon.dll"]
+# MCP protocol uses stdin/stdout. Run with: docker run -i mgs-codemap-mcp
+ENTRYPOINT ["dotnet", "MGsCodeMap.Mcp.dll"]

@@ -46,6 +46,8 @@ public sealed class IndexHandler
     private readonly WorkspaceManager? _workspaceManager;
     private readonly IRepoRegistry _repoRegistry;
     private readonly ILogger<IndexHandler> _logger;
+    private readonly IndexingResourceConfig _resources;
+    private readonly IndexingResourceGate _resourceGate;
 
     public IndexHandler(
         IGitService git,
@@ -55,7 +57,9 @@ public sealed class IndexHandler
         IRepoRegistry repoRegistry,
         ILogger<IndexHandler> logger,
         IBaselineScanner? scanner = null,
-        WorkspaceManager? workspaceManager = null)
+        WorkspaceManager? workspaceManager = null,
+        IndexingResourceConfig? resources = null,
+        IndexingResourceGate? resourceGate = null)
     {
         _git = git;
         _compiler = compiler;
@@ -65,6 +69,8 @@ public sealed class IndexHandler
         _scanner = scanner;
         _workspaceManager = workspaceManager;
         _logger = logger;
+        _resources = resources ?? new IndexingResourceConfig();
+        _resourceGate = resourceGate ?? new IndexingResourceGate(_resources.MaxConcurrentIndexes);
     }
 
     /// <summary>
@@ -373,8 +379,21 @@ public sealed class IndexHandler
                 }
             }
 
-            // Step 3: Build locally via Roslyn (existing behavior)
+            // Step 3: Build locally via Roslyn. Cache/discovery work stays outside this
+            // process-wide gate; only memory-intensive compilation and persistence are bounded.
+            using var resourceLease = await _resourceGate.AcquireAsync(ct).ConfigureAwait(false);
+            await using var memoryTelemetry = _resources.MemoryTelemetry
+                ? IndexMemoryTelemetry.Start((phase, snapshot) =>
+                    _logger.LogInformation(
+                        "INDEX_MEMORY phase={Phase} working_set_mb={WorkingSetMb:F1} private_mb={PrivateMb:F1} managed_heap_mb={ManagedHeapMb:F1}",
+                        phase,
+                        snapshot.WorkingSetBytes / 1048576d,
+                        snapshot.PrivateMemoryBytes / 1048576d,
+                        snapshot.ManagedHeapBytes / 1048576d))
+                : null;
+
             _logger.LogInformation("index.ensure_baseline: compiling {SolutionPath}", solutionPath);
+            IndexMemoryTelemetry.MarkPhase("compile-start");
             var compilationResult = await _compiler.CompileAndExtractAsync(solutionPath, ct).ConfigureAwait(false);
 
             if (compilationResult.Symbols.Count == 0 && compilationResult.Stats.Confidence == Core.Enums.Confidence.Low)
@@ -384,12 +403,18 @@ public sealed class IndexHandler
 
             // Store with repoRootPath (ADR-012)
             await _store.CreateBaselineAsync(storageRepoId, commitSha, compilationResult, repoPath, ct).ConfigureAwait(false);
+            IndexMemoryTelemetry.MarkPhase("baseline-written");
+
+            var resourceUsage = memoryTelemetry?.Complete(
+                _resources.MaxParallelProjects,
+                _resources.MaxConcurrentIndexes);
+            var responseStats = compilationResult.Stats with { ResourceUsage = resourceUsage };
 
             _logger.LogInformation(
                 "index.ensure_baseline: indexed {Symbols} symbols, {Refs} refs in {Ms:F1}ms",
-                compilationResult.Stats.SymbolCount,
-                compilationResult.Stats.ReferenceCount,
-                compilationResult.Stats.ElapsedSeconds * 1000);
+                responseStats.SymbolCount,
+                responseStats.ReferenceCount,
+                responseStats.ElapsedSeconds * 1000);
 
             // Step 4: Push to shared cache — fire-and-forget for errors
             await _cache.PushAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
@@ -397,7 +422,7 @@ public sealed class IndexHandler
             _repoRegistry.Register(repoPath!);
             var response = new EnsureBaselineResponse(
                 commitSha, solutionId, solutionRelativePath,
-                AlreadyExisted: false, Stats: compilationResult.Stats);
+                AlreadyExisted: false, Stats: responseStats);
             return new ToolCallResult(JsonSerializer.Serialize(response, CodeMapJsonOptions.Default));
             }
             finally

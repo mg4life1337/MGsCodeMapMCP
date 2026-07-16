@@ -3,6 +3,7 @@ namespace CodeMap.Storage.Engine;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using CodeMap.Core.Models;
 
 /// <summary>
 /// Builds search.idx per STORAGE-FORMAT.MD §12 and SEARCH-DESIGN.MD §7.
@@ -137,9 +138,51 @@ internal static partial class SearchIndexBuilder
         }
         tokenEntries.Sort((a, b) => a.TokenStringId.CompareTo(b.TokenStringId));
 
-        // Step 3: Encode all postings blocks into a single byte array
-        using var postingsStream = new MemoryStream();
+        WriteIndex(path, tokenEntries, postings);
+    }
+
+    /// <summary>Builds the search index directly from canonical symbol cards.</summary>
+    public static void Build(
+        string path,
+        IReadOnlyList<SymbolCard> symbols,
+        IDictionaryBuilder dictionary)
+    {
+        var postings = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        for (var i = 0; i < symbols.Count; i++)
+        {
+            var symbol = symbols[i];
+            var fqn = symbol.SymbolId.Value;
+            var displayName = ExtractDisplayName(symbol.FullyQualifiedName);
+            foreach (var token in Tokenize(
+                         fqn, displayName, symbol.Namespace, symbol.Signature, symbol.Documentation))
+            {
+                if (!postings.TryGetValue(token, out var list))
+                {
+                    list = [];
+                    postings[token] = list;
+                }
+                list.Add(i + 1);
+            }
+        }
+
+        var tokenEntries = new List<(int TokenStringId, string Token)>(postings.Count);
+        foreach (var token in postings.Keys)
+            tokenEntries.Add((dictionary.Intern(token), token));
+        tokenEntries.Sort((a, b) => a.TokenStringId.CompareTo(b.TokenStringId));
+        WriteIndex(path, tokenEntries, postings);
+    }
+
+    private static void WriteIndex(
+        string path,
+        IReadOnlyList<(int TokenStringId, string Token)> tokenEntries,
+        Dictionary<string, List<int>> postings)
+    {
         var entries = new TokenEntry[tokenEntries.Count];
+
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+        var postingsStart = StorageConstants.SegFileHeaderSize +
+            (long)Marshal.SizeOf<TokenEntry>() * tokenEntries.Count;
+        fs.Position = postingsStart;
 
         for (var i = 0; i < tokenEntries.Count; i++)
         {
@@ -148,28 +191,24 @@ internal static partial class SearchIndexBuilder
             list.Sort();
 
             // Deduplicate (same symbol can produce same token from different paths)
-            var deduped = Deduplicate(list);
-
-            var blockOffset = (uint)postingsStream.Position;
+            var uniqueCount = DeduplicateInPlace(list);
+            var blockOffset = checked((uint)(fs.Position - postingsStart));
 
             // Delta encode + LEB128
             uint prev = 0;
-            foreach (var id in deduped)
+            for (var item = 0; item < uniqueCount; item++)
             {
+                var id = list[item];
                 var delta = (uint)id - prev;
-                Leb128.Write(postingsStream, delta);
+                Leb128.Write(fs, delta);
                 prev = (uint)id;
             }
 
-            entries[i] = new TokenEntry(tokenStringId, blockOffset, (uint)deduped.Count);
+            entries[i] = new TokenEntry(tokenStringId, blockOffset, (uint)uniqueCount);
+            postings.Remove(token);
         }
 
-        var postingsBytes = postingsStream.ToArray();
-
-        // Step 4: Write file
-        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
-
-        // SegmentFileHeader
+        fs.Position = 0;
         Span<byte> header = stackalloc byte[StorageConstants.SegFileHeaderSize];
         BitConverter.TryWriteBytes(header, StorageConstants.SegmentMagic);
         BitConverter.TryWriteBytes(header[4..], (ushort)StorageConstants.FormatMajor);
@@ -178,24 +217,30 @@ internal static partial class SearchIndexBuilder
         BitConverter.TryWriteBytes(header[12..], 0u);
         fs.Write(header);
 
-        // TokenHeaderTable
         fs.Write(MemoryMarshal.AsBytes(entries.AsSpan()));
-
-        // PostingsRegion
-        fs.Write(postingsBytes);
-
         fs.Flush(true);
     }
 
-    private static List<int> Deduplicate(List<int> sorted)
+    private static int DeduplicateInPlace(List<int> sorted)
     {
-        if (sorted.Count <= 1) return sorted;
-        var result = new List<int>(sorted.Count) { sorted[0] };
+        if (sorted.Count <= 1) return sorted.Count;
+        var write = 1;
         for (var i = 1; i < sorted.Count; i++)
         {
             if (sorted[i] != sorted[i - 1])
-                result.Add(sorted[i]);
+                sorted[write++] = sorted[i];
         }
-        return result;
+        return write;
+    }
+
+    private static string ExtractDisplayName(string fqn)
+    {
+        var clean = fqn.Length > 2 && fqn[1] == ':' ? fqn[2..] : fqn;
+        var paren = clean.IndexOf('(');
+        if (paren >= 0) clean = clean[..paren];
+        var tick = clean.IndexOf('`');
+        if (tick >= 0) clean = clean[..tick];
+        var dot = clean.LastIndexOf('.');
+        return dot >= 0 ? clean[(dot + 1)..] : clean;
     }
 }

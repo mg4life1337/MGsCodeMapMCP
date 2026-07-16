@@ -58,12 +58,19 @@ public static class ServiceRegistration
             resolvedBaseDir,
             Path.Combine(resolvedBaseDir, "logs"),
             null));
+        services.AddSingleton(sp =>
+            sp.GetRequiredService<RuntimeConfiguration>().Config.IndexingResources
+            ?? new IndexingResourceConfig());
+        services.AddSingleton(sp => new IndexingResourceGate(
+            sp.GetRequiredService<IndexingResourceConfig>().MaxConcurrentIndexes));
 
         // ── Git ───────────────────────────────────────────────────────────────
         services.AddSingleton<IGitService, GitService>();
 
         // ── Roslyn ────────────────────────────────────────────────────────────
-        services.AddSingleton<IRoslynCompiler, RoslynCompiler>();
+        services.AddSingleton<IRoslynCompiler>(sp => new RoslynCompiler(
+            sp.GetRequiredService<ILogger<RoslynCompiler>>(),
+            sp.GetRequiredService<IndexingResourceConfig>()));
         services.AddSingleton<IResolutionWorker, ResolutionWorker>();
 
         // ── Storage ────────────────────────────────────────────────────────────
@@ -81,7 +88,10 @@ public static class ServiceRegistration
 
         // ── Incremental compiler ──────────────────────────────────────────────
         services.AddSingleton<SymbolDiffer>();
-        services.AddSingleton<IncrementalCompiler>();
+        services.AddSingleton<IncrementalCompiler>(sp => new IncrementalCompiler(
+            sp.GetRequiredService<SymbolDiffer>(),
+            sp.GetRequiredService<ILogger<IncrementalCompiler>>(),
+            sp.GetRequiredService<IndexingResourceConfig>()));
         services.AddSingleton<IIncrementalCompiler>(sp => sp.GetRequiredService<IncrementalCompiler>());
 
         // ── Metadata resolver (lazy DLL stub extraction) ──────────────────────
@@ -133,7 +143,9 @@ public static class ServiceRegistration
             sp.GetRequiredService<IRepoRegistry>(),
             sp.GetRequiredService<ILogger<IndexHandler>>(),
             sp.GetRequiredService<IBaselineScanner>(),
-            sp.GetRequiredService<WorkspaceManager>()));
+            sp.GetRequiredService<WorkspaceManager>(),
+            sp.GetRequiredService<IndexingResourceConfig>(),
+            sp.GetRequiredService<IndexingResourceGate>()));
         services.AddSingleton<McpToolHandlers>();
         services.AddSingleton<WorkspaceHandler>();
         services.AddSingleton<OverlayRefreshHandler>();

@@ -2,6 +2,13 @@
   "dataDirectory": ".\\data",
   "logDirectory": ".\\logs",
   "logLevel": "Information",
+  "indexingResources": {
+    "maxConcurrentIndexes": 1,
+    "maxParallelProjects": 2,
+    "incrementalSolutionCacheSize": 1,
+    "incrementalSolutionCacheIdleMinutes": 5,
+    "memoryTelemetry": true
+  },
   "repositories": [
     {
       "root": "C:\\Source\\SampleRepository",

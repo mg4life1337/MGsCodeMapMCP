@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "2.8.0-mgs.3"
+    [string]$Version = "2.8.0-mgs.4"
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,7 +25,7 @@ if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
 
-dotnet publish (Join-Path $repoRoot "src\CodeMap.Daemon\CodeMap.Daemon.csproj") `
+dotnet publish (Join-Path $repoRoot "src\CodeMap.Daemon\MGsCodeMap.Mcp.csproj") `
     -c Release `
     -r win-x64 `
     --self-contained true `
@@ -40,11 +40,15 @@ if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXIT
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 Copy-Item -Path (Join-Path $publishDir "*") -Destination $releaseDir -Recurse -Force
 
-$daemonExe = Join-Path $releaseDir "CodeMap.Daemon.exe"
-if (-not (Test-Path -LiteralPath $daemonExe)) {
-    throw "Published executable not found: $daemonExe"
+$mcpExe = Join-Path $releaseDir "MGsCodeMap.Mcp.exe"
+if (-not (Test-Path -LiteralPath $mcpExe)) {
+    throw "Published executable not found: $mcpExe"
 }
-Copy-Item -LiteralPath $daemonExe -Destination (Join-Path $releaseDir "CodeMap.Mcp.exe") -Force
+foreach ($legacyExecutable in @("CodeMap.Mcp.exe", "CodeMap.Daemon.exe")) {
+    if (Test-Path -LiteralPath (Join-Path $releaseDir $legacyExecutable)) {
+        throw "Legacy executable must not be included: $legacyExecutable"
+    }
+}
 Copy-Item -LiteralPath (Join-Path $repoRoot "codemap.example.json") -Destination $releaseDir
 Copy-Item -LiteralPath (Join-Path $repoRoot "README.md") -Destination $releaseDir
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE.MD") -Destination $releaseDir

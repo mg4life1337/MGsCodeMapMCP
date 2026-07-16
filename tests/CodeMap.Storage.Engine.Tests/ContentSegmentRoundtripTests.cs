@@ -1,6 +1,8 @@
 namespace CodeMap.Storage.Engine.Tests;
 
 using System.Text;
+using CodeMap.Core.Interfaces;
+using CodeMap.Core.Types;
 using FluentAssertions;
 using Xunit;
 
@@ -92,5 +94,23 @@ public sealed class ContentSegmentRoundtripTests : IDisposable
 
         magic.Should().Be(StorageConstants.SegmentMagic);
         recordCount.Should().Be(3u);
+    }
+
+    [Fact]
+    public void WriteFiles_StreamsOnlyPresentContentWithCompatibleIds()
+    {
+        var files = new List<ExtractedFile>
+        {
+            new("1", FilePath.From("src/One.cs"), new string('0', 64), "App", "first"),
+            new("2", FilePath.From("src/Generated.cs"), new string('1', 64), "App", null),
+            new("3", FilePath.From("src/Three.vb"), new string('2', 64), "App", "drei 🎉"),
+        };
+
+        ContentSegmentWriter.WriteFiles(ContentPath, files);
+        using var reader = new ContentSegmentReader(ContentPath);
+
+        reader.Count.Should().Be(2);
+        reader.ResolveContent(1).Should().Be("first");
+        reader.ResolveContent(2).Should().Be("drei 🎉");
     }
 }

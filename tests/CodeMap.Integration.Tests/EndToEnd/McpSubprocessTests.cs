@@ -5,7 +5,7 @@ using System.Text;
 using FluentAssertions;
 
 /// <summary>
-/// Subprocess E2E tests that spawn the compiled CodeMap.Daemon.dll as a real child
+/// Subprocess E2E tests that spawn the compiled MGsCodeMap.Mcp.dll as a real child
 /// process and exchange Content-Length-framed JSON-RPC messages over stdio.
 ///
 /// These tests cover the gap left by <see cref="McpEndToEndTests"/>, which wires
@@ -17,8 +17,8 @@ using FluentAssertions;
 [Trait("Category", "Integration")]
 public sealed class McpSubprocessTests : IDisposable
 {
-    // Project references copy the daemon and its BuildHost assets next to this test assembly.
-    private static readonly string DaemonDll = Path.Combine(AppContext.BaseDirectory, "CodeMap.Daemon.dll");
+    // Project references copy the host and its BuildHost assets next to this test assembly.
+    private static readonly string HostDll = Path.Combine(AppContext.BaseDirectory, "MGsCodeMap.Mcp.dll");
     private readonly string _runtimeDir = Path.Combine(
         Path.GetTempPath(), $"codemap-subprocess-{Guid.NewGuid():N}");
 
@@ -67,17 +67,17 @@ public sealed class McpSubprocessTests : IDisposable
     // ── tests ─────────────────────────────────────────────────────────────────
 
     [Fact]
-    public void DaemonDll_Exists_ForSubprocessTests()
+    public void HostDll_Exists_ForSubprocessTests()
     {
         // Explicit assertion so developers get a clear message when they need to build.
-        File.Exists(DaemonDll).Should().BeTrue(
-            $"because {DaemonDll} must be copied by the CodeMap.Daemon project reference");
+        File.Exists(HostDll).Should().BeTrue(
+            $"because {HostDll} must be copied by the MGsCodeMap.Mcp project reference");
     }
 
     [Fact]
     public async Task Subprocess_Initialize_RespondsWithinTimeoutAndReturnsValidJson()
     {
-        File.Exists(DaemonDll).Should().BeTrue($"because {DaemonDll} must exist");
+        File.Exists(HostDll).Should().BeTrue($"because {HostDll} must exist");
 
         const string request = """
             {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
@@ -109,7 +109,7 @@ public sealed class McpSubprocessTests : IDisposable
     [Fact]
     public async Task Subprocess_ToolsList_AfterInitialize_ReturnsTools()
     {
-        File.Exists(DaemonDll).Should().BeTrue("the daemon must be built first");
+        File.Exists(HostDll).Should().BeTrue("the host must be built first");
 
         // Send initialize then tools/list in a single stdin stream.
         const string init = """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}""";
@@ -154,9 +154,9 @@ public sealed class McpSubprocessTests : IDisposable
     [Fact]
     public async Task Subprocess_VersionFlag_PrintsVersionAndExits()
     {
-        File.Exists(DaemonDll).Should().BeTrue("the daemon must be built first");
+        File.Exists(HostDll).Should().BeTrue("the host must be built first");
 
-        var psi = new ProcessStartInfo("dotnet", $"\"{DaemonDll}\" --version")
+        var psi = new ProcessStartInfo("dotnet", $"\"{HostDll}\" --version")
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -168,8 +168,7 @@ public sealed class McpSubprocessTests : IDisposable
         await proc.WaitForExitAsync();
 
         proc.ExitCode.Should().Be(0);
-        output.Trim().Should().StartWith("MGsCodeMapMCP")
-            .And.Contain("upstream CodeMap 2.8.0");
+        output.Trim().Should().Be("MGsCodeMapMCP 2.8.0-mgs.4");
     }
 
     public void Dispose()
@@ -179,7 +178,7 @@ public sealed class McpSubprocessTests : IDisposable
 
     private ProcessStartInfo CreateStartInfo() => new(
         "dotnet",
-        $"\"{DaemonDll}\" --data-dir \"{Path.Combine(_runtimeDir, "data")}\" " +
+        $"\"{HostDll}\" --data-dir \"{Path.Combine(_runtimeDir, "data")}\" " +
         $"--log-dir \"{Path.Combine(_runtimeDir, "logs")}\"")
     {
         RedirectStandardInput = true,

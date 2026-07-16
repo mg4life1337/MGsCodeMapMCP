@@ -29,6 +29,8 @@ MGsCodeMapMCP keeps CodeMap's Roslyn-powered semantic navigation and adds:
 - Visual Studio 2026 and MSBuild 18 support while retaining VS 2022 support.
 - Rolling branch indexes: one shared immutable baseline plus small solution-specific overlays.
 - Fast impact checks across every discovered `.sln`/`.slnx`; unaffected solutions are skipped.
+- Bounded indexing memory: one full index at a time, at most two Roslyn projects in the
+  reference pass, streaming segment writers, and a one-solution incremental cache by default.
 - A configurable default solution, while explicit `solution_id` or `solution_path` still wins.
 - Non-blocking HEAD observation and atomic workspace switching: queries keep using the last
   consistent index while an update is built.
@@ -56,7 +58,7 @@ Example MCP configuration for Codex:
 {
   "mcpServers": {
     "mgs-codemap": {
-      "command": "C:\\Tools\\MGsCodeMapMCP\\CodeMap.Mcp.exe",
+      "command": "C:\\Tools\\MGsCodeMapMCP\\MGsCodeMap.Mcp.exe",
       "args": [
         "--config",
         "C:\\Tools\\MGsCodeMapMCP\\codemap.json"
@@ -66,8 +68,9 @@ Example MCP configuration for Codex:
 }
 ```
 
-`CodeMap.Mcp.exe` and `CodeMap.Daemon.exe` are equivalent entry points in the
-Windows package. MCP uses stdio, so do not start the executable in a separate console.
+`MGsCodeMap.Mcp.exe` is the only host executable in the Windows package. Version
+`2.8.0-mgs.4` removes the previous executable names, so update the MCP client
+`command` once when upgrading. MCP uses stdio; do not start it in a separate console.
 
 ### Build the Windows package yourself
 
@@ -93,7 +96,7 @@ Studio by using one of these mechanisms, in priority order:
 Verify the fork and upstream version with:
 
 ```powershell
-.\CodeMap.Mcp.exe --version
+.\MGsCodeMap.Mcp.exe --version
 ```
 
 ### Data locations
@@ -116,6 +119,35 @@ Data and log overrides are resolved in this order:
 
 Relative command-line and environment paths are EXE-relative. Relative configuration
 paths are relative to `codemap.json`, never to the current working directory.
+
+### Indexing memory limits
+
+Version `2.8.0-mgs.4` uses conservative limits without requiring configuration. They can be
+made explicit in `codemap.json`:
+
+```json
+{
+  "indexingResources": {
+    "maxConcurrentIndexes": 1,
+    "maxParallelProjects": 2,
+    "incrementalSolutionCacheSize": 1,
+    "incrementalSolutionCacheIdleMinutes": 5,
+    "memoryTelemetry": true
+  }
+}
+```
+
+Full baseline builds share a process-wide gate; discovery and solution-impact checks remain
+independent. The incremental workspace cache keeps the most recently used solution and releases
+it after five idle minutes. Memory telemetry adds peak working set, private memory, and managed
+heap values to `IndexStats`. Its phase log entries contain measurements only—no repository names
+or paths.
+
+Three cold full-index runs on the same isolated large VB.NET copy produced 164,162 symbols and
+1,001,683 references each. Peak working set was 4,750.1, 4,622.5, and 4,705.6 MiB; the median was
+4,705.6 MiB (4.60 GiB), about 49% below the previously observed 9 GiB. Median end-to-end duration
+was 87.63 seconds versus the earlier 103.48-second reference run. These figures describe that
+specific validation input and are not a universal resource guarantee.
 
 ## Rolling multi-solution configuration
 
@@ -503,16 +535,16 @@ the [Windows x64 installation](#windows-x64-installation) for MGsCodeMapMCP.
 See the [original CodeMap repository](https://github.com/bbajt/csharp-code-map) for
 upstream package installation and support information.
 
-> **NuGet package:** [nuget.org/packages/codemap-mcp](https://www.nuget.org/packages/codemap-mcp)
+> **NuGet package:** `MGsCodeMapMCP` with tool command `mgscodemap-mcp`.
 
 ### Docker
 
 ```bash
-docker build -t codemap-mcp .
+docker build -t mgs-codemap-mcp .
 docker run -i \
   -v /path/to/your/repo:/repo:ro \
   -v /path/to/cache:/cache \
-  codemap-mcp
+  mgs-codemap-mcp
 ```
 
 > `-i` is required — MCP uses stdio transport. Without it the container gets immediate EOF.
@@ -531,7 +563,7 @@ Use the absolute executable path in your client's MCP configuration:
 {
   "mcpServers": {
     "mgs-codemap": {
-      "command": "C:\\Tools\\MGsCodeMapMCP\\CodeMap.Mcp.exe",
+      "command": "C:\\Tools\\MGsCodeMapMCP\\MGsCodeMap.Mcp.exe",
       "args": ["--config", "C:\\Tools\\MGsCodeMapMCP\\codemap.json"]
     }
   }
@@ -605,7 +637,7 @@ CodeMap.Roslyn    ← Core (Roslyn 5.x + MSBuildWorkspace)
 CodeMap.Storage.Engine ← Core (v2 binary segments, sole engine since v2.1.0)
 CodeMap.Query     ← Core + Storage.Engine (query engine + cache + overlay merge)
 CodeMap.Mcp       ← Core + Query (MCP tool handlers)
-CodeMap.Daemon    ← ALL (DI composition root, the executable)
+MGsCodeMap.Mcp    ← ALL (DI composition root and host executable)
 ```
 
 ---

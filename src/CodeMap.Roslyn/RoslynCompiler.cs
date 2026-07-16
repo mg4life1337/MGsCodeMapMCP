@@ -19,11 +19,18 @@ using Microsoft.Extensions.Logging;
 public sealed class RoslynCompiler : IRoslynCompiler
 {
     private readonly ILogger<RoslynCompiler> _logger;
+    private readonly IndexingResourceConfig _resources;
 
-    public RoslynCompiler(ILogger<RoslynCompiler> logger)
+    public RoslynCompiler(
+        ILogger<RoslynCompiler> logger,
+        IndexingResourceConfig? resources = null)
     {
         _logger = logger;
+        _resources = resources ?? new IndexingResourceConfig();
     }
+
+    internal int GetPass2Parallelism(int projectCount) =>
+        Math.Min(_resources.MaxParallelProjects, Math.Max(1, projectCount));
 
     /// <inheritdoc/>
     public async Task<CompilationResult> CompileAndExtractAsync(
@@ -60,6 +67,7 @@ public sealed class RoslynCompiler : IRoslynCompiler
             solution = await workspace.OpenSolutionAsync(solutionPath, cancellationToken: ct);
         }
         swEval.Stop();
+        IndexMemoryTelemetry.MarkPhase("solution-opened");
         var totalProjectsLoaded = solution.Projects.Count();
         _logger.LogInformation(
             "PHASE_TIMING msbuild_eval_ms={Ms} total_projects_loaded={Count} solution={Path}",
@@ -140,6 +148,16 @@ public sealed class RoslynCompiler : IRoslynCompiler
         string CanonicalName,
         IReadOnlyList<string>? TargetFrameworks,
         Compilation Compilation,
+        IReadOnlyList<SymbolCard> Symbols,
+        IReadOnlyDictionary<string, StableId> StableIdMap,
+        IReadOnlyList<DiagnosticSeverity> ErrorSeverities,
+        IReadOnlyList<string> ErrorMessages);
+
+    private sealed record PendingProjectPassData(
+        Project Project,
+        string CanonicalName,
+        IReadOnlyList<string>? TargetFrameworks,
+        WeakReference<Compilation> Compilation,
         IReadOnlyList<SymbolCard> Symbols,
         IReadOnlyDictionary<string, StableId> StableIdMap,
         IReadOnlyList<DiagnosticSeverity> ErrorSeverities,
@@ -232,7 +250,7 @@ public sealed class RoslynCompiler : IRoslynCompiler
         var allFacts = new List<ExtractedFact>();
         var projectDiagnostics = new List<Core.Models.ProjectDiagnostic>();
         var confidence = Confidence.High;
-        Compilation? firstCompilation = null;
+        string? dllFingerprint = null;
 
         // ── Pass 1: compile every project, extract symbols/files/typeRelations.
         // Refs are deferred to Pass 2 so the complete cross-project symbol set is
@@ -240,7 +258,7 @@ public sealed class RoslynCompiler : IRoslynCompiler
         // Roslyn uses MetadataReference (no IsInSource locations) rather than
         // CompilationReference. solution.Projects order follows the .sln file, not
         // build-dependency order, so a streaming accumulation cannot work.
-        var passData = new List<ProjectPassData>();
+        var passData = new List<PendingProjectPassData>();
         var fsPassData = new List<FSharpPassData>();
 
         // ── Pass 0: F# projects (MSBuildWorkspace doesn't load them at all).
@@ -384,7 +402,7 @@ public sealed class RoslynCompiler : IRoslynCompiler
             var swExtract = Stopwatch.StartNew();
             try
             {
-                firstCompilation ??= winningCompilation;
+                dllFingerprint ??= BuildDllFingerprint(winningCompilation);
 
                 var errors = winningCompilation.GetDiagnostics(ct)
                     .Where(d => d.Severity == DiagnosticSeverity.Error)
@@ -407,11 +425,11 @@ public sealed class RoslynCompiler : IRoslynCompiler
                 allFiles.AddRange(files);
                 allTypeRelations.AddRange(typeRelations);
 
-                passData.Add(new ProjectPassData(
+                passData.Add(new PendingProjectPassData(
                     Project: winningProject,
                     CanonicalName: group.CanonicalName,
                     TargetFrameworks: tfmsForDiagnostic,
-                    Compilation: winningCompilation,
+                    Compilation: new WeakReference<Compilation>(winningCompilation),
                     Symbols: symbols,
                     StableIdMap: stableIdMap,
                     ErrorSeverities: errors.Select(e => e.Severity).ToList(),
@@ -435,6 +453,7 @@ public sealed class RoslynCompiler : IRoslynCompiler
         _logger.LogInformation(
             "PHASE_TIMING pass1_total_ms={TotalMs} bind_sum_ms={BindMs} extract_sum_ms={ExtractMs} groups={Groups} bind_attempts={Attempts}",
             swPass1.ElapsedMilliseconds, totalBindMs, totalExtractMs, totalGroups, totalBindAttempts);
+        IndexMemoryTelemetry.MarkPhase("roslyn-pass1-complete");
 
         // ── Pass 2: extract refs and facts now that all project symbols are known.
         // allSymbolIds covers every project so cross-language project refs resolve.
@@ -449,25 +468,44 @@ public sealed class RoslynCompiler : IRoslynCompiler
         // queries are documented thread-safe across distinct compilations.
         // Per-iteration buffers avoid contention; merge below preserves
         // passData order so projectDiagnostics ordering stays deterministic.
-        var perProject = new Pass2Result[passData.Count];
+        var perProject = new Pass2Result?[passData.Count];
         var parallelOptions = new ParallelOptions
         {
             CancellationToken = ct,
-            MaxDegreeOfParallelism = Environment.ProcessorCount,
+            MaxDegreeOfParallelism = GetPass2Parallelism(passData.Count),
         };
-        Parallel.For(0, passData.Count, parallelOptions, i =>
+        await Parallel.ForEachAsync(Enumerable.Range(0, passData.Count), parallelOptions, async (i, token) =>
         {
-            perProject[i] = ExecutePass2Project(passData[i], solutionDir, allSymbolIds);
-        });
+            var pending = passData[i];
+            if (!pending.Compilation.TryGetTarget(out var compilation))
+                compilation = await pending.Project.GetCompilationAsync(token).ConfigureAwait(false);
+            if (compilation is null)
+                throw new InvalidOperationException(
+                    $"Compilation became unavailable during reference extraction for {pending.CanonicalName}.");
+
+            var projectData = new ProjectPassData(
+                pending.Project,
+                pending.CanonicalName,
+                pending.TargetFrameworks,
+                compilation,
+                pending.Symbols,
+                pending.StableIdMap,
+                pending.ErrorSeverities,
+                pending.ErrorMessages);
+            perProject[i] = ExecutePass2Project(projectData, solutionDir, allSymbolIds);
+            pending.Compilation.SetTarget(null!);
+        }).ConfigureAwait(false);
 
         for (int i = 0; i < passData.Count; i++)
         {
-            var r = perProject[i];
+            var r = perProject[i]
+                ?? throw new InvalidOperationException("Reference extraction did not produce a result.");
             allReferences.AddRange(r.References);
             allFacts.AddRange(r.Facts);
             projectDiagnostics.Add(r.Diagnostic);
             totalRefsMs += r.RefsMs;
             totalFactsMs += r.FactsMs;
+            perProject[i] = null;
         }
 
         // ── Pass 2b: extract F# references now that allSymbolIds is complete.
@@ -490,6 +528,12 @@ public sealed class RoslynCompiler : IRoslynCompiler
         _logger.LogInformation(
             "PHASE_TIMING pass2_total_ms={TotalMs} refs_sum_ms={RefsMs} facts_sum_ms={FactsMs}",
             swPass2.ElapsedMilliseconds, totalRefsMs, totalFactsMs);
+        IndexMemoryTelemetry.MarkPhase("roslyn-pass2-complete");
+        passData.Clear();
+        fsPassData.Clear();
+        allSymbolIds.Clear();
+        CollectReleasedRoslynState();
+        IndexMemoryTelemetry.MarkPhase("roslyn-pass2-released");
 
         // Compute SemanticLevel from per-project outcomes
         int compiledCount = projectDiagnostics.Count(d => d.Compiled);
@@ -510,12 +554,18 @@ public sealed class RoslynCompiler : IRoslynCompiler
             SemanticLevel: semanticLevel,
             ProjectDiagnostics: projectDiagnostics);
 
-        string? dllFingerprint = firstCompilation is not null
-            ? BuildDllFingerprint(firstCompilation)
-            : null;
-
         return new CompilationResult(allSymbols, allReferences, allFiles, stats, allTypeRelations, allFacts,
             DllFingerprint: dllFingerprint);
+    }
+
+    private static void CollectReleasedRoslynState()
+    {
+        GC.Collect(
+            GC.MaxGeneration,
+            GCCollectionMode.Forced,
+            blocking: true,
+            compacting: false);
+        GC.WaitForPendingFinalizers();
     }
 
     /// <summary>
@@ -593,8 +643,14 @@ public sealed class RoslynCompiler : IRoslynCompiler
                 continue;
             try
             {
-                byte[] bytes = File.ReadAllBytes(reference.FilePath);
-                byte[] hash = SHA256.HashData(bytes);
+                using var stream = new FileStream(
+                    reference.FilePath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete,
+                    bufferSize: 128 * 1024,
+                    FileOptions.SequentialScan);
+                byte[] hash = SHA256.HashData(stream);
                 string name = Path.GetFileNameWithoutExtension(reference.FilePath);
                 fingerprint.TryAdd(name, Convert.ToHexStringLower(hash));
             }

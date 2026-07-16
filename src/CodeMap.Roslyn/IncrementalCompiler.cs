@@ -20,7 +20,7 @@ using Microsoft.Extensions.Logging;
 /// On subsequent calls for the same solution, uses Solution.WithDocumentText to
 /// apply file changes incrementally, avoiding the ~1.4s MSBuildWorkspace startup cost.
 /// </summary>
-public class IncrementalCompiler : IIncrementalCompiler
+public class IncrementalCompiler : IIncrementalCompiler, IDisposable
 {
     private readonly SymbolDiffer _differ;
     private readonly ILogger<IncrementalCompiler> _logger;
@@ -29,13 +29,26 @@ public class IncrementalCompiler : IIncrementalCompiler
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly Dictionary<string, CacheEntry> _solutionCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly LinkedList<string> _lru = new();
-    private const int MaxCachedSolutions = 3;
+    private readonly int _maxCachedSolutions;
+    private readonly TimeSpan _cacheIdleTime;
+    private readonly TimeProvider _timeProvider;
+    private readonly Timer _cacheTrimTimer;
     private CacheEntry? _mostRecent;
+    private int _disposed;
 
-    public IncrementalCompiler(SymbolDiffer differ, ILogger<IncrementalCompiler> logger)
+    public IncrementalCompiler(
+        SymbolDiffer differ,
+        ILogger<IncrementalCompiler> logger,
+        IndexingResourceConfig? resources = null,
+        TimeProvider? timeProvider = null)
     {
         _differ = differ;
         _logger = logger;
+        var effectiveResources = resources ?? new IndexingResourceConfig();
+        _maxCachedSolutions = effectiveResources.IncrementalSolutionCacheSize;
+        _cacheIdleTime = TimeSpan.FromMinutes(effectiveResources.IncrementalSolutionCacheIdleMinutes);
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _cacheTrimTimer = new Timer(TrimIdleCache, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
     }
 
     /// <inheritdoc/>
@@ -470,7 +483,7 @@ public class IncrementalCompiler : IIncrementalCompiler
             }
 
             var node = _lru.AddFirst(solutionPath);
-            var entry = new CacheEntry(workspace, solution, node);
+            var entry = new CacheEntry(workspace, solution, node, _timeProvider.GetUtcNow());
             _solutionCache[solutionPath] = entry;
             _mostRecent = entry;
             EvictOldestSolutions();
@@ -490,13 +503,14 @@ public class IncrementalCompiler : IIncrementalCompiler
 
         _lru.Remove(entry.LruNode);
         _lru.AddFirst(entry.LruNode);
+        entry.LastAccess = _timeProvider.GetUtcNow();
         _mostRecent = entry;
         return true;
     }
 
     private void EvictOldestSolutions()
     {
-        while (_solutionCache.Count > MaxCachedSolutions && _lru.Last is { } last)
+        while (_solutionCache.Count > _maxCachedSolutions && _lru.Last is { } last)
         {
             string path = last.Value;
             _lru.RemoveLast();
@@ -507,6 +521,44 @@ public class IncrementalCompiler : IIncrementalCompiler
                 _mostRecent = null;
         }
     }
+
+    private void TrimIdleCache(object? state)
+    {
+        if (!_lock.Wait(0)) return;
+        try
+        {
+            TrimIdleSolutions(_timeProvider.GetUtcNow());
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    internal int TrimIdleSolutions(DateTimeOffset now)
+    {
+        var removed = 0;
+        while (_lru.Last is { } last)
+        {
+            if (!_solutionCache.TryGetValue(last.Value, out var entry))
+            {
+                _lru.RemoveLast();
+                continue;
+            }
+            if (now - entry.LastAccess < _cacheIdleTime) break;
+
+            _lru.RemoveLast();
+            _solutionCache.Remove(last.Value);
+            entry.Workspace.Dispose();
+            if (ReferenceEquals(_mostRecent, entry)) _mostRecent = null;
+            removed++;
+        }
+        if (removed > 0)
+            _logger.LogInformation("Released {Count} idle incremental solution workspace(s)", removed);
+        return removed;
+    }
+
+    internal int CachedSolutionCount => _solutionCache.Count;
 
     /// <summary>
     /// Builds a path → DocumentId index over the entire solution in O(D) time,
@@ -630,24 +682,34 @@ public class IncrementalCompiler : IIncrementalCompiler
     /// </summary>
     internal async Task<Compilation?> GetMetadataCompilationAsync(CancellationToken ct = default)
     {
-        var solution = _mostRecent?.Solution;
-        if (solution is null) return null;
-
-        foreach (var project in solution.Projects)
+        await _lock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            try
-            {
-                var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
-                if (compilation is not null) return compilation;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "GetCompilationAsync failed for project {Project} — trying next", project.Name);
-            }
-        }
+            var entry = _mostRecent;
+            var solution = entry?.Solution;
+            if (solution is null) return null;
+            entry!.LastAccess = _timeProvider.GetUtcNow();
 
-        return null;
+            foreach (var project in solution.Projects)
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
+                    if (compilation is not null) return compilation;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "GetCompilationAsync failed for project {Project} — trying next", project.Name);
+                }
+            }
+
+            return null;
+        }
+        finally
+        {
+            _lock.Release();
+        }
     }
 
     /// <summary>
@@ -656,21 +718,33 @@ public class IncrementalCompiler : IIncrementalCompiler
     /// </summary>
     public void Dispose()
     {
-        _lock.Dispose();
-        foreach (var entry in _solutionCache.Values)
-            entry.Workspace.Dispose();
-        _solutionCache.Clear();
-        _lru.Clear();
-        _mostRecent = null;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        _cacheTrimTimer.Dispose();
+        _lock.Wait();
+        try
+        {
+            foreach (var entry in _solutionCache.Values)
+                entry.Workspace.Dispose();
+            _solutionCache.Clear();
+            _lru.Clear();
+            _mostRecent = null;
+        }
+        finally
+        {
+            _lock.Release();
+            _lock.Dispose();
+        }
     }
 
     private sealed class CacheEntry(
         MSBuildWorkspace workspace,
         Solution solution,
-        LinkedListNode<string> lruNode)
+        LinkedListNode<string> lruNode,
+        DateTimeOffset lastAccess)
     {
         public MSBuildWorkspace Workspace { get; } = workspace;
         public Solution Solution { get; set; } = solution;
         public LinkedListNode<string> LruNode { get; } = lruNode;
+        public DateTimeOffset LastAccess { get; set; } = lastAccess;
     }
 }
