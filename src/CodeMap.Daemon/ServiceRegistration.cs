@@ -76,9 +76,11 @@ public static class ServiceRegistration
         // ── Storage ────────────────────────────────────────────────────────────
         // v2 custom storage engine — all ISymbolStore methods + IOverlayStore adapter.
         var storeDir = Path.Combine(resolvedBaseDir, "repositories");
-        var customStore = new CustomSymbolStore(storeDir);
-        services.AddSingleton<ISymbolStore>(customStore);
-        services.AddSingleton<IOverlayStore>(new CustomEngineOverlayStore(customStore, storeDir));
+        services.AddSingleton(_ => new CustomSymbolStore(storeDir));
+        services.AddSingleton<ISymbolStore>(sp => sp.GetRequiredService<CustomSymbolStore>());
+        services.AddSingleton(sp => new CustomEngineOverlayStore(
+            sp.GetRequiredService<CustomSymbolStore>(), storeDir));
+        services.AddSingleton<IOverlayStore>(sp => sp.GetRequiredService<CustomEngineOverlayStore>());
 
         // ── Shared baseline cache ─────────────────────────────────────────────
         // CODEMAP_CACHE_DIR env var sets the shared cache directory (null = disabled).

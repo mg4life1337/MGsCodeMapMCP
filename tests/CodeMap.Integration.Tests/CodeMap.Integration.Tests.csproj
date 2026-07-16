@@ -11,7 +11,8 @@
     <ProjectReference Include="..\..\src\CodeMap.Git\CodeMap.Git.csproj" />
     <ProjectReference Include="..\..\src\CodeMap.Storage.Engine\CodeMap.Storage.Engine.csproj" />
     <ProjectReference Include="..\..\src\CodeMap.Mcp\CodeMap.Mcp.csproj" />
-    <ProjectReference Include="..\..\src\CodeMap.Daemon\MGsCodeMap.Mcp.csproj" />
+    <ProjectReference Include="..\..\src\CodeMap.Daemon\MGsCodeMap.Daemon.csproj" />
+    <ProjectReference Include="..\..\src\MGsCodeMap.Mcp\MGsCodeMap.Mcp.csproj" />
     <ProjectReference Include="..\CodeMap.TestUtilities\CodeMap.TestUtilities.csproj" />
   </ItemGroup>
 

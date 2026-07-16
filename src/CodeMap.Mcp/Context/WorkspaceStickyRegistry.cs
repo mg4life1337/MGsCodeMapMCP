@@ -10,17 +10,21 @@ using CodeMap.Core.Types;
 /// </summary>
 public sealed class WorkspaceStickyRegistry : IWorkspaceStickyRegistry
 {
+    private readonly IMcpSessionContext? _sessionContext;
     private readonly ConcurrentDictionary<string, string> _sticky =
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _solutionSticky =
         new(StringComparer.OrdinalIgnoreCase);
     private Action<string, SolutionId>? _solutionRequested;
 
+    public WorkspaceStickyRegistry(IMcpSessionContext? sessionContext = null) =>
+        _sessionContext = sessionContext;
+
     /// <inheritdoc/>
     public void Set(string repoPath, string workspaceId)
     {
         if (string.IsNullOrWhiteSpace(repoPath) || string.IsNullOrWhiteSpace(workspaceId)) return;
-        _sticky[Normalize(repoPath)] = workspaceId;
+        _sticky[SessionKey(repoPath)] = workspaceId;
     }
 
     /// <inheritdoc/>
@@ -34,12 +38,13 @@ public sealed class WorkspaceStickyRegistry : IWorkspaceStickyRegistry
     public void Clear(string repoPath, string workspaceId)
     {
         if (string.IsNullOrWhiteSpace(repoPath) || string.IsNullOrWhiteSpace(workspaceId)) return;
-        var key = Normalize(repoPath);
+        var key = SessionKey(repoPath);
         // Conditional remove: only clear if the sticky currently matches the deleted workspace.
         if (_sticky.TryGetValue(key, out var current) && string.Equals(current, workspaceId, StringComparison.Ordinal))
             _sticky.TryRemove(new KeyValuePair<string, string>(key, current));
+        var solutionPrefix = Normalize(repoPath) + "|";
         foreach (var entry in _solutionSticky)
-            if (entry.Key.StartsWith(key + "|", StringComparison.OrdinalIgnoreCase) &&
+            if (entry.Key.StartsWith(solutionPrefix, StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(entry.Value, workspaceId, StringComparison.Ordinal))
                 _solutionSticky.TryRemove(new KeyValuePair<string, string>(entry.Key, entry.Value));
     }
@@ -48,7 +53,7 @@ public sealed class WorkspaceStickyRegistry : IWorkspaceStickyRegistry
     public string? Get(string repoPath)
     {
         if (string.IsNullOrWhiteSpace(repoPath)) return null;
-        return _sticky.TryGetValue(Normalize(repoPath), out var ws) ? ws : null;
+        return _sticky.TryGetValue(SessionKey(repoPath), out var ws) ? ws : null;
     }
 
     /// <inheritdoc/>
@@ -67,6 +72,9 @@ public sealed class WorkspaceStickyRegistry : IWorkspaceStickyRegistry
 
     private static string Normalize(string path) =>
         Path.GetFullPath(path).Replace('\\', '/').TrimEnd('/');
+
+    private string SessionKey(string path) =>
+        (_sessionContext?.CurrentSessionId ?? "stdio") + "|" + Normalize(path);
 
     private static string SolutionKey(string path, SolutionId solutionId) =>
         Normalize(path) + "|" + solutionId.Value;

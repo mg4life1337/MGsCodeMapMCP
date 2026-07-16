@@ -200,7 +200,43 @@ public sealed class ConfigLoadingTests : IDisposable
     }
 
     [Fact]
-    public void CodeMapConfig_DefaultRecord_HasPortableDefaults()
+    public void LoadConfig_Server_ReadsLoopbackHttpOptions()
+    {
+        var configPath = Path.Combine(_tempDir, "codemap.json");
+        File.WriteAllText(configPath, """
+            {
+              "server": {
+                "host": "127.0.0.1",
+                "port": 5199,
+                "mcpPath": "/semantic-mcp",
+                "healthPath": "/status",
+                "shutdownTimeoutSeconds": 45
+              }
+            }
+            """);
+
+        var server = RuntimeConfiguration.LoadConfig(configPath).Server;
+
+        server.Should().NotBeNull();
+        server!.Port.Should().Be(5199);
+        server.McpPath.Should().Be("/semantic-mcp");
+        server.HealthPath.Should().Be("/status");
+        server.ShutdownTimeoutSeconds.Should().Be(45);
+    }
+
+    [Fact]
+    public void LoadConfig_RemoteHostWithoutOptIn_IsRejected()
+    {
+        var configPath = Path.Combine(_tempDir, "codemap.json");
+        File.WriteAllText(configPath, """{ "server": { "host": "0.0.0.0" } }""");
+
+        var act = () => RuntimeConfiguration.LoadConfig(configPath);
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*loopback*");
+    }
+
+    [Fact]
+    public void CodeMapConfig_DefaultRecord_HasSafeDefaults()
     {
         var config = new CodeMapConfig();
 
@@ -212,6 +248,12 @@ public sealed class ConfigLoadingTests : IDisposable
         config.RepositoryRoots.Should().BeNull();
         config.Repositories.Should().BeNull();
         config.IndexingResources.Should().BeNull();
+
+        var server = config.Server ?? new ServerConfig();
+        server.Host.Should().Be("127.0.0.1");
+        server.Port.Should().Be(5137);
+        server.AllowRemote.Should().BeFalse();
+        server.SingleInstance.Should().BeTrue();
 
         var resources = config.IndexingResources ?? new IndexingResourceConfig();
         resources.MaxConcurrentIndexes.Should().Be(1);

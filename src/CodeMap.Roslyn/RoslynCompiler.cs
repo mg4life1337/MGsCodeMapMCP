@@ -532,7 +532,6 @@ public sealed class RoslynCompiler : IRoslynCompiler
         passData.Clear();
         fsPassData.Clear();
         allSymbolIds.Clear();
-        CollectReleasedRoslynState();
         IndexMemoryTelemetry.MarkPhase("roslyn-pass2-released");
 
         // Compute SemanticLevel from per-project outcomes
@@ -556,16 +555,6 @@ public sealed class RoslynCompiler : IRoslynCompiler
 
         return new CompilationResult(allSymbols, allReferences, allFiles, stats, allTypeRelations, allFacts,
             DllFingerprint: dllFingerprint);
-    }
-
-    private static void CollectReleasedRoslynState()
-    {
-        GC.Collect(
-            GC.MaxGeneration,
-            GCCollectionMode.Forced,
-            blocking: true,
-            compacting: false);
-        GC.WaitForPendingFinalizers();
     }
 
     /// <summary>

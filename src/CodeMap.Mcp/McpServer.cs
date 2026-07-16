@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using CodeMap.Mcp.Context;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
@@ -23,13 +24,18 @@ public sealed class McpServer
     private const string ProtocolVersionMax = "2025-03-26";
 
     /// <summary>Maximum allowed Content-Length for a single MCP message (10 MB).</summary>
-    internal const int MaxContentLength = 10 * 1024 * 1024;
+    public const int MaxContentLength = 10 * 1024 * 1024;
 
     private readonly ToolRegistry _registry;
     private readonly ILogger<McpServer> _logger;
     private readonly string _version;
+    private readonly IMcpSessionContext _sessionContext;
 
-    public McpServer(ToolRegistry registry, ILogger<McpServer> logger, string? version = null)
+    public McpServer(
+        ToolRegistry registry,
+        ILogger<McpServer> logger,
+        string? version = null,
+        IMcpSessionContext? sessionContext = null)
     {
         _registry = registry;
         _logger = logger;
@@ -38,6 +44,7 @@ public sealed class McpServer
                 ?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
                 ?.InformationalVersion
             ?? "1.0.0";
+        _sessionContext = sessionContext ?? new McpSessionContext();
     }
 
     /// <summary>Runs the server loop, reading from <paramref name="input"/> and writing to <paramref name="output"/>.</summary>
@@ -53,6 +60,7 @@ public sealed class McpServer
             // Newer clients (protocol 2025-11-25+) use newline-delimited JSON.
             // Older clients / test harnesses use Content-Length framing (LSP style).
             bool? newlineDelimited = null;
+            var sessionId = "stdio-" + Guid.NewGuid().ToString("N");
 
             while (!ct.IsCancellationRequested)
             {
@@ -60,30 +68,35 @@ public sealed class McpServer
                 if (body is null) break; // EOF — client disconnected
 
                 newlineDelimited ??= isNewline; // latch on first detection
-                _logger.LogDebug("MCP ← {Body}", body);
-
-                JsonObject? msg;
-                try { msg = JsonNode.Parse(body) as JsonObject; }
-                catch { await SendAsync(writer, BuildError(null, -32700, "Parse error"), newlineDelimited ?? false, ct); continue; }
-
-                if (msg is null) continue;
-
-                // Notifications have no "id" member — ignore, no response
-                if (!msg.ContainsKey("id"))
-                {
-                    _logger.LogDebug("MCP notification: {Method}", msg["method"]?.GetValue<string>() ?? "?");
-                    continue;
-                }
-
-                var id = msg["id"]?.DeepClone();
-                var method = msg["method"]?.GetValue<string>() ?? "";
-                var @params = msg["params"] as JsonObject;
-
-                var response = await DispatchAsync(method, id, @params, ct).ConfigureAwait(false);
-                _logger.LogDebug("MCP → {Json}", response.ToJsonString());
+                var response = await ProcessMessageAsync(body, sessionId, ct).ConfigureAwait(false);
+                if (response is null) continue;
                 await SendAsync(writer, response, newlineDelimited ?? false, ct).ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>Processes one transport-independent JSON-RPC message for an MCP session.</summary>
+    public async Task<JsonObject?> ProcessMessageAsync(
+        string body,
+        string sessionId,
+        CancellationToken ct = default)
+    {
+        JsonObject? msg;
+        try { msg = JsonNode.Parse(body) as JsonObject; }
+        catch { return BuildError(null, -32700, "Parse error"); }
+
+        if (msg is null) return BuildError(null, -32600, "Invalid Request");
+        if (!msg.ContainsKey("id"))
+        {
+            _logger.LogDebug("MCP notification: {Method}", msg["method"]?.GetValue<string>() ?? "?");
+            return null;
+        }
+
+        var id = msg["id"]?.DeepClone();
+        var method = msg["method"]?.GetValue<string>() ?? "";
+        var @params = msg["params"] as JsonObject;
+        using var session = _sessionContext.Enter(sessionId);
+        return await DispatchAsync(method, id, @params, ct).ConfigureAwait(false);
     }
 
     // ─── Dispatch ─────────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <Version>2.8.0-mgs.5</Version>
   </PropertyGroup>
 
   <!-- Enable dotnet test to use MTP natively instead of VSTest compat mode. -->

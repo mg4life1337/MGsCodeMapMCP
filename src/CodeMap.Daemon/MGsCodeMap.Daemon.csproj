@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>CodeMap.Daemon</RootNamespace>
+    <AssemblyName>MGsCodeMap.Daemon</AssemblyName>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <Version>2.8.0-mgs.5</Version>
+    <PublishSingleFile Condition="'$(RuntimeIdentifier)' != ''">true</PublishSingleFile>
+    <EnableCompressionInSingleFile Condition="'$(RuntimeIdentifier)' != ''">true</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CodeMap.Core\CodeMap.Core.csproj" />
+    <ProjectReference Include="..\CodeMap.Git\CodeMap.Git.csproj" />
+    <ProjectReference Include="..\CodeMap.Roslyn\CodeMap.Roslyn.csproj" />
+    <ProjectReference Include="..\CodeMap.Query\CodeMap.Query.csproj" />
+    <ProjectReference Include="..\CodeMap.Mcp\CodeMap.Mcp.csproj" />
+    <ProjectReference Include="..\CodeMap.Storage.Engine\CodeMap.Storage.Engine.csproj" />
+  </ItemGroup>
+</Project>

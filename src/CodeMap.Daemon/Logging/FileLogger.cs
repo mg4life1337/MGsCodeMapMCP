@@ -37,8 +37,16 @@ internal sealed class FileLogger(
         if (state is IReadOnlyList<KeyValuePair<string, object?>> structured)
             foreach (var kv in structured)
                 if (kv.Key != "{OriginalFormat}" && kv.Value is not null)
-                    props[kv.Key] = kv.Value;
+                    props[kv.Key] = Normalize(kv.Value);
 
         provider.WriteEntry(categoryName, logLevel, message, props.Count > 0 ? props : null);
     }
+
+    private static object Normalize(object value) => value switch
+    {
+        string or bool or byte or sbyte or short or ushort or int or uint or long or ulong or
+        float or double or decimal or DateTime or DateTimeOffset or Guid => value,
+        Enum enumValue => enumValue.ToString(),
+        _ => value.ToString() ?? value.GetType().Name,
+    };
 }

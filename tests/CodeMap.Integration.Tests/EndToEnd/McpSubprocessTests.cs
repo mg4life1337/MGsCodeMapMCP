@@ -1,189 +1,65 @@
 namespace CodeMap.Integration.Tests.EndToEnd;
 
 using System.Diagnostics;
-using System.Text;
 using FluentAssertions;
 
-/// <summary>
-/// Subprocess E2E tests that spawn the compiled MGsCodeMap.Mcp.dll as a real child
-/// process and exchange Content-Length-framed JSON-RPC messages over stdio.
-///
-/// These tests cover the gap left by <see cref="McpEndToEndTests"/>, which wires
-/// handlers directly and never exercises the stdio transport or startup path.
-///
-/// Prerequisites: the daemon must be pre-built. Tests are skipped when the binary
-/// is absent so CI doesn't break on a clean checkout without a prior build step.
-/// </summary>
+/// <summary>Subprocess checks for the lightweight STDIO-to-HTTP compatibility proxy.</summary>
 [Trait("Category", "Integration")]
-public sealed class McpSubprocessTests : IDisposable
+public sealed class McpSubprocessTests
 {
-    // Project references copy the host and its BuildHost assets next to this test assembly.
-    private static readonly string HostDll = Path.Combine(AppContext.BaseDirectory, "MGsCodeMap.Mcp.dll");
-    private readonly string _runtimeDir = Path.Combine(
-        Path.GetTempPath(), $"codemap-subprocess-{Guid.NewGuid():N}");
-
-    private const int StartupTimeoutMs = 10_000;
-
-    // ── helpers ───────────────────────────────────────────────────────────────
-
-    // Newline-delimited JSON (the format Claude Code 2.1.70+ uses)
-    private static string Ndjson(string json) => json + "\n";
-
-    // Content-Length framed (LSP style, kept for backwards-compat test coverage)
-    private static string Frame(string json)
-    {
-        var bytes = Encoding.UTF8.GetByteCount(json);
-        return $"Content-Length: {bytes}\r\n\r\n{json}";
-    }
-
-    private async Task<string?> SendAndReceiveAsync(
-        string requestJson, bool newlineDelimited = true, int timeoutMs = StartupTimeoutMs)
-    {
-        var psi = CreateStartInfo();
-
-        using var proc = Process.Start(psi)
-            ?? throw new InvalidOperationException("Failed to start dotnet process.");
-
-        var formatted = newlineDelimited ? Ndjson(requestJson) : Frame(requestJson);
-        var bytes = Encoding.UTF8.GetBytes(formatted);
-        await proc.StandardInput.BaseStream.WriteAsync(bytes);
-        await proc.StandardInput.BaseStream.FlushAsync();
-        proc.StandardInput.Close();
-
-        using var cts = new CancellationTokenSource(timeoutMs);
-        try
-        {
-            var output = await proc.StandardOutput.ReadToEndAsync(cts.Token);
-            await proc.WaitForExitAsync(cts.Token);
-            return output;
-        }
-        catch (OperationCanceledException)
-        {
-            proc.Kill(entireProcessTree: true);
-            return null;
-        }
-    }
-
-    // ── tests ─────────────────────────────────────────────────────────────────
+    private static readonly string ProxyDll = Path.Combine(AppContext.BaseDirectory, "MGsCodeMap.Mcp.dll");
 
     [Fact]
-    public void HostDll_Exists_ForSubprocessTests()
+    public void ProxyBinary_IsIncludedWithIntegrationBuild()
     {
-        // Explicit assertion so developers get a clear message when they need to build.
-        File.Exists(HostDll).Should().BeTrue(
-            $"because {HostDll} must be copied by the MGsCodeMap.Mcp project reference");
+        File.Exists(ProxyDll).Should().BeTrue();
     }
 
     [Fact]
-    public async Task Subprocess_Initialize_RespondsWithinTimeoutAndReturnsValidJson()
+    public async Task Proxy_VersionFlag_PrintsVersionAndExits()
     {
-        File.Exists(HostDll).Should().BeTrue($"because {HostDll} must exist");
+        using var process = Start("--version");
+        var output = await process.StandardOutput.ReadToEndAsync();
+        await process.WaitForExitAsync();
 
-        const string request = """
-            {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
-            """;
-
-        var sw = Stopwatch.StartNew();
-        var output = await SendAndReceiveAsync(request.Trim());
-        sw.Stop();
-
-        output.Should().NotBeNull("server timed out — startup exceeded 10 seconds");
-
-        // Response is newline-delimited JSON (the format Claude Code 2.1.70+ uses)
-        var body = output!.Trim();
-        using var doc = System.Text.Json.JsonDocument.Parse(body);
-        var root = doc.RootElement;
-
-        root.GetProperty("jsonrpc").GetString().Should().Be("2.0");
-        root.GetProperty("id").GetInt32().Should().Be(1);
-        root.GetProperty("result").GetProperty("protocolVersion").GetString()
-            .Should().Be("2024-11-05", "server echoes the client-requested version");
-        root.GetProperty("result").GetProperty("serverInfo")
-            .GetProperty("name").GetString().Should().Be("codemap");
-
-        // Key acceptance criterion: must respond in under 5 seconds
-        sw.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(5),
-            "MCP clients typically have a 30-second connection timeout; staying well under 5s gives headroom");
+        process.ExitCode.Should().Be(0);
+        output.Trim().Should().Be("MGsCodeMapMCP 2.8.0-mgs.5");
     }
 
     [Fact]
-    public async Task Subprocess_ToolsList_AfterInitialize_ReturnsTools()
+    public void ProxyDependencyGraph_DoesNotContainHeavyServerAssemblies()
     {
-        File.Exists(HostDll).Should().BeTrue("the host must be built first");
+        var depsPath = Path.ChangeExtension(ProxyDll, ".deps.json");
+        var dependencies = File.ReadAllText(depsPath);
 
-        // Send initialize then tools/list in a single stdin stream.
-        const string init = """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}""";
-        const string list = """{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}""";
-
-        var psi = CreateStartInfo();
-
-        using var proc = Process.Start(psi)!;
-
-        var initBytes = Encoding.UTF8.GetBytes(Ndjson(init));
-        var listBytes = Encoding.UTF8.GetBytes(Ndjson(list));
-        await proc.StandardInput.BaseStream.WriteAsync(initBytes);
-        await proc.StandardInput.BaseStream.WriteAsync(listBytes);
-        await proc.StandardInput.BaseStream.FlushAsync();
-        proc.StandardInput.Close();
-
-        using var cts = new CancellationTokenSource(StartupTimeoutMs);
-        string output;
-        try
-        {
-            output = await proc.StandardOutput.ReadToEndAsync(cts.Token);
-            await proc.WaitForExitAsync(cts.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            proc.Kill(entireProcessTree: true);
-            output = string.Empty;
-        }
-
-        output.Should().NotBeEmpty("server must respond to both messages");
-
-        // Two newline-delimited JSON responses (one per request)
-        var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-        lines.Should().HaveCount(2, "one response for initialize and one for tools/list");
-
-        // tools/list response contains at least the 6 baseline tools
-        output.Should().Contain("symbols.search");
-        output.Should().Contain("symbols.get_card");
-        output.Should().Contain("index.ensure_baseline");
+        dependencies.Should().NotContain("CodeMap.Roslyn");
+        dependencies.Should().NotContain("CodeMap.Storage");
+        dependencies.Should().NotContain("Microsoft.CodeAnalysis");
     }
 
     [Fact]
-    public async Task Subprocess_VersionFlag_PrintsVersionAndExits()
+    public async Task Proxy_UnreachableDaemon_ReturnsClearError()
     {
-        File.Exists(HostDll).Should().BeTrue("the host must be built first");
+        using var process = Start("--endpoint", "http://127.0.0.1:1/mcp");
+        var error = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
 
-        var psi = new ProcessStartInfo("dotnet", $"\"{HostDll}\" --version")
+        process.ExitCode.Should().Be(4);
+        error.Should().Contain("daemon is not reachable");
+    }
+
+    private static Process Start(params string[] args)
+    {
+        var start = new ProcessStartInfo("dotnet")
         {
+            UseShellExecute = false,
+            RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
-            UseShellExecute = false,
+            CreateNoWindow = true,
         };
-
-        using var proc = Process.Start(psi)!;
-        var output = await proc.StandardOutput.ReadToEndAsync();
-        await proc.WaitForExitAsync();
-
-        proc.ExitCode.Should().Be(0);
-        output.Trim().Should().Be("MGsCodeMapMCP 2.8.0-mgs.4");
+        start.ArgumentList.Add(ProxyDll);
+        foreach (var arg in args) start.ArgumentList.Add(arg);
+        return Process.Start(start) ?? throw new InvalidOperationException("Could not start proxy test process.");
     }
-
-    public void Dispose()
-    {
-        try { Directory.Delete(_runtimeDir, recursive: true); } catch { }
-    }
-
-    private ProcessStartInfo CreateStartInfo() => new(
-        "dotnet",
-        $"\"{HostDll}\" --data-dir \"{Path.Combine(_runtimeDir, "data")}\" " +
-        $"--log-dir \"{Path.Combine(_runtimeDir, "logs")}\"")
-    {
-        RedirectStandardInput = true,
-        RedirectStandardOutput = true,
-        RedirectStandardError = true,
-        UseShellExecute = false,
-    };
 }

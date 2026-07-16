@@ -8,7 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\CodeMap.Daemon\MGsCodeMap.Mcp.csproj" />
+    <ProjectReference Include="..\..\src\CodeMap.Daemon\MGsCodeMap.Daemon.csproj" />
     <ProjectReference Include="..\CodeMap.TestUtilities\CodeMap.TestUtilities.csproj" />
   </ItemGroup>
 

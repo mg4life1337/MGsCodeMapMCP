@@ -14,7 +14,20 @@ public record CodeMapConfig(
     string? MsBuildPath = null,
     IReadOnlyList<RepositoryRootConfig>? RepositoryRoots = null,
     IReadOnlyList<RepositoryConfig>? Repositories = null,
-    IndexingResourceConfig? IndexingResources = null
+    IndexingResourceConfig? IndexingResources = null,
+    ServerConfig? Server = null
+);
+
+/// <summary>Loopback HTTP host and shutdown settings for the central daemon.</summary>
+public sealed record ServerConfig(
+    string Transport = "streamableHttp",
+    string Host = "127.0.0.1",
+    int Port = 5137,
+    string McpPath = "/mcp",
+    string HealthPath = "/health",
+    bool AllowRemote = false,
+    bool SingleInstance = true,
+    int ShutdownTimeoutSeconds = 30
 );
 
 /// <summary>

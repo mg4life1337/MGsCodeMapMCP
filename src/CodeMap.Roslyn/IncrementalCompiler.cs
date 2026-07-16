@@ -35,6 +35,15 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
     private readonly Timer _cacheTrimTimer;
     private CacheEntry? _mostRecent;
     private int _disposed;
+    private int _cachedSolutionCount;
+    private long _cacheHits;
+    private long _cacheMisses;
+    private long _cacheEvictions;
+
+    public int CachedSolutions => Volatile.Read(ref _cachedSolutionCount);
+    public long CacheHits => Interlocked.Read(ref _cacheHits);
+    public long CacheMisses => Interlocked.Read(ref _cacheMisses);
+    public long CacheEvictions => Interlocked.Read(ref _cacheEvictions);
 
     public IncrementalCompiler(
         SymbolDiffer differ,
@@ -485,6 +494,7 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
             var node = _lru.AddFirst(solutionPath);
             var entry = new CacheEntry(workspace, solution, node, _timeProvider.GetUtcNow());
             _solutionCache[solutionPath] = entry;
+            Volatile.Write(ref _cachedSolutionCount, _solutionCache.Count);
             _mostRecent = entry;
             EvictOldestSolutions();
             return entry;
@@ -499,7 +509,12 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
     private bool TryGetCached(string solutionPath, out CacheEntry? entry)
     {
         if (!_solutionCache.TryGetValue(solutionPath, out entry))
+        {
+            Interlocked.Increment(ref _cacheMisses);
             return false;
+        }
+
+        Interlocked.Increment(ref _cacheHits);
 
         _lru.Remove(entry.LruNode);
         _lru.AddFirst(entry.LruNode);
@@ -517,6 +532,8 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
             if (!_solutionCache.Remove(path, out var entry))
                 continue;
             entry.Workspace.Dispose();
+            Interlocked.Increment(ref _cacheEvictions);
+            Volatile.Write(ref _cachedSolutionCount, _solutionCache.Count);
             if (ReferenceEquals(_mostRecent, entry))
                 _mostRecent = null;
         }
@@ -550,15 +567,17 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
             _lru.RemoveLast();
             _solutionCache.Remove(last.Value);
             entry.Workspace.Dispose();
+            Interlocked.Increment(ref _cacheEvictions);
             if (ReferenceEquals(_mostRecent, entry)) _mostRecent = null;
             removed++;
         }
         if (removed > 0)
             _logger.LogInformation("Released {Count} idle incremental solution workspace(s)", removed);
+        Volatile.Write(ref _cachedSolutionCount, _solutionCache.Count);
         return removed;
     }
 
-    internal int CachedSolutionCount => _solutionCache.Count;
+    internal int CachedSolutionCount => CachedSolutions;
 
     /// <summary>
     /// Builds a path → DocumentId index over the entire solution in O(D) time,
@@ -726,6 +745,7 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
             foreach (var entry in _solutionCache.Values)
                 entry.Workspace.Dispose();
             _solutionCache.Clear();
+            Volatile.Write(ref _cachedSolutionCount, 0);
             _lru.Clear();
             _mostRecent = null;
         }

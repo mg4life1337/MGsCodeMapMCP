@@ -31,6 +31,11 @@ public sealed class RepositorySupervisor : BackgroundService
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _lastScheduledRepositoryState =
         new(StringComparer.OrdinalIgnoreCase);
+    private int _running;
+    private int _targetCount;
+
+    public bool IsRunning => Volatile.Read(ref _running) != 0;
+    public int ObservedSolutionCount => Volatile.Read(ref _targetCount);
 
     public RepositorySupervisor(
         RuntimeConfiguration runtime,
@@ -52,12 +57,14 @@ public sealed class RepositorySupervisor : BackgroundService
             (_runtime.Config.Repositories?.Count ?? 0) == 0)
             return;
 
+        Volatile.Write(ref _running, 1);
         _logger.LogInformation("Repository supervisor started");
         try
         {
             while (!stoppingToken.IsCancellationRequested)
             {
                 var targets = DiscoverTargets();
+                Volatile.Write(ref _targetCount, targets.Count);
 
                 foreach (var repositoryGroup in targets
                              .Where(target => target.IsRolling)
@@ -81,6 +88,7 @@ public sealed class RepositorySupervisor : BackgroundService
         }
         finally
         {
+            Volatile.Write(ref _running, 0);
             await _rolling.StopAsync().ConfigureAwait(false);
         }
     }

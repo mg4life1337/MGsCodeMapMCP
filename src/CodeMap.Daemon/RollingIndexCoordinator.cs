@@ -76,6 +76,10 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
             : [];
     }
 
+    public int TrackedSolutionCount => _statuses.Values.Sum(statuses => statuses.Count);
+
+    public int ActiveQueueCount => _queues.Values.Count(queue => queue.Runner is { IsCompleted: false });
+
     public async Task StopAsync()
     {
         _shutdown.Cancel();

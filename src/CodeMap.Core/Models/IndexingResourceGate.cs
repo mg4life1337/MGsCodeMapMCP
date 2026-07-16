@@ -17,6 +17,9 @@ public sealed class IndexingResourceGate : IDisposable
 
     public int MaxConcurrentIndexes { get; }
 
+    /// <summary>Number of full indexes currently holding the process-wide lease.</summary>
+    public int ActiveIndexes => Volatile.Read(ref _active);
+
     internal int PeakActive => Volatile.Read(ref _peakActive);
 
     public async ValueTask<IDisposable> AcquireAsync(CancellationToken ct = default)

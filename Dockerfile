@@ -7,15 +7,15 @@ COPY *.sln Directory.Packages.props Directory.Build.props ./
 COPY src/CodeMap.Core/*.csproj src/CodeMap.Core/
 COPY src/CodeMap.Git/*.csproj src/CodeMap.Git/
 COPY src/CodeMap.Roslyn/*.csproj src/CodeMap.Roslyn/
-COPY src/CodeMap.Storage/*.csproj src/CodeMap.Storage/
+COPY src/CodeMap.Storage.Engine/*.csproj src/CodeMap.Storage.Engine/
 COPY src/CodeMap.Query/*.csproj src/CodeMap.Query/
 COPY src/CodeMap.Mcp/*.csproj src/CodeMap.Mcp/
 COPY src/CodeMap.Daemon/*.csproj src/CodeMap.Daemon/
-RUN dotnet restore src/CodeMap.Daemon/MGsCodeMap.Mcp.csproj
+RUN dotnet restore src/CodeMap.Daemon/MGsCodeMap.Daemon.csproj
 
 # Copy source and publish
 COPY src/ src/
-RUN dotnet publish src/CodeMap.Daemon/MGsCodeMap.Mcp.csproj -c Release -o /app/publish --no-restore
+RUN dotnet publish src/CodeMap.Daemon/MGsCodeMap.Daemon.csproj -c Release -o /app/publish --no-restore
 
 # === Runtime stage ===
 # NOTE: Using the SDK image (not runtime-only) because MSBuildWorkspace requires
@@ -38,5 +38,5 @@ ENV CODEMAP_CACHE_DIR=/cache
 #   /cache  — shared baseline cache (persistent, read-write)
 VOLUME ["/repo", "/cache"]
 
-# MCP protocol uses stdin/stdout. Run with: docker run -i mgs-codemap-mcp
-ENTRYPOINT ["dotnet", "MGsCodeMap.Mcp.dll"]
+EXPOSE 5137
+ENTRYPOINT ["dotnet", "MGsCodeMap.Daemon.dll"]

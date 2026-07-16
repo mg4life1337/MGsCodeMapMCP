@@ -25,6 +25,8 @@ public class WorkspaceManager
 
     private readonly ConcurrentDictionary<(RepoId, WorkspaceId), WorkspaceInfo> _registry = new();
 
+    public int OpenWorkspaceCount => _registry.Count;
+
     public WorkspaceManager(
         IOverlayStore overlayStore,
         IIncrementalCompiler incrementalCompiler,

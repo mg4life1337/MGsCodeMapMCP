@@ -2,6 +2,16 @@
   "dataDirectory": ".\\data",
   "logDirectory": ".\\logs",
   "logLevel": "Information",
+  "server": {
+    "transport": "streamableHttp",
+    "host": "127.0.0.1",
+    "port": 5137,
+    "mcpPath": "/mcp",
+    "healthPath": "/health",
+    "allowRemote": false,
+    "singleInstance": true,
+    "shutdownTimeoutSeconds": 30
+  },
   "indexingResources": {
     "maxConcurrentIndexes": 1,
     "maxParallelProjects": 2,

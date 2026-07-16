@@ -1,6 +1,7 @@
 namespace CodeMap.Daemon;
 
 using System.Text.Json;
+using System.Net;
 using CodeMap.Core.Models;
 
 /// <summary>
@@ -14,6 +15,11 @@ public sealed record RuntimeConfiguration(
     string LogDirectory,
     string? MsBuildPath)
 {
+    public ServerConfig Server => Config.Server ?? new ServerConfig();
+
+    public string McpEndpoint => $"http://{Server.Host}:{Server.Port}{NormalizeHttpPath(Server.McpPath)}";
+
+    public string HealthEndpoint => $"http://{Server.Host}:{Server.Port}{NormalizeHttpPath(Server.HealthPath)}";
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -81,6 +87,7 @@ public sealed record RuntimeConfiguration(
             var config = JsonSerializer.Deserialize<CodeMapConfig>(json, JsonOptions)
                 ?? throw new InvalidOperationException("The configuration file contains JSON null.");
             ValidateIndexingResources(config.IndexingResources);
+            ValidateServer(config.Server ?? new ServerConfig());
             return config;
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
@@ -88,6 +95,35 @@ public sealed record RuntimeConfiguration(
             throw new InvalidOperationException(
                 $"Could not read CodeMap configuration '{configPath}': {ex.Message}", ex);
         }
+    }
+
+    private static void ValidateServer(ServerConfig server)
+    {
+        if (!server.Transport.Equals("streamableHttp", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("server.transport must be 'streamableHttp'.");
+        ValidateRange(server.Port, 1, 65535, "server.port");
+        ValidateRange(server.ShutdownTimeoutSeconds, 1, 600, "server.shutdownTimeoutSeconds");
+        if (!server.AllowRemote && !IsLoopback(server.Host))
+            throw new InvalidOperationException(
+                "server.host must be a loopback address when server.allowRemote is false.");
+        _ = NormalizeHttpPath(server.McpPath);
+        _ = NormalizeHttpPath(server.HealthPath);
+        if (string.Equals(NormalizeHttpPath(server.McpPath), NormalizeHttpPath(server.HealthPath), StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("server.mcpPath and server.healthPath must be different.");
+    }
+
+    private static bool IsLoopback(string host) =>
+        host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+        IPAddress.TryParse(host, out var address) && IPAddress.IsLoopback(address);
+
+    internal static string NormalizeHttpPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            throw new InvalidOperationException("HTTP endpoint paths cannot be empty.");
+        var normalized = path.StartsWith('/') ? path : "/" + path;
+        if (normalized.Contains('?', StringComparison.Ordinal) || normalized.Contains('#', StringComparison.Ordinal))
+            throw new InvalidOperationException("HTTP endpoint paths cannot contain query strings or fragments.");
+        return normalized;
     }
 
     private static void ValidateIndexingResources(IndexingResourceConfig? resources)

@@ -20,6 +20,9 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
     private readonly object _cacheLock = new();
     private bool _disposed;
 
+    public int OpenBaselineCount { get { lock (_cacheLock) return _cache.Count; } }
+    public int OpenOverlayCount { get { lock (_cacheLock) return _overlays.Count; } }
+
     public CustomSymbolStore(string storeBaseDir)
     {
         _storeBaseDir = storeBaseDir;

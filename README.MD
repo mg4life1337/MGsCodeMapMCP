@@ -1,132 +1,94 @@
 # MGsCodeMapMCP
 
-[![Upstream](https://img.shields.io/badge/upstream-bbajt%2Fcsharp--code--map-1f6feb)](https://github.com/bbajt/csharp-code-map)
-[![.NET](https://img.shields.io/badge/.NET-10-512BD4)](#)
-[![MCP Server](https://img.shields.io/badge/MCP-server-1f6feb)](#)
-[![Windows](https://img.shields.io/badge/Windows-x64-0078D4)](#windows-x64-installation)
-[![VS 2026](https://img.shields.io/badge/Visual%20Studio-2026-5C2D91)](#visual-studio-and-msbuild)
-[![C%23](https://img.shields.io/badge/C%23-Roslyn-239120)](#)
-[![VB.NET](https://img.shields.io/badge/VB.NET-Roslyn-512BD4)](#)
-[![F%23](https://img.shields.io/badge/F%23-FCS-378BBA)](#)
-[![License](https://img.shields.io/badge/license-Non--Commercial-orange.svg)](LICENSE.MD)
+MGsCodeMapMCP is a public CodeMap fork for semantic navigation of C#, VB.NET, and F# solutions through MCP.
 
-> [!IMPORTANT]
-> **Unofficial public fork.** MGsCodeMapMCP is derived from
-> [bbajt/csharp-code-map](https://github.com/bbajt/csharp-code-map) and is not an
-> official release of, or supported by, the original author. The original
-> `LICENSE.MD` remains unchanged; this fork is distributed under the same
-> non-commercial open-source terms.
+## What is different in this fork?
 
-## What MGsCodeMapMCP changes
+The central difference is visible at the process boundary:
 
-MGsCodeMapMCP keeps CodeMap's Roslyn-powered semantic navigation and adds:
+- `MGsCodeMap.Daemon.exe` is the one long-running, heavy process. It owns Roslyn, MSBuild, repository monitoring, baselines, overlays, and WAL files.
+- Any number of MCP clients share that daemon through Streamable HTTP at `http://127.0.0.1:5137/mcp`.
+- `MGsCodeMap.Mcp.exe` is an optional lightweight STDIO-to-HTTP proxy. It does not reference Roslyn, start watchers, open index files, or index code.
+- A per-data-directory mutex and lock file prevent a second daemon from opening the same stores.
+- Rolling branch indexing, multi-solution discovery, conservative indexing limits, and bounded incremental Solution caching remain available centrally.
 
-- Targeted semantic deltas: comments and whitespace perform no semantic reindex; method-body
-  changes stay in one document; local API changes stay in one project; public API and hierarchy
-  changes expand only through dependent projects.
-- Duplicate-free workspace search and browse: canonical paths and symbol identity are merged
-  before result limits, with the current overlay revision taking precedence.
-- Visual Studio 2026 and MSBuild 18 support while retaining VS 2022 support.
-- Rolling branch indexes: one shared immutable baseline plus small solution-specific overlays.
-- Fast impact checks across every discovered `.sln`/`.slnx`; unaffected solutions are skipped.
-- Bounded indexing memory: one full index at a time, at most two Roslyn projects in the
-  reference pass, streaming segment writers, and a one-solution incremental cache by default.
-- A configurable default solution, while explicit `solution_id` or `solution_path` still wins.
-- Non-blocking HEAD observation and atomic workspace switching: queries keep using the last
-  consistent index while an update is built.
-- Persisted branch state, safe hashed branch directories, retention, and overlay checkpoints.
-- Correct incremental C# and VB.NET updates across project references, renames, deletions,
-  partial/Designer files, caller graphs, and type relations.
-- Structured rolling metrics for selected mode, fallback reason, changed and reindexed files,
-  affected projects, symbol/relation counts, and per-stage timings.
-- Data and logs only below the configured MCP directories—never inside analyzed repositories.
-
-The upstream overview and tool reference remain below. Fork-specific installation and
-configuration take precedence where they differ from upstream CodeMap 2.8.0.
-
-## Windows x64 installation
-
-1. Download [`MGsCodeMapMCP-win-x64.zip`](https://github.com/mg4life1337/MGsCodeMapMCP/releases/latest/download/MGsCodeMapMCP-win-x64.zip), or build the package yourself as described below.
-2. Extract it to a stable writable directory, for example `C:\Tools\MGsCodeMapMCP`.
-3. Copy `codemap.example.json` to `codemap.json` and adjust repository roots or explicit solutions.
-4. Keep Visual Studio 2022/2026 or compatible MSBuild Build Tools installed. The package includes the .NET runtime, but Roslyn still needs MSBuild to evaluate real solutions.
-5. Register the absolute executable path in Codex or another MCP client.
-
-Example MCP configuration for Codex:
-
-```json
-{
-  "mcpServers": {
-    "mgs-codemap": {
-      "command": "C:\\Tools\\MGsCodeMapMCP\\MGsCodeMap.Mcp.exe",
-      "args": [
-        "--config",
-        "C:\\Tools\\MGsCodeMapMCP\\codemap.json"
-      ]
-    }
-  }
-}
-```
-
-`MGsCodeMap.Mcp.exe` is the only host executable in the Windows package. Version
-`2.8.0-mgs.4` removes the previous executable names, so update the MCP client
-`command` once when upgrading. MCP uses stdio; do not start it in a separate console.
-
-### Build the Windows package yourself
-
-From a Visual Studio Developer PowerShell or a shell with .NET 10:
-
-```powershell
-.\scripts\build-win-x64.ps1
-```
-
-Output: `artifacts\release\MGsCodeMapMCP` and a matching ZIP archive.
-
-### Visual Studio and MSBuild
-
-At startup the daemon logs all discovered .NET SDK and Visual Studio MSBuild instances
-and selects the newest compatible instance. Visual Studio 2026/MSBuild 18 is preferred
-when available; VS 2022 remains supported. Override selection without modifying Visual
-Studio by using one of these mechanisms, in priority order:
-
-1. `--msbuild-path "C:\path\to\MSBuild"`
-2. `CODEMAP_MSBUILD_PATH`
-3. `msBuildPath` in `codemap.json`
-
-Verify the fork and upstream version with:
-
-```powershell
-.\MGsCodeMap.Mcp.exe --version
-```
-
-### Data locations
-
-Mutable files are never intentionally written into an analyzed repository. Defaults:
+This fixes the failure mode where several client tasks each started a complete STDIO server, multiplied Roslyn memory, and competed for the same `overlay.wal`.
 
 ```text
-MGsCodeMapMCP\
-  data\
-    repositories\<repo-id>\solutions\<solution-id>\baselines\<commit-sha>\
-  logs\
+MCP client 1 ─┐
+MCP client 2 ─┼── Streamable HTTP ──> MGsCodeMap.Daemon.exe
+MCP client 3 ─┘                              ├─ Roslyn / MSBuild
+                                            ├─ repository supervisor
+                                            ├─ baselines and overlays
+                                            └─ one writer per data directory
 ```
 
-Data and log overrides are resolved in this order:
+Current fork version: `2.8.0-mgs.5`.
 
-1. `--data-dir` / `--log-dir`
-2. `CODEMAP_DATA_DIR` / `CODEMAP_LOG_DIR`
-3. `dataDirectory` / `logDirectory` in `codemap.json`
-4. `data` / `logs` beside the running executable
+## Windows installation
 
-Relative command-line and environment paths are EXE-relative. Relative configuration
-paths are relative to `codemap.json`, never to the current working directory.
+1. Extract `MGsCodeMapMCP-win-x64.zip` to `C:\Tools\MGsCodeMapMCP`.
+2. Copy `codemap.example.json` to `codemap.json` and edit the repository roots.
+3. Install the per-user logon task:
 
-### Indexing memory limits
+```powershell
+Set-Location C:\Tools\MGsCodeMapMCP
+powershell -ExecutionPolicy Bypass -File .\scripts\install-user-daemon.ps1 -ConfigPath .\codemap.json
+```
 
-Version `2.8.0-mgs.4` uses conservative limits without requiring configuration. They can be
-made explicit in `codemap.json`:
+4. Verify the daemon:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\status-daemon.ps1 -ConfigPath .\codemap.json
+Invoke-RestMethod http://127.0.0.1:5137/health
+```
+
+5. Configure Codex to use HTTP directly:
+
+```toml
+[mcp_servers.codemap]
+url = "http://127.0.0.1:5137/mcp"
+enabled = true
+startup_timeout_sec = 30
+tool_timeout_sec = 1800
+```
+
+6. Restart Codex. All tasks now use the same daemon.
+
+The logon task runs as the signed-in user. This is the recommended setup because it keeps the same Git credentials, NuGet settings, certificates, environment, and filesystem permissions as interactive development.
+
+Full instructions: [Windows installation](docs/WINDOWS-INSTALLATION.MD) and [central daemon architecture](docs/CENTRAL-DAEMON.MD).
+
+## Configuration
+
+Minimal `codemap.json`:
 
 ```json
 {
+  "dataDirectory": ".\\data",
+  "logDirectory": ".\\logs",
+  "logLevel": "Information",
+  "server": {
+    "transport": "streamableHttp",
+    "host": "127.0.0.1",
+    "port": 5137,
+    "mcpPath": "/mcp",
+    "healthPath": "/health",
+    "allowRemote": false,
+    "singleInstance": true,
+    "shutdownTimeoutSeconds": 30
+  },
+  "repositoryRoots": [
+    {
+      "path": "C:\\Source",
+      "discoverGitRepositories": true,
+      "discoverSolutions": true,
+      "autoIndex": true,
+      "watchGitHead": true,
+      "indexMode": "rollingBranch",
+      "updateStrategy": "incremental"
+    }
+  ],
   "indexingResources": {
     "maxConcurrentIndexes": 1,
     "maxParallelProjects": 2,
@@ -137,633 +99,100 @@ made explicit in `codemap.json`:
 }
 ```
 
-Full baseline builds share a process-wide gate; discovery and solution-impact checks remain
-independent. The incremental workspace cache keeps the most recently used solution and releases
-it after five idle minutes. Memory telemetry adds peak working set, private memory, and managed
-heap values to `IndexStats`. Its phase log entries contain measurements only—no repository names
-or paths.
+Relative `dataDirectory`, `logDirectory`, repository, and solution paths are resolved relative to `codemap.json`.
 
-Three cold full-index runs on the same isolated large VB.NET copy produced 164,162 symbols and
-1,001,683 references each. Peak working set was 4,750.1, 4,622.5, and 4,705.6 MiB; the median was
-4,705.6 MiB (4.60 GiB), about 49% below the previously observed 9 GiB. Median end-to-end duration
-was 87.63 seconds versus the earlier 103.48-second reference run. These figures describe that
-specific validation input and are not a universal resource guarantee.
+When `discoverGitRepositories` and `discoverSolutions` are enabled on a root, explicit `repositories` entries are unnecessary unless you need per-repository overrides or an explicit default solution. If several solutions are found, MCP responses expose their stable `solution_id`; pass `solution_path` or `solution_id` where selection is ambiguous.
 
-## Rolling multi-solution configuration
+The default host is loopback-only. A non-loopback host is rejected unless `allowRemote` is explicitly enabled. Authentication and TLS are not built in, so remote exposure should be placed behind an appropriate protected reverse proxy.
 
-```json
-{
-  "dataDirectory": ".\\data",
-  "logDirectory": ".\\logs",
-  "repositories": [
-    {
-      "root": "C:\\Source\\SampleRepository",
-      "discoverSolutions": true,
-      "defaultSolution": "src\\Primary.slnx",
-      "indexMode": "rollingBranch",
-      "updateStrategy": "incremental",
-      "checkAllSolutions": true,
-      "skipUnaffectedSolutions": true,
-      "servePreviousIndexWhileUpdating": true,
-      "autoIndex": true,
-      "watchGitHead": true,
-      "watchIntervalSeconds": 3,
-      "retentionDays": 30,
-      "maxRollingBranches": 8
-    }
-  ]
-}
-```
-
-Use either `repositoryRoots` for automatic discovery beneath a common source folder or
-`repositories` for repository-specific settings such as `defaultSolution`; do not duplicate
-the same repository in both arrays. With `discoverGitRepositories: true` and
-`discoverSolutions: true`, a root entry finds repositories and their solutions without any
-separate `repositories` entries.
-
-Explicit repository entries take precedence over discovered entries. Generated and tool
-directories including `bin`, `obj`, `.git`, `.vs`, `packages`, `.codemap`, and `.codex`
-are pruned during discovery. A failure in one solution does not stop other solutions.
-
-Every query tool accepts optional `solution_path` or `solution_id`. With one registered
-solution it is selected automatically. With multiple solutions, selection order is explicit
-`solution_id`, explicit `solution_path`, configured `defaultSolution`, the only known solution,
-then `AMBIGUOUS_SOLUTION`. The default solution is also updated first.
-
-At every observed HEAD change all discovered solutions are checked against a persisted impact
-map. Only affected solutions are recompiled; documentation-only and unrelated changes are
-skipped. A branch created at an already indexed commit reuses that state without a full build.
-During `checking` or `updating`, `repo.status` reports `possibly_stale: true` and queries continue
-against the previous consistent workspace until the new overlay is atomically selected.
-
-See [Rolling branch indexing](docs/ROLLING-BRANCH-INDEXING.MD) for configuration, consistency,
-fallback, retention, migration, and troubleshooting details.
-
-## Updating and rebuilding indexes
-
-- Update an installation by stopping the MCP client, replacing the program/runtime files, preserving `codemap.json`, `data`, and `logs`, then restarting the client.
-- Rebuild a missing solution/commit index with `index.ensure_baseline` plus `repo_path` and `solution_path`.
-- Inspect all solution baselines using `index.list_baselines`.
-- Preview retention cleanup using `index.cleanup` (dry-run is the default), then repeat with `dry_run: false`.
-- Remove every cached solution index for one repository using `index.remove_repo`; this is also dry-run by default.
-- Rolling branch state is retained according to `retentionDays` and `maxRollingBranches`.
-  Commit-specific baselines and the existing cleanup tools remain available.
-
-For source updates:
+## Daemon management
 
 ```powershell
-git fetch upstream
-git checkout main
-git pull --ff-only origin main
-git rebase upstream/main
-dotnet build CodeMap.sln -c Release
-.\scripts\build-win-x64.ps1
+.\scripts\start-daemon.ps1   -ConfigPath .\codemap.json
+.\scripts\status-daemon.ps1  -ConfigPath .\codemap.json
+.\scripts\restart-daemon.ps1 -ConfigPath .\codemap.json
+.\scripts\stop-daemon.ps1    -ConfigPath .\codemap.json
 ```
 
-Do not overwrite `codemap.json`, `data`, or `logs` when distributing an update.
+The stop script requests graceful shutdown and waits up to 30 seconds. `-ForceFallback` is available for a stuck process; it refuses to force-stop while the health response reports an active index publication.
 
-## About CodeMap
+Uninstalling the logon task does not delete `codemap.json`, `data`, or `logs`:
 
-CodeMap lets AI agents navigate C#, VB.NET, and F# codebases by symbol, call graph,
-type hierarchy, and architectural fact instead of repeatedly reading raw source files.
-
----
-
-## The Problem
-
-An AI agent working on a C# codebase without CodeMap does this:
-
-```
-Agent: I need to find who calls OrderService.SubmitAsync.
-→ Read OrderService.cs       (3,600 tokens)
-→ Read Controllers/...       (3,600 tokens)
-→ Grep across src/           (another 3,600 tokens)
-→ Maybe find it. Maybe not.
+```powershell
+.\scripts\uninstall-user-daemon.ps1 -ConfigPath .\codemap.json
 ```
 
-With CodeMap:
+## Health and single-instance behavior
 
-```
-refs.find { symbol_id: "M:MyApp.Services.OrderService.SubmitAsync", kind: "Call" }
-→ 220 tokens. Exact file, line, and excerpt for every call site. Done.
-```
+`GET http://127.0.0.1:5137/health` reports:
 
-That's **93.9% fewer tokens** for a task agents do dozens of times per session. On a real production codebase (100k+ lines), savings are **95–99%+**.
+- product version, PID, start time, endpoint, and mode;
+- active MCP sessions and request count;
+- observed and loaded solutions, workspaces, baselines, and overlays;
+- working set, private bytes, and managed heap;
+- Solution-cache hits, misses, and evictions;
+- repository supervisor and current indexing status.
 
----
+The endpoint does not return source content, symbols, repository names, or log contents.
 
-## What It Does
+The daemon derives a lock identity from the canonical data directory. A second daemon using the same directory exits with code `17` before MSBuild registration, DI construction, store opening, supervisor startup, or WAL access. Different data directories may run independently.
 
-CodeMap builds a **persistent semantic index** from your solution file using Roslyn — the same compiler that powers Visual Studio. Supports both **`.sln`** (all Visual Studio versions) and **`.slnx`** (VS 2022 17.12+ / .NET SDK 9+) solution formats — **auto-discovered** when `solution_path` is omitted (prefers `.slnx`). Short commit SHAs are auto-expanded. The index captures:
+## Optional STDIO compatibility
 
-- Every symbol (classes, methods, properties, interfaces, records)
-- Every call relationship and reference (who calls what, where)
-- Type hierarchy (inheritance chains, interface implementations)
-- Architectural facts extracted from code: HTTP endpoints, config keys, DB tables, DI registrations, middleware pipeline, retry policies, exception throw points, structured log templates
+Use the proxy only when a client cannot connect to Streamable HTTP:
 
-All of this is exposed via **28 MCP tools** that any MCP-compatible AI agent can call. Starting from v1.3, CodeMap also navigates **DLL boundaries** — lazily resolving NuGet and SDK symbols on first access, with optional ICSharpCode.Decompiler source reconstruction and cross-DLL call graphs.
-
-**Supported languages:** C#, VB.NET, and F#. Mixed-language solutions (`.sln` / `.slnx` containing C#, VB.NET, and F# projects) are indexed in a single pass. All 28 MCP tools work identically for symbols from any language. C# and VB.NET use Roslyn's `MSBuildWorkspace`; F# uses `FSharp.Compiler.Service` (MSBuildWorkspace doesn't support `.fsproj`). F# architectural fact extractors (endpoints, DI, config) are not yet implemented — symbol search, call graphs, references, and type hierarchy all work.
-
-**Blazor / Razor (v2.5.0+):** `.razor` components are indexed via the Razor source generator. ComponentBase-derived classes appear in `symbols.search`. `@page` routes surface in `surfaces.list_endpoints` with a `PAGE` HTTP method. `[Inject]` and `[Parameter]` properties emit dedicated `RazorInject` / `RazorParameter` facts.
-
-**Multi-target projects (v2.5.1+):** `<TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>` previously produced one extraction per TFM (3× duplication). CodeMap now collapses to a single extraction on the highest-ranked TFM, with `ProjectDiagnostic.TargetFrameworks` listing every TFM in the group. Symbol counts on heavily multi-targeted Blazor libraries drop 60–80%.
-
-**Interface-aware `graph.callers` (v2.6.0+):** in DI-dispatched codebases (most production .NET) `graph.callers` on a concrete method silently under-reported because real call sites resolve through the registered interface. CodeMap now detects interface implementation at query time and surfaces an `interface_implementation_hint` listing the interface members and an estimated count of additional callers routed through them. Pass `follow_interface: true` to union those into the result (deduped by `from_symbol`). No baseline-format change, no re-index required. Handles both implicit and explicit interface implementations.
-
-**Indexing perf + correctness (v2.5.2):** large reduction in indexing wall-clock by skipping auto-generated trees (`*.g.cs`, `*.Designer.cs`, files with `<auto-generated>`, paths under `obj/`), short-circuiting type-position identifier classification (typeof / generic args / base lists / attributes), and parallelizing Pass-2 reference & fact extraction across projects. Validated on a 9-repo Blazor corpus: Blazorise drops from 408 s → 95 s (−77 %), ant-design-blazor from 47 s → 25 s (−47 %), OrchardCore (single-target sentinel) from 131 s → 96 s (−27 %), and a 78-csproj distributed-database project (ByTech.Bedrock) indexes in 27 s with an 11.2× Pass-2 parallel speedup. Five query-correctness bugs also fixed: `symbols.search` browse-by-kinds now honours `namespace` / `file_path` / `project_name` filters; workspace-mode namespace filter is case-insensitive (matches committed mode); `refs.find` cache key includes `resolution_state`; workspace browse-by-kinds now includes overlay-new symbols; `codemap.guide`'s decision table no longer advertises `surfaces.list_di_registrations` (which was never a registered tool).
-
----
-
-## The Transformation
-
-Here's what changes when you give an agent CodeMap:
-
-| Without CodeMap | With CodeMap |
-|---|---|
-| `grep -rn "OrderService" src/` | `symbols.search { query: "OrderService" }` |
-| Read 5 files to understand a method | `symbols.get_context` — card + source + all callees in one call |
-| Manually trace call chains across files | `graph.trace_feature` — full annotated tree, one call |
-| Hope grep finds the right interface impl | `types.hierarchy` — base, interfaces, derived types, instant |
-| Read the whole file to find config usage | `surfaces.list_config_keys` — every `IConfiguration` access, indexed |
-| Diff two commits by reading changed files | `index.diff` — semantic diff, rename-aware, architectural changes only |
-
-The agent stops **reading** your codebase and starts **understanding** it.
-
----
-
-## Showpiece: `graph.trace_feature`
-
-The most powerful tool. Replaces 5–10 manual calls with one:
-
-```json
-graph.trace_feature {
-  "repo_path": "/path/to/repo",
-  "entry_point": "M:MyApp.Controllers.OrdersController.Create",
-  "depth": 3
-}
+```toml
+[mcp_servers.codemap]
+command = 'C:\Tools\MGsCodeMapMCP\MGsCodeMap.Mcp.exe'
+args = ['--config', 'C:\Tools\MGsCodeMapMCP\codemap.json']
+enabled = true
+startup_timeout_sec = 30
+tool_timeout_sec = 1800
 ```
 
-Returns an annotated call tree with architectural facts at every node:
+The daemon must already be running. Add `--start-daemon` to the proxy arguments if it should attempt to start the sibling daemon and wait briefly for health. Closing proxy stdin ends only the proxy; the daemon remains alive.
 
-```
-OrdersController.Create  [POST /api/orders]
-  → OrderService.SubmitAsync
-      → [Config: App:MaxRetries]
-      → [DI: IOrderService → OrderService | Scoped]
-      → Repository<Order>.SaveAsync
-            → [DB: orders | DbSet<Order>]
-            → [Retry: WaitAndRetryAsync(3) | Polly]
-```
+## Upgrade from an earlier fork release
 
-One query. Full feature flow. Every config key touched, every table written, every retry policy applied — surfaced automatically from the index.
+1. Stop all earlier MCP host processes.
+2. Preserve `codemap.json`, `data`, and `logs`.
+3. Replace program files with the new release.
+4. Install the user daemon and verify `/health`.
+5. Change Codex from `command`/`args` to the HTTP `url` configuration.
+6. Restart Codex and confirm one `MGsCodeMap.Daemon.exe` process.
 
----
+The storage format is unchanged in `2.8.0-mgs.5`; existing baselines, rolling state, overlays, and valid WAL data are reused. A full reindex is not required solely for this upgrade.
 
-## Token Savings Benchmark
+## MCP tools
 
-Measured across 24 canonical agent tasks on a real .NET solution:
+The daemon exposes the existing tool schemas, including:
 
-| Task | Raw Tokens | CodeMap | Savings |
-|------|-----------|---------|---------|
-| Find a class by name | 3,609 | 248 | **93%** |
-| Get method source + facts | 3,609 | 336 | **91%** |
-| Find all callers (refs.find) | 3,609 | 220 | **94%** |
-| Caller chain depth=2 | 3,609 | 287 | **92%** |
-| Type hierarchy | 3,609 | 200 | **94%** |
-| List all HTTP endpoints | 3,609 | 360 | **90%** |
-| List all DB tables | 3,609 | 169 | **95%** |
-| Workspace staleness check | 3,609 | 62 | **98%** |
-| Baseline build (cache hit) | ~30s Roslyn | ~2ms pull | **∞** |
-| **Average** | | | **90.4%** |
+- `symbols.search`, `symbols.get_card`, `symbols.get_context`
+- `code.get_span`, `code.search_text`
+- `refs.find`, `graph.callers`, `graph.callees`, `graph.trace_feature`
+- `types.hierarchy`, `surfaces.endpoints`, `surfaces.config_keys`, `surfaces.db_tables`
+- `workspace.create`, `index.refresh_overlay`, `workspace.reset`, `workspace.list`, `workspace.delete`
+- `index.ensure_baseline`, `index.list_baselines`, `index.cleanup`, `index.remove_repo`, `index.diff`
+- `repo.status`, `codemap.summarize`, `codemap.export`, `codemap.guide`
 
-*Raw tokens = reading all source files. On production codebases (100k+ lines), savings reach 95–99%+.*
+Reads from separate HTTP sessions can run concurrently. Full indexing remains bounded process-wide, rolling updates keep latest-only queues, and overlay batches publish atomically so readers continue seeing the last consistent revision during an update.
 
-Run it yourself:
-```bash
-dotnet test --filter "Category=Benchmark" -v normal
+## Build and test
+
+```powershell
+dotnet restore CodeMap.sln
+dotnet build CodeMap.sln -c Release --no-restore
+dotnet test CodeMap.sln -c Release --no-build --no-restore
+powershell -ExecutionPolicy Bypass -File .\scripts\build-win-x64.ps1
 ```
 
----
+The Windows archive contains both official executables:
 
-## 28 Tools Across Six Categories
+- `MGsCodeMap.Daemon.exe` — central semantic server
+- `MGsCodeMap.Mcp.exe` — lightweight compatibility proxy
 
-### Discover
-| Tool | What it does |
-|------|-------------|
-| `symbols.search` | FTS search by name, kind, namespace, or file path |
-| `code.search_text` | Regex/substring search across source files — returns file:line:excerpt |
-| `symbols.get_card` | Full symbol metadata + architectural facts + source code |
-| `symbols.get_context` | Card + source + all callees with source — deep understanding in one call |
-| `symbols.get_definition_span` | Raw source only, no overhead |
-| `code.get_span` | Read any source excerpt by line range |
+No executable using an earlier name is included.
 
-### Navigate
-| Tool | What it does |
-|------|-------------|
-| `refs.find` | All references to a symbol, classified (Call, Read, Write, Implementation…) |
-| `graph.callers` | Depth-limited caller graph — who triggers this? |
-| `graph.callees` | Depth-limited callee graph — what does this orchestrate? |
-| `graph.trace_feature` | Full annotated feature flow with facts at every node |
-| `types.hierarchy` | Base type, interfaces implemented, and all derived types |
+## License and attribution
 
-### Architecture
-| Tool | What it does |
-|------|-------------|
-| `codemap.summarize` | Full codebase overview: endpoints, DI, config, DB, middleware, logging |
-| `codemap.export` | Portable context dump (markdown/JSON, 3 detail levels) for any LLM |
-| `codemap.guide` | Quick-start guide: session setup, decision table, and usage rules for agents |
-| `index.diff` | Semantic diff between commits: symbols added/removed/renamed, API changes |
-| `surfaces.list_endpoints` | Every HTTP route (controller + minimal API) with handler and file:line |
-| `surfaces.list_config_keys` | Every `IConfiguration` access with usage pattern |
-| `surfaces.list_db_tables` | EF Core entities + `[Table]` attributes + raw SQL table references |
-
-### Workspace
-| Tool | What it does |
-|------|-------------|
-| `workspace.create` | Isolated overlay for in-progress edits |
-| `workspace.reset` | Clear overlay, back to baseline |
-| `workspace.list` | All active workspaces with staleness, SemanticLevel, and fact count |
-| `workspace.delete` | Remove a workspace |
-| `index.refresh_overlay` | Re-index changed files incrementally (~63ms) |
-
-### Index Management
-| Tool | What it does |
-|------|-------------|
-| `index.ensure_baseline` | Build the semantic index (idempotent, cache-aware, auto-discovers solution) |
-| `index.list_baselines` | All cached baselines with size, age, and commit |
-| `index.cleanup` | Remove stale baselines (dry-run default) |
-| `index.remove_repo` | Remove ALL baselines for a repo (ignores protection rules) |
-
-### Repo
-| Tool | What it does |
-|------|-------------|
-| `repo.status` | Git state + whether a baseline exists for current HEAD |
-
----
-
-## Workspace Mode — See Your Own Edits
-
-CodeMap tracks uncommitted changes via an **overlay index**. Every agent session gets its own isolated workspace:
-
-```
-1. index.ensure_baseline   → index HEAD once
-2. workspace.create        → agent gets isolated overlay
-3. Edit files on disk
-4. index.refresh_overlay   → re-indexes only changed files (~63ms)
-5. Query with workspace_id → results include your in-progress code
-```
-
-Three consistency modes:
-- **Committed** — baseline index only (default, no workspace needed)
-- **Workspace** — baseline + your uncommitted edits merged
-- **Ephemeral** — workspace + virtual file contents (unsaved buffer content)
-
----
-
-## Multi-Agent Supervisor Support
-
-Running multiple agents in parallel? CodeMap has you covered:
-
-- Each agent gets its own isolated workspace — no cross-contamination
-- `workspace.list` shows every workspace: `IsStale`, `SemanticLevel`, fact count
-- Stale detection fires when a workspace's base commit diverges from HEAD
-- Supervisor can inspect, clean up, or re-provision any agent's workspace
-
----
-
-## Self-Healing Under Broken Builds
-
-When a file doesn't compile, CodeMap doesn't drop references. It stores **unresolved edges** with syntactic hints. When compilation succeeds again (after a fix), a **resolution worker** automatically upgrades them to fully-resolved semantic edges.
-
-`refs.find` returns both. Filter with `resolution_state: "resolved"` if you need certainty.
-
----
-
-## DLL Boundary Navigation
-
-CodeMap resolves DLL symbols lazily on first agent access — `NOT_FOUND` at a DLL
-boundary triggers automatic extraction rather than a dead end.
-
-**Two levels, both permanent (cached in baseline DB):**
-
-| Level | Trigger | What you get | Cost |
-|-------|---------|--------------|------|
-| 1 — Metadata stub | Any `NOT_FOUND` query | Method signatures, XML docs, type hierarchy | ~1–5ms (once) |
-| 2 — Decompiled source | `symbols.get_card` with `include_code: true` | Full reconstructed C# source via ICSharpCode.Decompiler | ~10–200ms (once) |
-
-After Level 2, cross-DLL call graph edges are extracted so `graph.callees` and
-`graph.trace_feature` traverse INTO and THROUGH DLL code seamlessly.
-
-**`source` discriminator in `symbols.get_card` response:**
-- `"source_code"` — symbol is from your own source
-- `"metadata_stub"` — Level 1 only (decompilation unavailable)
-- `"decompiled"` — Level 2 source reconstructed and ready
-
-`graph.trace_feature` applies a `max_lazy_resolutions_per_query` budget (default 20)
-when encountering previously-unseen DLL types to bound decompilation latency.
-
----
-
-## Shared Baseline Cache
-
-Index once, reuse everywhere — across machines, CI, Docker containers:
-
-```bash
-export CODEMAP_CACHE_DIR=/shared/codemap-cache
-```
-
-- `index.ensure_baseline` pulls from cache first (~2ms vs ~30s Roslyn build)
-- Auto-push after every new baseline build
-- Self-healing: corrupt cache entries are detected and overwritten
-- Zero config when `CODEMAP_CACHE_DIR` is unset — all cache ops are no-ops
-
----
-
-## v2 Storage Engine — 10x Faster Queries
-
-v2.0.0 replaces SQLite with a **custom binary storage engine** using memory-mapped segment files. The Roslyn extraction pipeline is unchanged — only the on-disk format is new.
-
-**Query speedup** (measured across 15 query types on real repos):
-
-| Query | v1 (SQLite) | v2 (mmap) | Speedup |
-|-------|------------|-----------|---------|
-| `graph.trace_feature` | 13.2ms | 0.5ms | **26x** |
-| `codemap.summarize` | 18.9ms | 0.9ms | **21x** |
-| `surfaces.list_db_tables` | 5.7ms | 0.2ms | **28x** |
-| `surfaces.list_config_keys` | 3.6ms | 0.2ms | **18x** |
-| `types.hierarchy` | 8.7ms | 1.0ms | **9x** |
-| `symbols.get_context` | 28.7ms | 5.3ms | **5x** |
-| `symbols.get_card` | 7.8ms | 2.7ms | **3x** |
-
-**Indexing speedup** (Roslyn compilation dominates, but I/O is faster):
-
-| Repo | v1 | v2 | Speedup |
-|------|-----|-----|---------|
-| eShopOnWeb (278 files) | 16.2s | 5.8s | **2.8x** |
-| Bitwarden (4,466 files) | ~170s | ~110s | **1.5x** |
-| dotnet/roslyn (18,799 files) | 138.2s | 96.8s | **1.4x** |
-
-**What changed:**
-- Baselines stored as contiguous packed binary segments (symbols, edges, files, facts) with mmap reads — no SQL parsing overhead
-- Custom search index with tokenized FTS (CamelCase splitting, signature/documentation indexing)
-- WAL-backed overlay for workspace mutations (same isolation model)
-- Zero native DLL dependencies (no `e_sqlite3.dll`)
-
-**Validated on 9+ repos** including dotnet/roslyn (174K symbols, 768K references), dotnet/fsharp (157K symbols via FCS), and Bitwarden. Zero functional bugs. See [`docs/ENGINE-COMPARISON-RESULTS.MD`](docs/ENGINE-COMPARISON-RESULTS.MD) for full data.
-
----
-
-## Self-Hosting Validated
-
-CodeMap indexes its own 18-project solution (5,576 symbols, 20,960 references).
-All 28 tools verified against real-world architectural complexity. Self-hosting exposed
-and fixed cross-project reference bugs, CamelCase FTS edge cases, overlay StringId
-resolution issues, and multi-line SQL extraction gaps. Every tool in this README was
-tested against the codebase that implements it.
-
----
-
-## Upstream package installation
-
-The NuGet package below belongs to the original upstream CodeMap project and does not
-contain this fork's VS 2026, multi-solution, watcher, or configured-storage changes. Use
-the [Windows x64 installation](#windows-x64-installation) for MGsCodeMapMCP.
-
-### Original CodeMap .NET global tool
-
-See the [original CodeMap repository](https://github.com/bbajt/csharp-code-map) for
-upstream package installation and support information.
-
-> **NuGet package:** `MGsCodeMapMCP` with tool command `mgscodemap-mcp`.
-
-### Docker
-
-```bash
-docker build -t mgs-codemap-mcp .
-docker run -i \
-  -v /path/to/your/repo:/repo:ro \
-  -v /path/to/cache:/cache \
-  mgs-codemap-mcp
-```
-
-> `-i` is required — MCP uses stdio transport. Without it the container gets immediate EOF.
-
-Uses the .NET SDK base image (~800MB) because `MSBuildWorkspace` needs MSBuild at runtime for `index.ensure_baseline`. Mount a cache volume (`-v /path/to/cache:/cache`) to avoid rebuilding the index on every container start.
-
----
-
-## Connect to Your AI Agent
-
-### MGsCodeMapMCP on Windows
-
-Use the absolute executable path in your client's MCP configuration:
-
-```json
-{
-  "mcpServers": {
-    "mgs-codemap": {
-      "command": "C:\\Tools\\MGsCodeMapMCP\\MGsCodeMap.Mcp.exe",
-      "args": ["--config", "C:\\Tools\\MGsCodeMapMCP\\codemap.json"]
-    }
-  }
-}
-```
-
-### Any MCP-Compatible Client
-
-CodeMap speaks standard MCP over **stdin/stdout** (JSON-RPC 2.0). Any MCP client works.
-
-### CLAUDE.md Integration
-
-Drop the instruction block from [`docs/CLAUDE-INSERT.MD`](docs/CLAUDE-INSERT.MD) into your project's `CLAUDE.md` to wire up automatic CodeMap usage for any Claude agent working on that project. The block includes the session startup sequence, a tool substitution decision table, and the "refresh before grep" rule that keeps agents in semantic mode.
-
----
-
-## Tip: Write XML Docs — CodeMap Uses Them
-
-CodeMap indexes `/// <summary>` XML doc comments on all classes, methods, and
-interfaces. They appear in `symbols.get_card`, `symbols.get_context`, and
-`symbols.search` results — giving agents intent and context without reading
-implementations.
-
-**When writing C# code with CodeMap enabled, always add XML doc comments.**
-This isn't just style — it directly improves every downstream query. Agents
-using `graph.trace_feature` see annotated call trees that read like specs.
-`codemap.export` includes docs in the portable context for other LLMs.
-
-See [`docs/CODEMAP-AGENT-GUIDE.MD`](docs/CODEMAP-AGENT-GUIDE.MD) for the full agent workflow guide.
-
----
-
-## Architecture
-
-```
-Your Git repo              CodeMap Server
-     │                          │
-     │  repo_path               │
-     ├─────────────────────────►│ GitService         (repo identity, HEAD SHA)
-     │                          │      │
-     │  solution.sln/.slnx      │      ▼
-     ├─────────────────────────►│ RoslynCompiler     (MSBuildWorkspace for C#/VB, FCS for F#)
-     │                          │      │
-     │                          │      ▼
-     │                          │ Extractors         (Symbols + Refs + TypeRelations + Facts)
-     │                          │      │
-     │                          │      ▼
-     │                          │ CustomSymbolStore   (v2 binary segments, mmap'd)
-     │                          │      │        ↕
-     │                          │      │   SharedCache  (file-based, optional)
-     │                          │      ▼
-     │  your uncommitted edits  │      ▼
-     ├─────────────────────────►│ OverlayStore        (WAL-backed incremental overlay)
-     │                          │      │
-     │                          │      ▼
-     │                          │ MergedQueryEngine  (baseline + overlay, transparent merge)
-     │                          │      │
-     │  MCP tool call           │      ▼
-     ├─────────────────────────►│ McpServer          (stdio JSON-RPC 2.0, 28 tools)
-     │                          │      │
-     │  JSON response           │      ▼
-     │◄─────────────────────────│ ResponseEnvelope   (answer + evidence + timing + token savings)
-```
-
-**Layer dependencies** (enforced at build time — violations are build errors):
-
-```
-CodeMap.Core      ← zero dependencies (domain types + interfaces)
-CodeMap.Git       ← Core (LibGit2Sharp)
-CodeMap.Roslyn    ← Core (Roslyn 5.x + MSBuildWorkspace)
-CodeMap.Storage.Engine ← Core (v2 binary segments, sole engine since v2.1.0)
-CodeMap.Query     ← Core + Storage.Engine (query engine + cache + overlay merge)
-CodeMap.Mcp       ← Core + Query (MCP tool handlers)
-MGsCodeMap.Mcp    ← ALL (DI composition root and host executable)
-```
-
----
-
-## Observability
-
-Every response includes:
-- **Per-phase timing** — `cache_lookup_ms`, `db_query_ms`, `ranking_ms` (sub-millisecond on v2)
-- **Token savings** — tokens saved and cost avoided vs raw file reading
-- **Semantic level** — `Full` / `Partial` / `SyntaxOnly` (index quality signal)
-- **Overlay revision** — which workspace revision answered the query
-- **Workspace ID** — which workspace context answered (null for committed mode)
-
-Structured logs are written to the resolved `logs` directory as daily JSON-lines
-files. Cumulative savings are stored under the resolved `data` directory. Configuration
-defaults to `codemap.json` beside the executable and can be overridden with `--config`.
-
-### v2 Data Directory
-
-Baselines are stored under
-`data/repositories/<repoId>/solutions/<solutionId>/baselines/<commitSha>/` as binary
-segment files. Solution-scoped overlays live under the same configured data root. Use
-`index.list_baselines` to inspect and `index.cleanup` to reclaim space.
-
----
-
-## Known Limitations & Coverage Gaps
-
-CodeMap won't surface a hit in every situation a `grep` would. The most
-common reasons are documented in [`docs/KNOWN-LIMITATIONS.md`](docs/KNOWN-LIMITATIONS.md).
-Top items to be aware of:
-
-- **Multi-target conditional symbols.** `#if NET8_0`-only types are
-  invisible — extraction runs on the highest TFM only (L-01).
-- **Legacy MVC `MapControllerRoute`** — convention-routed actions don't
-  surface in `surfaces.list_endpoints`. Only attribute routing,
-  minimal API, and Blazor `@page` are extracted (L-02).
-- **F# fact extractors not yet wired** — F# gets symbols/refs/hierarchy
-  only; endpoints / DI / config / DB tables don't extract from `.fsproj`
-  yet (L-05).
-- **Fresh clone with no build** — Razor source-generator output may be
-  invisible until you `dotnet build` once (L-08).
-
-When `symbols.search` returns nothing for code you can see in the
-editor, scan KNOWN-LIMITATIONS first before falling back to grep.
-
----
-
-## Documentation
-
-| Doc | What's in it |
-|-----|-------------|
-| [`docs/CLAUDE-INSERT.MD`](docs/CLAUDE-INSERT.MD) | Copy-paste block for CLAUDE.md — wires up agent to use CodeMap |
-| [`docs/CODEMAP-AGENT-GUIDE.MD`](docs/CODEMAP-AGENT-GUIDE.MD) | Full agent operating guide: startup, refresh, query patterns, common mistakes |
-| [`docs/KNOWN-LIMITATIONS.md`](docs/KNOWN-LIMITATIONS.md) | Coverage gaps and intentional non-features — what `grep` finds that CodeMap doesn't |
-| [`docs/DEVELOPER-GUIDE.MD`](docs/DEVELOPER-GUIDE.MD) | How to add tools, extractors, storage methods |
-| [`docs/ARCHITECTURE-WALKTHROUGH.MD`](docs/ARCHITECTURE-WALKTHROUGH.MD) | Request traces, data model, decision log |
-| [`docs/API-SCHEMA.MD`](docs/API-SCHEMA.MD) | Every type definition and MCP tool contract |
-| [`docs/SYSTEM-ARCHITECTURE.MD`](docs/SYSTEM-ARCHITECTURE.MD) | Component design, DB schema, query model |
-
----
-
-## Build & Test
-
-```bash
-# Build (zero warnings enforced)
-dotnet build -warnaserror
-
-# Fast unit tests
-dotnet test --filter "Category!=Integration&Category!=Benchmark"
-
-# Integration tests (requires MSBuild)
-dotnet test --filter "Category=Integration"
-
-# Token savings benchmark
-dotnet test --filter "Category=Benchmark" -v normal
-
-# Performance microbenchmarks (BenchmarkDotNet)
-cd tests/CodeMap.Benchmarks && dotnet run -c Release
-```
-
----
-
-## Performance Reference
-
-What to expect when running CodeMap on your codebase. All v2 engine numbers (default since v2.0.0).
-
-### Indexing time by repo size
-
-| Repo | Files | Symbols | Refs | Index time |
-|------|-------|---------|------|-----------|
-| CodeMap (self-hosted) | 585 | 6,800 | 29,200 | ~24s |
-| eShopOnWeb | 278 | — | — | ~6s |
-| dotnet/fsharp | 994 | 157,000 | 58,000 | ~131s |
-| Bitwarden | 4,466 | — | — | ~110s |
-| dotnet/roslyn | 18,799 | 174,000 | 768,000 | ~97s |
-
-Subsequent runs on the same commit return immediately (`already_existed: true`). Incremental overlay refresh (after editing files) takes **~63ms**.
-
-### Query response time (v2 engine)
-
-| Query | Cold (first hit, no L1 cache) | Warm (L1 cache) |
-|-------|------------------------------|-----------------|
-| `symbols.search` | 1–10ms | <1ms |
-| `symbols.get_card` | 2–10ms | <1ms |
-| `symbols.get_context` | 5–30ms | 1–5ms |
-| `refs.find` | 5–20ms | <1ms |
-| `graph.callers / callees` | 10–50ms | 1–5ms |
-| `graph.trace_feature` | 10–100ms | 1–10ms |
-| `types.hierarchy` | 1–5ms | <1ms |
-| `codemap.summarize` | 50–200ms | 5–20ms |
-| `surfaces.list_*` | 1–10ms | <1ms |
-| `index.diff` | 100–500ms | — |
-
-Cold times scale with repo size (more symbols = more BFS/join work). Warm times are nearly flat across all repo sizes — L1 cache caps at 10,000 entries with LRU eviction.
-
-### Memory footprint (v2 engine)
-
-| Repo size | Baseline on disk | Resident memory (mmap) |
-|-----------|-----------------|----------------------|
-| Small (<1K symbols) | ~1–5 MB | ~5–20 MB |
-| Medium (10K symbols) | ~20–50 MB | ~30–80 MB |
-| Large (100K+ symbols) | ~200–500 MB | ~300–600 MB |
-
-mmap pages are demand-loaded by the OS — resident memory stays proportional to queries made, not total index size.
-
----
-
-*28 MCP tools. 90%+ token savings. Roslyn-grade semantics. C#, VB.NET, F#, **Blazor/Razor**. DLL boundary navigation. `.sln` + `.slnx` auto-discovery. v2.5.1 — multi-target compilation collapse (one extraction per `.csproj`, not per TFM), KNOWN-LIMITATIONS register surfaced via `codemap.guide`. Validated on dotnet/roslyn (174K symbols), dotnet/fsharp (157K symbols), and a 9-repo Blazor corpus including Blazorise, MudBlazor, ant-design-blazor, OrchardCore. Your agent deserves better than grep.*
+See [LICENSE.MD](LICENSE.MD) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

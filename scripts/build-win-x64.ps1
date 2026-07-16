@@ -1,62 +1,69 @@
-param(
-    [string]$Version = "2.8.0-mgs.4"
-)
+param([string]$Version = "2.8.0-mgs.5")
 
 $ErrorActionPreference = "Stop"
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $artifactsRoot = [System.IO.Path]::GetFullPath((Join-Path $repoRoot "artifacts\release"))
-$publishDir = [System.IO.Path]::GetFullPath((Join-Path $artifactsRoot "publish-win-x64"))
+$daemonPublish = [System.IO.Path]::GetFullPath((Join-Path $artifactsRoot "publish-daemon-win-x64"))
+$proxyPublish = [System.IO.Path]::GetFullPath((Join-Path $artifactsRoot "publish-proxy-win-x64"))
 $releaseDir = [System.IO.Path]::GetFullPath((Join-Path $artifactsRoot "MGsCodeMapMCP"))
 $zipPath = [System.IO.Path]::GetFullPath((Join-Path $artifactsRoot "MGsCodeMapMCP-win-x64.zip"))
 
-foreach ($path in @($publishDir, $releaseDir, $zipPath)) {
+foreach ($path in @($daemonPublish, $proxyPublish, $releaseDir, $zipPath)) {
     if (-not $path.StartsWith($artifactsRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Refusing to modify path outside artifacts/release: $path"
     }
 }
 
 New-Item -ItemType Directory -Force -Path $artifactsRoot | Out-Null
-foreach ($directory in @($publishDir, $releaseDir)) {
-    if (Test-Path -LiteralPath $directory) {
-        Remove-Item -LiteralPath $directory -Recurse -Force
-    }
+foreach ($directory in @($daemonPublish, $proxyPublish, $releaseDir)) {
+    if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force }
 }
-if (Test-Path -LiteralPath $zipPath) {
-    Remove-Item -LiteralPath $zipPath -Force
-}
+if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
 
-dotnet publish (Join-Path $repoRoot "src\CodeMap.Daemon\MGsCodeMap.Mcp.csproj") `
-    -c Release `
-    -r win-x64 `
-    --self-contained true `
-    -p:PublishSingleFile=false `
-    -p:PublishTrimmed=false `
-    -p:DebugType=None `
-    -p:DebugSymbols=false `
-    -p:Version=$Version `
-    -o $publishDir
-if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE" }
+dotnet publish (Join-Path $repoRoot "src\CodeMap.Daemon\MGsCodeMap.Daemon.csproj") `
+    -c Release -r win-x64 --self-contained true `
+    -p:PublishSingleFile=false -p:PublishTrimmed=false -p:DebugType=None -p:DebugSymbols=false `
+    -p:Version=$Version -o $daemonPublish
+if ($LASTEXITCODE -ne 0) { throw "Daemon publish failed with exit code $LASTEXITCODE" }
+
+dotnet publish (Join-Path $repoRoot "src\MGsCodeMap.Mcp\MGsCodeMap.Mcp.csproj") `
+    -c Release -r win-x64 --self-contained true `
+    -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:PublishTrimmed=false `
+    -p:DebugType=None -p:DebugSymbols=false -p:Version=$Version -o $proxyPublish
+if ($LASTEXITCODE -ne 0) { throw "Proxy publish failed with exit code $LASTEXITCODE" }
 
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
-Copy-Item -Path (Join-Path $publishDir "*") -Destination $releaseDir -Recurse -Force
+Copy-Item -Path (Join-Path $daemonPublish "*") -Destination $releaseDir -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $proxyPublish "MGsCodeMap.Mcp.exe") -Destination $releaseDir -Force
+Get-ChildItem -LiteralPath $releaseDir -Recurse -Filter "*.pdb" | Remove-Item -Force
 
-$mcpExe = Join-Path $releaseDir "MGsCodeMap.Mcp.exe"
-if (-not (Test-Path -LiteralPath $mcpExe)) {
-    throw "Published executable not found: $mcpExe"
-}
-foreach ($legacyExecutable in @("CodeMap.Mcp.exe", "CodeMap.Daemon.exe")) {
-    if (Test-Path -LiteralPath (Join-Path $releaseDir $legacyExecutable)) {
-        throw "Legacy executable must not be included: $legacyExecutable"
+foreach ($required in @("MGsCodeMap.Daemon.exe", "MGsCodeMap.Mcp.exe")) {
+    if (-not (Test-Path -LiteralPath (Join-Path $releaseDir $required))) {
+        throw "Published executable not found: $required"
     }
 }
-Copy-Item -LiteralPath (Join-Path $repoRoot "codemap.example.json") -Destination $releaseDir
-Copy-Item -LiteralPath (Join-Path $repoRoot "README.md") -Destination $releaseDir
-Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE.MD") -Destination $releaseDir
-Copy-Item -LiteralPath (Join-Path $repoRoot "THIRD-PARTY-NOTICES.md") -Destination $releaseDir
+foreach ($oldName in @("CodeMap.Mcp.exe", "CodeMap.Daemon.exe")) {
+    if (Test-Path -LiteralPath (Join-Path $releaseDir $oldName)) {
+        throw "Old executable must not be included: $oldName"
+    }
+}
+
+foreach ($file in @("codemap.example.json", "README.md", "LICENSE.MD", "THIRD-PARTY-NOTICES.md")) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot $file) -Destination $releaseDir
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "docs") | Out-Null
+foreach ($doc in @("CENTRAL-DAEMON.MD", "WINDOWS-INSTALLATION.MD", "ROLLING-BRANCH-INDEXING.MD")) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot "docs\$doc") -Destination (Join-Path $releaseDir "docs")
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "scripts") | Out-Null
+foreach ($script in @(
+    "daemon-common.ps1", "install-user-daemon.ps1", "uninstall-user-daemon.ps1",
+    "start-daemon.ps1", "stop-daemon.ps1", "restart-daemon.ps1", "status-daemon.ps1")) {
+    Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\$script") -Destination (Join-Path $releaseDir "scripts")
+}
 New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "data") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "logs") | Out-Null
 
 Compress-Archive -LiteralPath $releaseDir -DestinationPath $zipPath -CompressionLevel Optimal
-
 Write-Host "Windows x64 release: $releaseDir"
-Write-Host "Archive:          $zipPath"
+Write-Host "Archive: $zipPath"

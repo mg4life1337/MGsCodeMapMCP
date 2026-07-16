@@ -1,6 +1,7 @@
 namespace CodeMap.Mcp;
 
 using Microsoft.Extensions.DependencyInjection;
+using CodeMap.Mcp.Context;
 
 /// <summary>
 /// DI registration extension for the hand-rolled MCP server.
@@ -16,6 +17,7 @@ public static class McpServerSetup
     public static IServiceCollection AddMcpServer(this IServiceCollection services)
     {
         services.AddSingleton<ToolRegistry>();
+        services.AddSingleton<IMcpSessionContext, McpSessionContext>();
         services.AddSingleton<McpServer>();
         return services;
     }

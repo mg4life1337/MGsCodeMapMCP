@@ -1,5 +1,11 @@
 # Rolling branch indexing
 
+## Central ownership in 2.8.0-mgs.5
+
+Rolling indexing now runs only inside `MGsCodeMap.Daemon`. Multiple HTTP clients share the same `RepositorySupervisor`, latest-only queues, incremental Solution cache, baselines, overlays, and WAL writers. `MGsCodeMap.Mcp` is a transport proxy and cannot start rolling work or open storage.
+
+The daemon acquires its per-data-directory single-instance lock before resolving this subsystem. A rejected second daemon therefore cannot restore a rolling workspace or open its WAL. Client-session cancellation applies to the individual MCP request; repository observation and centrally scheduled rolling work use the host lifetime token.
+
 MGsCodeMapMCP can maintain a current logical index for every repository, branch, and
 solution without creating a complete immutable baseline after every pull. The mode is
 opt-in, so existing configurations keep their previous commit-baseline behavior.

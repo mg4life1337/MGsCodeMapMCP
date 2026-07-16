@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.8.0-mgs.5 - 2026-07-16
+
+### Central multi-client daemon
+
+- Split the heavy host into `MGsCodeMap.Daemon.exe` and the lightweight `MGsCodeMap.Mcp.exe` STDIO-to-HTTP proxy.
+- Added a loopback Streamable HTTP MCP endpoint with independent sessions, concurrent reads, transport cancellation, and unchanged tool schemas.
+- Added per-session sticky workspace state so one client cannot change another client's default workspace.
+- Added a health endpoint with process, memory, cache, supervisor, session, workspace, and indexing status.
+- Added a per-data-directory named mutex plus lock metadata. A second writer exits with code 17 before opening stores or WAL files.
+- Added graceful HTTP shutdown, clean disposal of cached baselines and overlays, and existing WAL replay on restart.
+- Added per-user logon-task installation and start, stop, restart, status, and uninstall scripts.
+- Added HTTP, three-session, single-instance, proxy-dependency, configuration, and session-isolation tests.
+- Updated Windows, cross-platform, Docker, NuGet, documentation, examples, and release packaging for both executable roles.
+- Removed the forced full garbage collection after Roslyn pass 2; cache bounds and object lifetime now provide the memory controls.
+
 ## 2.8.0-mgs.4
 
 - Bounded full baseline builds to one concurrent index and Roslyn reference extraction to two

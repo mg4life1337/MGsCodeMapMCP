@@ -51,6 +51,7 @@ public sealed class FileLoggerProvider : ILoggerProvider, IDisposable
             {
                 ["ts"] = DateTimeOffset.UtcNow.ToString("o"),
                 ["level"] = level.ToString(),
+                ["pid"] = Environment.ProcessId,
                 ["cat"] = categoryName,
                 ["msg"] = message
             };

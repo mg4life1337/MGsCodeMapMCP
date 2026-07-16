@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>MGsCodeMap.Mcp</RootNamespace>
+    <AssemblyName>MGsCodeMap.Mcp</AssemblyName>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <Version>2.8.0-mgs.5</Version>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>mgscodemap-mcp</ToolCommandName>
+    <PackageId>MGsCodeMapMCP</PackageId>
+    <PackageOutputPath>..\..\dist\nupkg</PackageOutputPath>
+    <PublishSingleFile Condition="'$(RuntimeIdentifier)' != ''">true</PublishSingleFile>
+    <EnableCompressionInSingleFile Condition="'$(RuntimeIdentifier)' != ''">true</EnableCompressionInSingleFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="\" Condition="Exists('..\..\LICENSE')" />
+  </ItemGroup>
+</Project>
