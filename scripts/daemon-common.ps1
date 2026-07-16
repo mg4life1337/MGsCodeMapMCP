@@ -1,12 +1,16 @@
 $ErrorActionPreference = "Stop"
+$script:MGsDefaultTaskName = "MGsCodeMapMCP User Daemon"
 
 function Resolve-MGsDaemonSettings {
     param([Parameter(Mandatory = $true)][string]$ConfigPath)
 
     $resolvedConfig = [System.IO.Path]::GetFullPath($ConfigPath)
     $installDirectory = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-    $exe = [System.IO.Path]::GetFullPath((Join-Path $installDirectory "MGsCodeMap.Daemon.exe"))
-    if (-not (Test-Path -LiteralPath $exe)) { throw "Daemon executable not found: $exe" }
+    $daemonExe = [System.IO.Path]::GetFullPath((Join-Path $installDirectory "MGsCodeMap.Daemon.exe"))
+    $taskHostExe = [System.IO.Path]::GetFullPath((Join-Path $installDirectory "MGsCodeMap.TaskHost.exe"))
+    if (-not (Test-Path -LiteralPath $daemonExe)) { throw "Daemon executable not found: $daemonExe" }
+    if (-not (Test-Path -LiteralPath $taskHostExe)) { throw "Task host executable not found: $taskHostExe" }
+    if (-not (Test-Path -LiteralPath $resolvedConfig)) { throw "Configuration file not found: $resolvedConfig" }
 
     $hostName = "127.0.0.1"
     $port = 5137
@@ -24,10 +28,37 @@ function Resolve-MGsDaemonSettings {
     [pscustomobject]@{
         ConfigPath = $resolvedConfig
         InstallDirectory = $installDirectory
-        Executable = $exe
+        DaemonExecutable = $daemonExe
+        TaskHostExecutable = $taskHostExe
         HealthUrl = "http://${hostName}:${port}${healthPath}"
         ShutdownUrl = "http://${hostName}:${port}/shutdown"
     }
+}
+
+function ConvertTo-MGsQuotedArgument {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    if ($Value.Contains('"')) { throw 'Windows paths containing a quotation mark are not supported.' }
+    return '"' + $Value + '"'
+}
+
+function Get-MGsScheduledTask {
+    param([string]$TaskName = $script:MGsDefaultTaskName)
+    return Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+}
+
+function Wait-MGsScheduledTaskState {
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [Parameter(Mandatory = $true)][string]$State,
+        [int]$TimeoutSeconds = 10
+    )
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTimeOffset]::UtcNow -lt $deadline) {
+        $task = Get-MGsScheduledTask -TaskName $TaskName
+        if ($null -eq $task -or [string]$task.State -eq $State) { return $task }
+        Start-Sleep -Milliseconds 250
+    }
+    return Get-MGsScheduledTask -TaskName $TaskName
 }
 
 function Get-MGsDaemonHealth {

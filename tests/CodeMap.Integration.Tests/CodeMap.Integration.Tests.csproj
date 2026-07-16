@@ -13,6 +13,7 @@
     <ProjectReference Include="..\..\src\CodeMap.Mcp\CodeMap.Mcp.csproj" />
     <ProjectReference Include="..\..\src\CodeMap.Daemon\MGsCodeMap.Daemon.csproj" />
     <ProjectReference Include="..\..\src\MGsCodeMap.Mcp\MGsCodeMap.Mcp.csproj" />
+    <ProjectReference Include="..\..\src\MGsCodeMap.TaskHost\MGsCodeMap.TaskHost.csproj" />
     <ProjectReference Include="..\CodeMap.TestUtilities\CodeMap.TestUtilities.csproj" />
   </ItemGroup>
 

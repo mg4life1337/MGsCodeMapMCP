@@ -1,4 +1,4 @@
-param([string]$Version = "2.8.0-mgs.5")
+param([string]$Version = "2.8.0-mgs.6")
 
 $ErrorActionPreference = "Stop"
 dotnet pack src/MGsCodeMap.Mcp/MGsCodeMap.Mcp.csproj -c Release "-p:Version=$Version" -o dist/nupkg
@@ -17,4 +17,12 @@ foreach ($rid in @("win-x64", "linux-x64", "osx-arm64")) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     $proxyName = if ($rid.StartsWith("win")) { "MGsCodeMap.Mcp.exe" } else { "MGsCodeMap.Mcp" }
     Copy-Item -LiteralPath (Join-Path $proxyTemp $proxyName) -Destination $target -Force
+    if ($rid.StartsWith("win")) {
+        $taskHostTemp = "dist/taskhost-$rid"
+        dotnet publish src/MGsCodeMap.TaskHost/MGsCodeMap.TaskHost.csproj -c Release -r $rid --self-contained `
+            -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:PublishTrimmed=true `
+            "-p:Version=$Version" -o $taskHostTemp
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        Copy-Item -LiteralPath (Join-Path $taskHostTemp "MGsCodeMap.TaskHost.exe") -Destination $target -Force
+    }
 }

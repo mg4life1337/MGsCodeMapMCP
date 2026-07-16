@@ -4,19 +4,29 @@
 
 STDIO MCP clients commonly own the lifetime of the command they start. When several client tasks use the same STDIO configuration, each task can therefore start a complete semantic server. Each process then has its own Roslyn and MSBuild state while trying to open the same rolling overlays.
 
-MGsCodeMapMCP `2.8.0-mgs.5` moves all semantic state into one long-lived process:
+MGsCodeMapMCP `2.8.0-mgs.6` keeps all semantic state in one long-lived process and adds a supervised windowless Windows task host:
 
 ```text
-HTTP session A ─┐
-HTTP session B ─┼── /mcp ──> MGsCodeMap.Daemon
-HTTP session C ─┘                ├─ RepositorySupervisor
-                                ├─ RollingIndexCoordinator
-                                ├─ Roslyn / MSBuild Solution cache
-                                ├─ baseline readers
-                                └─ overlay writer and WAL recovery
+Task Scheduler ──> MGsCodeMap.TaskHost ──> MGsCodeMap.Daemon
+                                              ↑
+HTTP session A ─┐                              │
+HTTP session B ─┼────────── /mcp ─────────────┤
+HTTP session C ─┘                              ├─ RepositorySupervisor
+                                              ├─ RollingIndexCoordinator
+                                              ├─ Roslyn / MSBuild Solution cache
+                                              ├─ baseline readers
+                                              └─ overlay writer and WAL recovery
 ```
 
 `MGsCodeMap.Mcp` is a separate compatibility proxy. Its project uses only the .NET base libraries and HTTP client. It has no project reference to CodeMap libraries, Roslyn, MSBuild, storage, query, or supervisor code.
+
+## Windows user-task supervision
+
+`MGsCodeMap.TaskHost.exe` is a small `WinExe` with no CodeMap project references. Task Scheduler starts it directly at user logon, so no PowerShell or terminal process remains attached. The task host starts `MGsCodeMap.Daemon.exe` with `CreateNoWindow`, waits synchronously for the child process, records lifecycle diagnostics in `logs/taskhost.log`, and returns the exact daemon exit code.
+
+The task therefore remains `Running` for the complete daemon lifetime. A crash produces a failed task result; a one-minute watchdog trigger starts a new task instance while `IgnoreNew` suppresses ticks during healthy operation. A deliberate stop disables the task before `/shutdown`, preventing a watchdog restart. `start-daemon.ps1` enables it again. The supplied stop and uninstall scripts always request graceful HTTP shutdown before considering a force fallback, and the fallback is refused while an index publication is reported.
+
+The scheduled principal uses the installing user's `Interactive` logon and `Limited` run level. No password is stored. This deliberately preserves the user's Git, NuGet, certificate, profile, environment, MSBuild, and filesystem context. A Windows service would run under a separately configured identity and is not installed by this release.
 
 ## Startup order
 

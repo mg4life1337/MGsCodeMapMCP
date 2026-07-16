@@ -8,6 +8,7 @@ The central difference is visible at the process boundary:
 
 - `MGsCodeMap.Daemon.exe` is the one long-running, heavy process. It owns Roslyn, MSBuild, repository monitoring, baselines, overlays, and WAL files.
 - Any number of MCP clients share that daemon through Streamable HTTP at `http://127.0.0.1:5137/mcp`.
+- `MGsCodeMap.TaskHost.exe` is the windowless Windows Task Scheduler action. It remains active while the daemon runs and returns the daemon exit code so Task Scheduler can restart failures.
 - `MGsCodeMap.Mcp.exe` is an optional lightweight STDIO-to-HTTP proxy. It does not reference Roslyn, start watchers, open index files, or index code.
 - A per-data-directory mutex and lock file prevent a second daemon from opening the same stores.
 - Rolling branch indexing, multi-solution discovery, conservative indexing limits, and bounded incremental Solution caching remain available centrally.
@@ -15,15 +16,17 @@ The central difference is visible at the process boundary:
 This fixes the failure mode where several client tasks each started a complete STDIO server, multiplied Roslyn memory, and competed for the same `overlay.wal`.
 
 ```text
-MCP client 1 ─┐
-MCP client 2 ─┼── Streamable HTTP ──> MGsCodeMap.Daemon.exe
-MCP client 3 ─┘                              ├─ Roslyn / MSBuild
-                                            ├─ repository supervisor
-                                            ├─ baselines and overlays
-                                            └─ one writer per data directory
+Task Scheduler ──> MGsCodeMap.TaskHost.exe ──> MGsCodeMap.Daemon.exe
+                                                   ↑
+MCP client 1 ─┐                                    │
+MCP client 2 ─┼──────── Streamable HTTP ───────────┤
+MCP client 3 ─┘                                    ├─ Roslyn / MSBuild
+                                                   ├─ repository supervisor
+                                                   ├─ baselines and overlays
+                                                   └─ one writer per data directory
 ```
 
-Current fork version: `2.8.0-mgs.5`.
+Current fork version: `2.8.0-mgs.6`.
 
 ## Windows installation
 
@@ -41,6 +44,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-user-daemon.ps1 -Conf
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\status-daemon.ps1 -ConfigPath .\codemap.json
 Invoke-RestMethod http://127.0.0.1:5137/health
+Get-ScheduledTask -TaskName 'MGsCodeMapMCP User Daemon'
+Get-ScheduledTaskInfo -TaskName 'MGsCodeMapMCP User Daemon'
 ```
 
 5. Configure Codex to use HTTP directly:
@@ -55,7 +60,9 @@ tool_timeout_sec = 1800
 
 6. Restart Codex. All tasks now use the same daemon.
 
-The logon task runs as the signed-in user. This is the recommended setup because it keeps the same Git credentials, NuGet settings, certificates, environment, and filesystem permissions as interactive development.
+The logon task runs as the signed-in user with `Interactive` logon and limited privileges. It stores no password and keeps the same Git credentials, NuGet settings, certificates, profile environment, and filesystem permissions as interactive development. Its expected state is `Running` while the daemon is alive and `Disabled` after a deliberate stop; `start-daemon.ps1` enables it again.
+
+The scheduled action is the native windowless `MGsCodeMap.TaskHost.exe`, not a persistent PowerShell process. The task host waits for the daemon and returns its exit code. A one-minute Task Scheduler watchdog trigger starts a new task instance after an unexpected exit; `IgnoreNew` makes watchdog ticks no-ops while the healthy task is already running. For interactive diagnostics, run `MGsCodeMap.Daemon.exe --config .\codemap.json --console` directly.
 
 Full instructions: [Windows installation](docs/WINDOWS-INSTALLATION.MD) and [central daemon architecture](docs/CENTRAL-DAEMON.MD).
 
@@ -116,6 +123,8 @@ The default host is loopback-only. A non-loopback host is rejected unless `allow
 
 The stop script requests graceful shutdown and waits up to 30 seconds. `-ForceFallback` is available for a stuck process; it refuses to force-stop while the health response reports an active index publication.
 
+When the scheduled task is installed, `start-daemon.ps1` starts that task instead of detaching a one-shot launcher. `status-daemon.ps1` displays task state, last result, last run, daemon PID, version, health, and observed Solution count.
+
 Uninstalling the logon task does not delete `codemap.json`, `data`, or `logs`:
 
 ```powershell
@@ -161,7 +170,7 @@ The daemon must already be running. Add `--start-daemon` to the proxy arguments 
 5. Change Codex from `command`/`args` to the HTTP `url` configuration.
 6. Restart Codex and confirm one `MGsCodeMap.Daemon.exe` process.
 
-The storage format is unchanged in `2.8.0-mgs.5`; existing baselines, rolling state, overlays, and valid WAL data are reused. A full reindex is not required solely for this upgrade.
+The storage format is unchanged in `2.8.0-mgs.6`; existing baselines, rolling state, overlays, and valid WAL data are reused. A full reindex is not required solely for this upgrade.
 
 ## MCP tools
 
@@ -189,6 +198,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-win-x64.ps1
 The Windows archive contains both official executables:
 
 - `MGsCodeMap.Daemon.exe` — central semantic server
+- `MGsCodeMap.TaskHost.exe` — windowless supervised Task Scheduler host
 - `MGsCodeMap.Mcp.exe` — lightweight compatibility proxy
 
 No executable using an earlier name is included.

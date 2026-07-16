@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.8.0-mgs.6 - 2026-07-16
+
+### Windowless supervised user task
+
+- Added `MGsCodeMap.TaskHost.exe`, a lightweight Windows `WinExe` that starts the daemon without a console window, remains active for the complete daemon lifetime, and returns the daemon exit code to Task Scheduler.
+- Changed the user-logon task to run the task host with `Interactive` logon, limited privileges, no stored password, unlimited execution time, battery-safe settings, and automatic restart after failure.
+- Made installation upgrade-safe by gracefully stopping an existing daemon before replacing and restarting the scheduled task.
+- Updated start, stop, restart, status, and uninstall scripts to manage the scheduled task while retaining the standalone windowless and interactive console paths.
+- Added Task Host dependency/version tests and an isolated practical Task Scheduler acceptance test covering task state, windowless execution, health, solution discovery, crash restart, normal restart, stop, uninstall, and data preservation.
+- Updated Windows installation, daemon architecture, troubleshooting, upgrade, and release-package documentation.
+
 ## 2.8.0-mgs.5 - 2026-07-16
 
 ### Central multi-client daemon

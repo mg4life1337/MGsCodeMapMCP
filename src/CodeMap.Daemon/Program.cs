@@ -105,7 +105,7 @@ internal static class Program
 
     private static string Version => typeof(Program).Assembly
         .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
-        ?? "2.8.0-mgs.5";
+        ?? "2.8.0-mgs.6";
 
     private static void MapEndpoints(WebApplication app, RuntimeConfiguration runtime)
     {

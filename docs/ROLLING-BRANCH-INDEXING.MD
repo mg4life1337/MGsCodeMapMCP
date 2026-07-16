@@ -1,6 +1,6 @@
 # Rolling branch indexing
 
-## Central ownership in 2.8.0-mgs.5
+## Central ownership since 2.8.0-mgs.5
 
 Rolling indexing now runs only inside `MGsCodeMap.Daemon`. Multiple HTTP clients share the same `RepositorySupervisor`, latest-only queues, incremental Solution cache, baselines, overlays, and WAL writers. `MGsCodeMap.Mcp` is a transport proxy and cannot start rolling work or open storage.
 

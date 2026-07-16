@@ -23,7 +23,7 @@ public sealed class McpSubprocessTests
         await process.WaitForExitAsync();
 
         process.ExitCode.Should().Be(0);
-        output.Trim().Should().Be("MGsCodeMapMCP 2.8.0-mgs.5");
+        output.Trim().Should().Be("MGsCodeMapMCP 2.8.0-mgs.6");
     }
 
     [Fact]

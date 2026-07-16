@@ -2,9 +2,11 @@
 
 ## Recommended per-user installation
 
-The recommended installation uses Task Scheduler at user logon. The daemon then runs with the same Git credentials, NuGet configuration, certificates, environment variables, temporary directory, MSBuild discovery, and filesystem access as the signed-in developer.
+The recommended installation uses Task Scheduler at user logon. The daemon then runs with the same Git credentials, NuGet configuration, certificates, environment variables, temporary directory, MSBuild discovery, and filesystem access as the signed-in developer. No password is stored and no elevated principal is used.
 
 ### Copy and paste
+
+Download the Windows x64 release ZIP, extract it to a directory such as `C:\Tools\MGsCodeMapMCP`, then create the local configuration:
 
 ```powershell
 Set-Location C:\Tools\MGsCodeMapMCP
@@ -13,6 +15,8 @@ notepad .\codemap.json
 powershell -ExecutionPolicy Bypass -File .\scripts\install-user-daemon.ps1 -ConfigPath .\codemap.json
 powershell -ExecutionPolicy Bypass -File .\scripts\status-daemon.ps1 -ConfigPath .\codemap.json
 Invoke-RestMethod http://127.0.0.1:5137/health
+Get-ScheduledTask -TaskName 'MGsCodeMapMCP User Daemon'
+Get-ScheduledTaskInfo -TaskName 'MGsCodeMapMCP User Daemon'
 ```
 
 Add this to Codex `config.toml`:
@@ -26,6 +30,34 @@ tool_timeout_sec = 1800
 ```
 
 Restart Codex and verify `repo.status`.
+
+## Task behavior
+
+The standard task name is `MGsCodeMapMCP User Daemon`. Installation registers it with:
+
+- an at-logon trigger for the installing user;
+- `Interactive` logon and `Limited` run level;
+- no stored or requested password;
+- start-when-available behavior for a missed logon trigger;
+- start and continued execution on battery power;
+- unlimited execution time;
+- up to three configured restart attempts plus a one-minute watchdog trigger after a failure;
+- `Register-ScheduledTask -Force` so the same command updates an existing installation.
+
+The action is `MGsCodeMap.TaskHost.exe`. It is a windowless `WinExe`, starts the daemon without a console, remains active for the daemon's complete lifetime, and returns the daemon exit code. The expected task state is therefore `Running` while `/health` is available. A one-minute watchdog trigger creates a new task instance after an unexpected exit; `IgnoreNew` suppresses watchdog ticks while the task is healthy. `stop-daemon.ps1` disables the task before graceful shutdown, so its expected state after a deliberate stop is `Disabled`. `start-daemon.ps1` enables it again.
+
+Inspect the registered identity, action, state, and last result:
+
+```powershell
+$task = Get-ScheduledTask -TaskName 'MGsCodeMapMCP User Daemon'
+$task | Select-Object TaskName, State
+$task.Principal | Select-Object UserId, LogonType, RunLevel
+$task.Actions | Select-Object Execute, Arguments, WorkingDirectory
+Get-ScheduledTaskInfo -TaskName 'MGsCodeMapMCP User Daemon' |
+    Select-Object LastRunTime, LastTaskResult, NextRunTime
+```
+
+Do not use `Stop-ScheduledTask` as the normal shutdown command because it cannot coordinate an active index publication. Use `stop-daemon.ps1`, which requests `/shutdown`, waits for store disposal and lock release, and only permits a controlled force fallback after checking publication state.
 
 ## Configuration choices
 
@@ -60,6 +92,16 @@ All commands accept an absolute or relative configuration path, including paths 
 .\scripts\stop-daemon.ps1 -ConfigPath .\codemap.json
 ```
 
+Relative paths are resolved from the shell's current directory; absolute paths work unchanged. Quoted paths containing spaces are passed to Task Scheduler and the task host without string reconstruction.
+
+For interactive diagnostics without changing the installed task:
+
+```powershell
+.\MGsCodeMap.Daemon.exe --config .\codemap.json --console
+```
+
+Stop the scheduled instance first so the single-instance lock is available.
+
 The install operation uses `Register-ScheduledTask -Force`, so running it again updates the same task. The uninstall operation removes only the scheduled task. Neither operation deletes configuration, data, logs, baselines, overlays, or rolling state.
 
 ## Upgrade
@@ -72,7 +114,7 @@ The install operation uses `Register-ScheduledTask -Force`, so running it again 
 6. Change Codex from STDIO `command`/`args` to the HTTP `url`.
 7. Confirm that only one `MGsCodeMap.Daemon.exe` is running.
 
-The `2.8.0-mgs.5` storage format is compatible with the preceding fork release, so existing indexes are retained.
+The `2.8.0-mgs.6` storage format is compatible with the preceding fork release, so existing indexes are retained. Reinstalling the task upgrades its action from a direct daemon start to the supervised Task Host without changing configuration or data formats.
 
 ## STDIO fallback
 
@@ -88,7 +130,7 @@ This executable is only a proxy. Start the daemon first, or add `--start-daemon`
 
 ## Windows service considerations
 
-A registered Windows service often runs under a service identity with different user environment variables, Git credentials, NuGet sources, certificates, network-drive mappings, temporary directories, and MSBuild discovery. This release therefore supplies the logon-task workflow as the supported default and does not install a service automatically.
+A registered Windows service often runs under a service identity with different user environment variables, Git credentials, NuGet sources, certificates, network-drive mappings, temporary directories, and MSBuild discovery. This release therefore supplies the logon-task workflow as the supported default and does not install a service automatically. A true Windows service may be added later as an optional mode after its identity, credential, and permission behavior is separately implemented and tested.
 
 If a managed deployment wraps the daemon as a service, use a deliberately selected identity, absolute paths, explicit permissions, and the same health and graceful-shutdown checks used by the supplied scripts. Validate repository and package access before enabling automatic indexing.
 
@@ -105,6 +147,14 @@ Another daemon owns the same canonical data directory. Run `status-daemon.ps1` a
 ### Daemon starts but indexing cannot load a solution
 
 Run the daemon interactively with `--console`, verify the selected SDK/MSBuild installation, and confirm that the signed-in user can restore and build the solution.
+
+### Task is Ready instead of Running
+
+Check `Get-ScheduledTaskInfo`, `logs/taskhost.log`, and the current daemon log. A non-zero child exit is returned by the Task Host and triggers the configured restart attempts. Common causes are a malformed configuration, a missing executable, an occupied port, or a second owner of the same data directory.
+
+### No console window is visible
+
+This is expected for the installed task. `MGsCodeMap.TaskHost.exe` is a Windows GUI-subsystem entry point and creates the daemon with no console window. Use the explicit `--console` command only when interactive diagnostics are needed.
 
 ### High memory during initial indexing
 
