@@ -72,10 +72,12 @@ internal static class DbTableExtractor
     public static IReadOnlyList<ExtractedFact> ExtractAll(
         Compilation compilation,
         string solutionDir,
-        IReadOnlyDictionary<string, StableId>? stableIdMap = null)
+        IReadOnlyDictionary<string, StableId>? stableIdMap = null,
+        IReadOnlySet<string>? includedAbsolutePaths = null)
     {
         if (compilation.Language == Microsoft.CodeAnalysis.LanguageNames.VisualBasic)
-            return VbNet.VbDbTableExtractor.ExtractAll(compilation, solutionDir, stableIdMap);
+            return VbNet.VbDbTableExtractor.ExtractAll(
+                compilation, solutionDir, stableIdMap, includedAbsolutePaths);
         var facts = new List<ExtractedFact>();
         // Track entity type FQNs captured via DbSet to avoid standalone [Table] duplicates
         var capturedEntityFqns = new HashSet<string>(StringComparer.Ordinal);
@@ -83,11 +85,14 @@ internal static class DbTableExtractor
 
         foreach (var syntaxTree in compilation.SyntaxTrees)
         {
+            if (!ExtractionScope.Includes(syntaxTree, includedAbsolutePaths)) continue;
             if (syntaxTree.FilePath is null or "") continue;
 
             var semanticModel = compilation.GetSemanticModel(syntaxTree);
             var root = syntaxTree.GetRoot();
-            var filePath = MakeRepoRelative(syntaxTree.FilePath, normalizedDir);
+            var filePathNullable = MakeRepoRelative(syntaxTree.FilePath, normalizedDir);
+            if (filePathNullable is null) continue;
+            var filePath = filePathNullable.Value;
 
             // === Pattern 1: DbSet<T> properties on DbContext-derived classes ===
             foreach (var propertyDecl in root.DescendantNodes().OfType<PropertyDeclarationSyntax>())
@@ -328,11 +333,8 @@ internal static class DbTableExtractor
         return stableId == default ? null : stableId;
     }
 
-    private static FilePath MakeRepoRelative(string filePath, string normalizedDir)
+    private static FilePath? MakeRepoRelative(string filePath, string normalizedDir)
     {
-        var normalized = filePath.Replace('\\', '/');
-        if (normalized.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase))
-            return FilePath.From(normalized[normalizedDir.Length..]);
-        return FilePath.From(Path.GetFileName(normalized));
+        return ExtractionScope.ToRepositoryPath(normalizedDir.TrimEnd('/'), filePath);
     }
 }

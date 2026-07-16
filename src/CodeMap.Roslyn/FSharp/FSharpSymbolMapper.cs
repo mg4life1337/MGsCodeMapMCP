@@ -101,7 +101,8 @@ internal static class FSharpSymbolMapper
                 ThrownExceptions: [],
                 Evidence: [],
                 Confidence: Confidence.High,
-                StableId: null);
+                StableId: null,
+                ProjectName: projectName);
 
             var stableId = ComputeFSharpStableId(xmlDocSig, kind, projectName);
             stableIdMap[xmlDocSig] = stableId;
@@ -156,7 +157,8 @@ internal static class FSharpSymbolMapper
                     ThrownExceptions: [],
                     Evidence: [],
                     Confidence: Confidence.High,
-                    StableId: null);
+                    StableId: null,
+                    ProjectName: projectName);
 
                 var memberStableId = ComputeFSharpStableId(memberDocSig, memberKind, projectName);
                 stableIdMap[memberDocSig] = memberStableId;
@@ -280,10 +282,9 @@ internal static class FSharpSymbolMapper
 
     internal static string MakeRepoRelative(string absolutePath, string normalizedDir)
     {
-        var normalized = absolutePath.Replace('\\', '/');
-        if (normalized.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase))
-            return normalized[normalizedDir.Length..];
-        return Path.GetFileName(normalized);
+        return RepositoryPath.TryCreate(normalizedDir.TrimEnd('/'), absolutePath, out var relativePath)
+            ? relativePath.Value
+            : throw new InvalidOperationException("Source path is outside the repository root.");
     }
 }
 

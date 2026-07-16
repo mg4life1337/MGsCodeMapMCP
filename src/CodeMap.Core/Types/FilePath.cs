@@ -2,7 +2,7 @@ namespace CodeMap.Core.Types;
 
 /// <summary>
 /// Strongly-typed repo-relative file path.
-/// Uses forward slashes only, no leading slash.
+/// Stored in canonical form with forward slashes and no leading slash.
 /// </summary>
 public readonly record struct FilePath
 {
@@ -10,29 +10,9 @@ public readonly record struct FilePath
 
     private FilePath(string value) => Value = value;
 
-    /// <summary>Creates a FilePath from a pre-validated string.</summary>
-    /// <exception cref="ArgumentException">If value is null, whitespace, contains backslashes, or has a leading slash.</exception>
-    public static FilePath From(string value)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(value);
-        if (value.Contains('\\'))
-            throw new ArgumentException("FilePath must use forward slashes only.", nameof(value));
-        if (value.StartsWith('/'))
-            throw new ArgumentException("FilePath must be repo-relative (no leading slash).", nameof(value));
-        if (ContainsPathTraversal(value))
-            throw new ArgumentException("FilePath must not contain '..' path traversal.", nameof(value));
-        return new FilePath(value);
-    }
-
-    private static bool ContainsPathTraversal(string path)
-    {
-        // Reject ".." as a path component: exact match, start, end, or middle segment
-        if (path == "..") return true;
-        if (path.StartsWith("../", StringComparison.Ordinal)) return true;
-        if (path.EndsWith("/..", StringComparison.Ordinal)) return true;
-        if (path.Contains("/../", StringComparison.Ordinal)) return true;
-        return false;
-    }
+    /// <summary>Creates a FilePath using the repository-wide canonical path rules.</summary>
+    /// <exception cref="ArgumentException">If the path is empty, absolute, or escapes the repository.</exception>
+    public static FilePath From(string value) => new(RepositoryPath.CanonicalizeRelative(value));
 
     public override string ToString() => Value;
 

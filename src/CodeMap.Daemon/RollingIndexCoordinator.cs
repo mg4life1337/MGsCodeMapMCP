@@ -376,6 +376,31 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
                     explicitFilePaths: null,
                     ct).ConfigureAwait(false);
                 if (result.IsFailure) throw new InvalidOperationException(result.Error.Message);
+                if (result.Value.Metrics is { } metrics)
+                {
+                    _logger.LogInformation(
+                        "Rolling delta for {Solution}: mode={Mode}, changed={Changed}, noOp={NoOp}, " +
+                        "documents={Documents}, projects={Projects}, symbolsWritten={Written}, " +
+                        "symbolsDeleted={Deleted}, relations={Relations}, fallback={Fallback}, " +
+                        "gitMs={GitMs:F1}, compileMs={CompileMs:F1}, symbolsMs={SymbolsMs:F1}, " +
+                        "referencesMs={ReferencesMs:F1}, overlayMs={OverlayMs:F1}, totalMs={TotalMs:F1}",
+                        target.RelativePath,
+                        metrics.Mode,
+                        metrics.ChangedFiles,
+                        metrics.SemanticNoOpFiles,
+                        metrics.DocumentsReindexed,
+                        metrics.AffectedProjects,
+                        metrics.SymbolsWritten,
+                        metrics.SymbolsDeleted,
+                        metrics.RelationsUpdated,
+                        metrics.FallbackReason,
+                        metrics.Timings.GitDiff.TotalMilliseconds,
+                        metrics.Timings.DirectCompilation.TotalMilliseconds,
+                        metrics.Timings.SymbolExtraction.TotalMilliseconds,
+                        metrics.Timings.ReferenceExtraction.TotalMilliseconds,
+                        metrics.Timings.OverlayWrite.TotalMilliseconds,
+                        metrics.Timings.Total.TotalMilliseconds);
+                }
 
                 updateWatch.Stop();
                 var updated = updating with

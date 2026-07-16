@@ -95,4 +95,39 @@ public class IsUnderSolutionDirTests : IDisposable
         var candidate = Path.Combine(_root.ToUpperInvariant(), "FILE.RAZOR");
         RoslynCompiler.IsUnderSolutionDir(candidate, _root.ToLowerInvariant()).Should().BeTrue();
     }
+
+    [Fact]
+    public void FindRepositoryRoot_SolutionBelowGitMarker_ReturnsWorkingTreeRoot()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, ".git"));
+        var solutionDirectory = Path.Combine(_root, "src", "Solutions");
+        Directory.CreateDirectory(solutionDirectory);
+        var solutionPath = Path.Combine(solutionDirectory, "Sample.sln");
+        File.WriteAllText(solutionPath, "");
+
+        RoslynCompiler.FindRepositoryRoot(solutionPath).Should().Be(_root);
+    }
+
+    [Fact]
+    public void FindRepositoryRoot_GitFileMarker_IsSupported()
+    {
+        File.WriteAllText(Path.Combine(_root, ".git"), "gitdir: elsewhere");
+        var projectDirectory = Path.Combine(_root, "src", "Library");
+        Directory.CreateDirectory(projectDirectory);
+        var projectPath = Path.Combine(projectDirectory, "Library.vbproj");
+        File.WriteAllText(projectPath, "");
+
+        RoslynCompiler.FindRepositoryRoot(projectPath).Should().Be(_root);
+    }
+
+    [Fact]
+    public void FindRepositoryRoot_WithoutGitMarker_FallsBackToInputDirectory()
+    {
+        var solutionDirectory = Path.Combine(_root, "standalone");
+        Directory.CreateDirectory(solutionDirectory);
+        var solutionPath = Path.Combine(solutionDirectory, "Sample.slnx");
+        File.WriteAllText(solutionPath, "");
+
+        RoslynCompiler.FindRepositoryRoot(solutionPath).Should().Be(solutionDirectory);
+    }
 }

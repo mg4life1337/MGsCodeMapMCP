@@ -71,7 +71,7 @@ public sealed class SlnxSupportTests
     }
 
     [Fact]
-    public async Task IncrementalCompiler_SlnxSolution_WarmPathFasterThanColdPath()
+    public async Task IncrementalCompiler_SlnxSolution_WarmNoOpFasterThanColdPath()
     {
         // Arrange
         var solutionDir = FindSampleSolutionDir();
@@ -85,6 +85,10 @@ public sealed class SlnxSupportTests
         mockStore.GetSymbolsByFileAsync(Arg.Any<RepoId>(), Arg.Any<CommitSha>(),
             Arg.Any<FilePath>(), Arg.Any<CancellationToken>())
             .Returns(Task.FromResult<IReadOnlyList<SymbolCard>>([]));
+        mockStore.GetFileContentAsync(Arg.Any<RepoId>(), Arg.Any<CommitSha>(),
+            Arg.Any<FilePath>(), Arg.Any<CancellationToken>())
+            .Returns(File.ReadAllText(Path.Combine(
+                solutionDir, "SampleApp", "Services", "OrderService.cs")));
 
         var changedFile = FilePath.From("SampleApp/Services/OrderService.cs");
 
@@ -103,8 +107,10 @@ public sealed class SlnxSupportTests
         sw2.Stop();
 
         // Assert
-        cold.AddedOrUpdatedSymbols.Should().NotBeEmpty("cold .slnx compilation should find symbols in OrderService.cs");
-        warm.AddedOrUpdatedSymbols.Should().NotBeEmpty("warm .slnx compilation should find symbols in OrderService.cs");
+        cold.AddedOrUpdatedSymbols.Should().BeEmpty("the baseline content matches the current document");
+        cold.Metrics!.Mode.Should().Be(IncrementalUpdateMode.NoOp);
+        warm.AddedOrUpdatedSymbols.Should().BeEmpty("an unchanged warm document is a semantic no-op");
+        warm.Metrics!.Mode.Should().Be(IncrementalUpdateMode.NoOp);
         sw2.ElapsedMilliseconds.Should().BeLessThan(sw1.ElapsedMilliseconds,
             $"warm path ({sw2.ElapsedMilliseconds}ms) should be faster than cold path ({sw1.ElapsedMilliseconds}ms) due to cached MSBuildWorkspace");
     }

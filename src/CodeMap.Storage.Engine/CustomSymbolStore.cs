@@ -381,6 +381,20 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
         return Task.FromResult<IReadOnlyList<(FilePath Path, string? Content)>>(result);
     }
 
+    public Task<string?> GetFileContentAsync(
+        RepoId repoId,
+        CommitSha commitSha,
+        FilePath filePath,
+        CancellationToken ct = default)
+    {
+        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        var file = merged.GetFileByPath(filePath.Value);
+        string? content = file is { ContentId: > 0 }
+            ? reader.ResolveContent(file.Value.ContentId)
+            : null;
+        return Task.FromResult(content);
+    }
+
     // ── Stats/metadata queries ───────────────────────────────────────────────
 
     public Task<SemanticLevel?> GetSemanticLevelAsync(RepoId repoId, CommitSha commitSha, CancellationToken ct = default)

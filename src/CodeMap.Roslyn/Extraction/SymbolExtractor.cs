@@ -14,9 +14,14 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 /// </summary>
 internal static class SymbolExtractor
 {
-    public static IReadOnlyList<SymbolCard> ExtractAll(Compilation compilation, string projectName, string solutionDir = "")
+    public static IReadOnlyList<SymbolCard> ExtractAll(
+        Compilation compilation,
+        string projectName,
+        string solutionDir = "",
+        IReadOnlySet<string>? includedAbsolutePaths = null)
     {
-        var (cards, _) = ExtractAllWithStableIds(compilation, projectName, solutionDir);
+        var (cards, _) = ExtractAllWithStableIds(
+            compilation, projectName, solutionDir, includedAbsolutePaths);
         return cards;
     }
 
@@ -26,15 +31,27 @@ internal static class SymbolExtractor
     /// ReferenceExtractor and TypeRelationExtractor.
     /// </summary>
     internal static (IReadOnlyList<SymbolCard> Cards, IReadOnlyDictionary<string, StableId> StableIdMap)
-        ExtractAllWithStableIds(Compilation compilation, string projectName, string solutionDir = "")
+        ExtractAllWithStableIds(
+            Compilation compilation,
+            string projectName,
+            string solutionDir = "",
+            IReadOnlySet<string>? includedAbsolutePaths = null)
     {
         var pairs = new List<(ISymbol Symbol, SymbolCard Card)>();
-        WalkNamespace(compilation.Assembly.GlobalNamespace, compilation, pairs, projectName, solutionDir);
+        var fingerprintSymbols = new List<ISymbol>();
+        WalkNamespace(compilation.Assembly.GlobalNamespace, compilation, pairs, fingerprintSymbols,
+            projectName, solutionDir, includedAbsolutePaths);
 
         // Compute stable fingerprints in batch (handles same-container ordinal disambiguation)
-        var stableIds = SymbolFingerprinter.ComputeStableIds(pairs.Select(p => p.Symbol));
+        var stableIds = SymbolFingerprinter.ComputeStableIds(fingerprintSymbols);
 
         var stableIdMap = new Dictionary<string, StableId>(StringComparer.Ordinal);
+        foreach (var (symbol, stableId) in stableIds)
+        {
+            string? symbolId = symbol.GetDocumentationCommentId();
+            if (symbolId is not null)
+                stableIdMap[symbolId] = stableId;
+        }
         var patchedCards = new List<SymbolCard>(pairs.Count);
 
         foreach (var (symbol, card) in pairs)
@@ -54,25 +71,34 @@ internal static class SymbolExtractor
     }
 
     private static void WalkNamespace(INamespaceSymbol ns, Compilation compilation,
-        List<(ISymbol Symbol, SymbolCard Card)> pairs, string projectName, string solutionDir)
+        List<(ISymbol Symbol, SymbolCard Card)> pairs,
+        List<ISymbol> fingerprintSymbols,
+        string projectName,
+        string solutionDir,
+        IReadOnlySet<string>? includedAbsolutePaths)
     {
         foreach (var member in ns.GetMembers())
         {
             if (member is INamespaceSymbol childNs)
             {
-                WalkNamespace(childNs, compilation, pairs, projectName, solutionDir);
+                WalkNamespace(childNs, compilation, pairs, fingerprintSymbols,
+                    projectName, solutionDir, includedAbsolutePaths);
             }
             else if (member is INamedTypeSymbol type)
             {
                 if (ShouldSkip(type)) continue;
+                fingerprintSymbols.Add(type);
 
-                var card = BuildCard(type, compilation, projectName, containingType: null, solutionDir);
+                var card = BuildCard(type, compilation, projectName, containingType: null,
+                    solutionDir, includedAbsolutePaths);
                 if (card is not null) pairs.Add((type, card));
 
                 foreach (var typeMember in type.GetMembers())
                 {
                     if (ShouldSkip(typeMember)) continue;
-                    var memberCard = BuildCard(typeMember, compilation, projectName, containingType: type, solutionDir);
+                    fingerprintSymbols.Add(typeMember);
+                    var memberCard = BuildCard(typeMember, compilation, projectName, containingType: type,
+                        solutionDir, includedAbsolutePaths);
                     if (memberCard is not null) pairs.Add((typeMember, memberCard));
                 }
             }
@@ -158,11 +184,13 @@ internal static class SymbolExtractor
     }
 
     private static SymbolCard? BuildCard(ISymbol symbol, Compilation compilation,
-        string projectName, INamedTypeSymbol? containingType, string solutionDir)
+        string projectName, INamedTypeSymbol? containingType, string solutionDir,
+        IReadOnlySet<string>? includedAbsolutePaths)
     {
         // Require a source location
         var location = symbol.Locations.FirstOrDefault(l => l.IsInSource);
         if (location is null) return null;
+        if (!ExtractionScope.Includes(location.SourceTree, includedAbsolutePaths)) return null;
 
         var symbolIdStr = symbol.GetDocumentationCommentId()
             ?? symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
@@ -234,7 +262,8 @@ internal static class SymbolExtractor
             SideEffects: [],
             ThrownExceptions: thrownExceptions,
             Evidence: evidence,
-            Confidence: Confidence.High
+            Confidence: Confidence.High,
+            ProjectName: projectName
         );
     }
 
@@ -242,24 +271,7 @@ internal static class SymbolExtractor
     {
         if (string.IsNullOrWhiteSpace(absolutePath)) return null;
 
-        string normalized = absolutePath.Replace('\\', '/');
-
-        // Use full path if it doesn't look absolute (i.e., already relative — in-memory tests)
-        if (!Path.IsPathRooted(absolutePath))
-            return FilePath.From(normalized.TrimStart('/'));
-
-        // Relativize against the solution directory when available (matches ExtractFiles)
-        if (!string.IsNullOrEmpty(solutionDir))
-        {
-            string normalizedDir = solutionDir.Replace('\\', '/').TrimEnd('/') + '/';
-            if (normalized.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase))
-                return FilePath.From(normalized[normalizedDir.Length..]);
-        }
-
-        // Fallback: filename only
-        string fileName = Path.GetFileName(normalized);
-        if (string.IsNullOrWhiteSpace(fileName)) return null;
-        return FilePath.From(fileName);
+        return ExtractionScope.ToRepositoryPath(solutionDir, absolutePath);
     }
 
     private static string MapVisibility(Accessibility accessibility) => accessibility switch

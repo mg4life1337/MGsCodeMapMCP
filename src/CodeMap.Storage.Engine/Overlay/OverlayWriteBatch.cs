@@ -56,6 +56,13 @@ internal sealed class OverlayWriteBatch : IOverlayWriteBatch
         _pendingApply.Add(() => _overlay.ApplyFact(record));
     }
 
+    public void ReplaceFile(string repositoryPath)
+    {
+        int pathStringId = InternString(repositoryPath);
+        _pendingWal.Add(writer => writer.WriteReplaceFile(pathStringId));
+        _pendingApply.Add(() => _overlay.ApplyReplaceFile(repositoryPath));
+    }
+
     public void UpsertFile(FileRecord record)
     {
         var path = _overlay.ResolveString(record.PathStringId);

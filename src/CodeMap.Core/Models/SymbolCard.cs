@@ -35,7 +35,8 @@ public record SymbolCard(
     IReadOnlyList<string> ThrownExceptions,
     IReadOnlyList<EvidencePointer> Evidence,
     Enums.Confidence Confidence,
-    Types.StableId? StableId = null
+    Types.StableId? StableId = null,
+    string? ProjectName = null
 )
 {
     /// <summary>
@@ -63,7 +64,8 @@ public record SymbolCard(
         string visibility,
         Enums.Confidence confidence,
         string? documentation = null,
-        string? containingType = null)
+        string? containingType = null,
+        string? projectName = null)
         => new(
             symbolId, fullyQualifiedName, kind, signature,
             documentation, @namespace, containingType,
@@ -73,5 +75,6 @@ public record SymbolCard(
             SideEffects: [],
             ThrownExceptions: [],
             Evidence: [],
-            confidence);
+            confidence,
+            ProjectName: projectName);
 }

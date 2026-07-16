@@ -25,21 +25,67 @@ public static class MergeHelpers
         IReadOnlySet<FilePath> overlayFiles,
         int limit)
     {
-        // Filter baseline: exclude deleted symbols and symbols from reindexed files
-        var filteredBaseline = baselineHits
-            .Where(h => !deletedIds.Contains(h.SymbolId) && !overlayFiles.Contains(h.FilePath))
-            .ToList();
+        var deleted = deletedIds.Select(id => id.Value).ToHashSet(StringComparer.Ordinal);
+        var replacedFiles = overlayFiles
+            .Select(path => path.Value)
+            .ToHashSet(RepositoryPath.StringComparer);
+        var seenSymbolIds = new ScopedIdentitySet();
+        var seenStableIds = new ScopedIdentitySet();
+        var combined = new List<SymbolSearchHit>(Math.Min(limit + 1, baselineHits.Count + overlayHits.Count));
 
-        // Overlay first (higher priority), then filtered baseline; +1 for truncation detection
-        var combined = overlayHits.Concat(filteredBaseline)
-            .Take(limit + 1)
-            .ToList();
+        void AddUnique(SymbolSearchHit hit)
+        {
+            if (combined.Count > limit) return;
+            if (!seenSymbolIds.Add(hit.SymbolId.Value, hit.ProjectName)) return;
+            if (hit.StableId is { IsEmpty: false } stable &&
+                !seenStableIds.Add(stable.Value, hit.ProjectName))
+                return;
+            combined.Add(hit);
+        }
+
+        // Overlay is authoritative and is deduplicated before the result limit is applied.
+        foreach (var hit in overlayHits)
+            AddUnique(hit);
+
+        foreach (var hit in baselineHits)
+        {
+            if (deleted.Contains(hit.SymbolId.Value) || replacedFiles.Contains(hit.FilePath.Value))
+                continue;
+            AddUnique(hit);
+        }
 
         var truncated = combined.Count > limit;
         var hits = combined.Take(limit).ToList();
         var totalCount = truncated ? limit + 1 : hits.Count;
 
         return new MergedSearchResult(hits, totalCount, truncated);
+    }
+
+    /// <summary>
+    /// Keeps equal symbol/stable IDs separate when their owning projects are known to differ.
+    /// A missing project is treated as legacy unscoped identity and therefore matches every
+    /// occurrence of that ID, preserving deduplication for older baseline formats.
+    /// </summary>
+    private sealed class ScopedIdentitySet
+    {
+        private const string Unscoped = "\0";
+        private readonly Dictionary<string, HashSet<string>> _projects =
+            new(StringComparer.Ordinal);
+
+        public bool Add(string identity, string? projectName)
+        {
+            string project = string.IsNullOrWhiteSpace(projectName) ? Unscoped : projectName;
+            if (!_projects.TryGetValue(identity, out var projects))
+            {
+                _projects[identity] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { project };
+                return true;
+            }
+
+            if (projects.Contains(Unscoped) || project == Unscoped)
+                return false;
+
+            return projects.Add(project);
+        }
     }
 }
 

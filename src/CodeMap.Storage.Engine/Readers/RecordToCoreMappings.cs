@@ -95,6 +95,9 @@ internal static class RecordToCoreMappings
         var ns = sym.NamespaceStringId > 0 ? resolveString(sym.NamespaceStringId) : "";
         var stableIdStr = sym.StableIdStringId > 0 ? resolveString(sym.StableIdStringId) : null;
         var filePath = sym.FileIntId > 0 ? resolveString(reader.GetFileByIntId(sym.FileIntId).PathStringId) : "";
+        string? projectName = null;
+        if (sym.ProjectIntId > 0 && sym.ProjectIntId <= reader.ProjectCount)
+            projectName = resolveString(reader.GetProjectByIntId(sym.ProjectIntId).NameStringId);
         var visibility = ReverseAccessibility(sym.Accessibility);
         var kind = ReverseSymbolKind(sym.Kind);
 
@@ -146,7 +149,8 @@ internal static class RecordToCoreMappings
             ThrownExceptions: [],
             Evidence: [],
             Confidence: confidence,
-            StableId: stableIdStr != null ? new StableId(stableIdStr) : null);
+            StableId: stableIdStr != null ? new StableId(stableIdStr) : null,
+            ProjectName: projectName);
 
         return card with { IsDecompiled = (sym.Flags & (1 << 7)) != 0 ? 1 : 0 };
     }
@@ -159,6 +163,12 @@ internal static class RecordToCoreMappings
         var displayFqn = DocIdToDisplayFqn(symbolId, IsVbSymbol(sym, reader));
         var displayName = reader.ResolveString(sym.DisplayNameStringId);
         var filePath = sym.FileIntId > 0 ? reader.ResolveString(reader.GetFileByIntId(sym.FileIntId).PathStringId) : "";
+        var stableId = sym.StableIdStringId > 0
+            ? new StableId(reader.ResolveString(sym.StableIdStringId))
+            : (StableId?)null;
+        string? projectName = null;
+        if (sym.ProjectIntId > 0 && sym.ProjectIntId <= reader.ProjectCount)
+            projectName = reader.ResolveString(reader.GetProjectByIntId(sym.ProjectIntId).NameStringId);
 
         return new SymbolSearchHit(
             SymbolId: SymbolId.From(symbolId),
@@ -168,7 +178,9 @@ internal static class RecordToCoreMappings
             DocumentationSnippet: null,
             FilePath: FilePath.From(filePath.Length > 0 ? filePath : "unknown"),
             Line: sym.SpanStart,
-            Score: score);
+            Score: score,
+            StableId: stableId,
+            ProjectName: projectName);
     }
 
     // ── SymbolRecord → SymbolSummary ─────────────────────────────────────────

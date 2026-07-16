@@ -197,8 +197,8 @@ public sealed class IdentifierTests
         FluentActions.Invoking(() => FilePath.From(" ")).Should().Throw<ArgumentException>();
 
     [Fact]
-    public void FilePath_From_BackslashPath_ThrowsArgumentException() =>
-        FluentActions.Invoking(() => FilePath.From("src\\Foo.cs")).Should().Throw<ArgumentException>();
+    public void FilePath_From_BackslashPath_NormalizesSeparators() =>
+        FilePath.From("src\\Foo.cs").Value.Should().Be("src/Foo.cs");
 
     [Fact]
     public void FilePath_From_LeadingSlash_ThrowsArgumentException() =>
@@ -208,6 +208,13 @@ public sealed class IdentifierTests
     public void FilePath_From_NestedPath_CreatesInstance() =>
         FilePath.From("src/Services/OrderService.cs").Value
             .Should().Be("src/Services/OrderService.cs");
+
+    [Theory]
+    [InlineData("./src/Foo.cs", "src/Foo.cs")]
+    [InlineData("src/Generated/../Foo.cs", "src/Foo.cs")]
+    [InlineData("src//Foo.cs", "src/Foo.cs")]
+    public void FilePath_From_DotSegments_Canonicalizes(string value, string expected) =>
+        FilePath.From(value).Value.Should().Be(expected);
 
     [Fact]
     public void FilePath_ToString_ReturnsValue() =>
@@ -239,4 +246,23 @@ public sealed class IdentifierTests
     [InlineData("src/file..cs")]
     public void FilePath_From_DoubleDotInName_NotTraversal_Succeeds(string value) =>
         FilePath.From(value).Value.Should().Be(value);
+
+    [Fact]
+    public void RepositoryPath_TryCreate_InsideRoot_ReturnsCanonicalRelativePath()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "codemap-path-test");
+        string candidate = Path.Combine(root, "src", "Foo.cs");
+
+        RepositoryPath.TryCreate(root, candidate, out FilePath result).Should().BeTrue();
+        result.Value.Should().Be("src/Foo.cs");
+    }
+
+    [Fact]
+    public void RepositoryPath_TryCreate_OutsideRoot_IsRejected()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "codemap-path-test", "repo");
+        string candidate = Path.Combine(Path.GetTempPath(), "codemap-path-test", "outside.cs");
+
+        RepositoryPath.TryCreate(root, candidate, out _).Should().BeFalse();
+    }
 }

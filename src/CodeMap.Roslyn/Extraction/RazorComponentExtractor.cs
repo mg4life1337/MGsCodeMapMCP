@@ -60,7 +60,9 @@ internal static class RazorComponentExtractor
                 var sourcePath = mapped.HasMappedPath && !string.IsNullOrEmpty(mapped.Path)
                     ? mapped.Path
                     : propLocation.SourceTree?.FilePath ?? "";
-                var filePath = MakeRepoRelative(sourcePath, normalizedDir);
+                var filePathNullable = MakeRepoRelative(sourcePath, normalizedDir);
+                if (filePathNullable is null) continue;
+                var filePath = filePathNullable.Value;
 
                 facts.Add(new ExtractedFact(
                     SymbolId: SymbolId.From(typeId),
@@ -90,11 +92,8 @@ internal static class RazorComponentExtractor
         return null;
     }
 
-    private static FilePath MakeRepoRelative(string filePath, string normalizedDir)
+    private static FilePath? MakeRepoRelative(string filePath, string normalizedDir)
     {
-        var normalized = filePath.Replace('\\', '/');
-        if (normalized.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase))
-            return FilePath.From(normalized[normalizedDir.Length..]);
-        return FilePath.From(Path.GetFileName(normalized));
+        return ExtractionScope.ToRepositoryPath(normalizedDir.TrimEnd('/'), filePath);
     }
 }

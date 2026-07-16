@@ -90,7 +90,14 @@ internal sealed class EngineOverlay : IEngineOverlay
         try
         {
             isTombstoned = TombstoneSet.Contains(stableId);
-            return SymbolsByStableId.TryGetValue(stableId, out var rec) ? rec : null;
+            if (SymbolsByStableId.TryGetValue(stableId, out var direct))
+                return direct;
+
+            string prefix = stableId + "\0";
+            foreach (var (key, record) in SymbolsByStableId)
+                if (key.StartsWith(prefix, StringComparison.Ordinal))
+                    return record;
+            return null;
         }
         finally { _lock.ExitReadLock(); }
     }
@@ -256,7 +263,14 @@ internal sealed class EngineOverlay : IEngineOverlay
 
     internal void ApplySymbol(SymbolRecord record, string stableId, string[] tokens)
     {
-        SymbolsByStableId[stableId] = record;
+        string storageKey = StableProjectKey(stableId, record.ProjectIntId);
+        if (SymbolsByStableId.TryGetValue(storageKey, out var previous))
+        {
+            foreach (var tokenSet in TokenMap.Values)
+                tokenSet.Remove(previous.SymbolIntId);
+        }
+        TombstoneSet.Remove(stableId);
+        SymbolsByStableId[storageKey] = record;
         foreach (var t in tokens)
         {
             if (!TokenMap.TryGetValue(t, out var set))
@@ -305,11 +319,56 @@ internal sealed class EngineOverlay : IEngineOverlay
         FilesByPath[path] = record;
     }
 
+    internal void ApplyReplaceFile(string repositoryPath)
+    {
+        if (!FilesByPath.Remove(repositoryPath, out var previousFile))
+            return;
+
+        int fileIntId = previousFile.FileIntId;
+        var removedSymbolIds = SymbolsByStableId
+            .Where(pair => pair.Value.FileIntId == fileIntId)
+            .Select(pair => pair.Value.SymbolIntId)
+            .ToHashSet();
+        foreach (string stableId in SymbolsByStableId
+            .Where(pair => pair.Value.FileIntId == fileIntId)
+            .Select(pair => pair.Key)
+            .ToList())
+            SymbolsByStableId.Remove(stableId);
+
+        foreach (string token in TokenMap.Keys.ToList())
+        {
+            TokenMap[token].ExceptWith(removedSymbolIds);
+            if (TokenMap[token].Count == 0)
+                TokenMap.Remove(token);
+        }
+
+        foreach (int symbolId in removedSymbolIds)
+        {
+            OutgoingEdges.Remove(symbolId);
+            IncomingEdges.Remove(symbolId);
+            FactsBySymbol.Remove(symbolId);
+        }
+        foreach (var edges in OutgoingEdges.Values)
+            edges.RemoveAll(edge => edge.FileIntId == fileIntId || removedSymbolIds.Contains(edge.ToSymbolIntId));
+        foreach (var edges in IncomingEdges.Values)
+            edges.RemoveAll(edge => edge.FileIntId == fileIntId || removedSymbolIds.Contains(edge.FromSymbolIntId));
+        foreach (var facts in FactsBySymbol.Values)
+            facts.RemoveAll(fact => fact.FileIntId == fileIntId);
+    }
+
     internal void ApplyTombstone(string stableId)
     {
         TombstoneSet.Add(stableId);
         SymbolsByStableId.Remove(stableId);
+        string prefix = stableId + "\0";
+        foreach (string key in SymbolsByStableId.Keys
+            .Where(key => key.StartsWith(prefix, StringComparison.Ordinal))
+            .ToList())
+            SymbolsByStableId.Remove(key);
     }
+
+    private static string StableProjectKey(string stableId, int projectIntId) =>
+        projectIntId == 0 ? stableId : stableId + "\0" + projectIntId;
 
     internal void ApplyDictionaryEntry(int stringId, string value)
     {
@@ -392,6 +451,9 @@ internal sealed class EngineOverlay : IEngineOverlay
             case 0x08: // DictionaryAdd
                 var (sid, val) = WalReader.ParseDictionaryAdd(payload);
                 ApplyDictionaryEntry(sid, val);
+                break;
+            case 0x0B: // ReplaceFile
+                ApplyReplaceFile(ResolveString(BitConverter.ToInt32(payload)));
                 break;
             case 0x09: // CheckpointBegin — no-op during replay
             case 0x0A: // CheckpointComplete — no-op during replay

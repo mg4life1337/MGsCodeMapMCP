@@ -23,13 +23,13 @@
 
   <PropertyGroup>
     <Authors>Branimir Bajt</Authors>
-    <Product>CodeMap</Product>
-    <Description>Roslyn-powered semantic code index for AI agents. 28 MCP tools that let AI agents navigate C# codebases by symbol, call graph, and architectural fact instead of brute-reading source files. Average 90%+ token savings.</Description>
+    <Product>MGsCodeMapMCP</Product>
+    <Description>Roslyn-powered semantic MCP index with targeted rolling C#, VB.NET, and F# updates and duplicate-free overlay queries.</Description>
     <Copyright>Copyright © 2026 CodeMap Branimir Bajt</Copyright>
     <RepositoryType>git</RepositoryType>
     <!-- GitHub repository -->
-    <RepositoryUrl>https://github.com/bbajt/csharp-code-map</RepositoryUrl>
-    <PackageProjectUrl>https://github.com/bbajt/csharp-code-map</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/mg4life1337/MGsCodeMapMCP</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/mg4life1337/MGsCodeMapMCP</PackageProjectUrl>
     <PackageLicenseFile>LICENSE.MD</PackageLicenseFile>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageTags>mcp;roslyn;ai-agent;csharp;semantic-search;code-navigation;code-analysis;llm;claude;dotnet</PackageTags>

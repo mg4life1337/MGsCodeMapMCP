@@ -17,7 +17,8 @@ public record OverlayDelta(
     int NewRevision,
     IReadOnlyList<ExtractedTypeRelation>? TypeRelations = null,
     Enums.SemanticLevel? SemanticLevel = null,
-    IReadOnlyList<ExtractedFact>? Facts = null
+    IReadOnlyList<ExtractedFact>? Facts = null,
+    IncrementalUpdateMetrics? Metrics = null
 )
 {
     /// <summary>An empty delta with revision 1 — no changes detected.</summary>

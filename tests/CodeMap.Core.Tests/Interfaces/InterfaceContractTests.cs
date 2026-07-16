@@ -145,8 +145,8 @@ public sealed class InterfaceContractTests
         typeof(ISymbolStore).GetMethod("GetDerivedTypesAsync").Should().NotBeNull();
 
     [Fact]
-    public void ISymbolStore_Defines21Methods() =>
-        typeof(ISymbolStore).GetMethods().Should().HaveCount(27); // +1 GetAllFileContentsAsync (FTS content indexing)
+    public void ISymbolStore_DefinesExpectedMethods() =>
+        typeof(ISymbolStore).GetMethods().Should().HaveCount(28);
 
     // ─── IQueryEngine ─────────────────────────────────────────────────────────
 

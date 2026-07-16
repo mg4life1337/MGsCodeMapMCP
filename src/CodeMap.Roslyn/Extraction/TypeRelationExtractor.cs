@@ -18,33 +18,37 @@ internal static class TypeRelationExtractor
     /// </summary>
     public static IReadOnlyList<ExtractedTypeRelation> ExtractAll(
         Compilation compilation,
-        IReadOnlyDictionary<string, StableId>? stableIdMap = null)
+        IReadOnlyDictionary<string, StableId>? stableIdMap = null,
+        IReadOnlySet<string>? includedAbsolutePaths = null)
     {
         var relations = new List<ExtractedTypeRelation>();
-        WalkNamespace(compilation.Assembly.GlobalNamespace, relations, stableIdMap);
+        WalkNamespace(compilation.Assembly.GlobalNamespace, relations, stableIdMap, includedAbsolutePaths);
         return relations;
     }
 
     private static void WalkNamespace(INamespaceSymbol ns, List<ExtractedTypeRelation> relations,
-        IReadOnlyDictionary<string, StableId>? stableIdMap)
+        IReadOnlyDictionary<string, StableId>? stableIdMap,
+        IReadOnlySet<string>? includedAbsolutePaths)
     {
         foreach (var member in ns.GetMembers())
         {
             if (member is INamespaceSymbol childNs)
             {
-                WalkNamespace(childNs, relations, stableIdMap);
+                WalkNamespace(childNs, relations, stableIdMap, includedAbsolutePaths);
             }
             else if (member is INamedTypeSymbol type)
             {
                 if (type.IsImplicitlyDeclared) continue;
 
-                ExtractForType(type, relations, stableIdMap);
+                if (type.Locations.Any(location => ExtractionScope.Includes(location.SourceTree, includedAbsolutePaths)))
+                    ExtractForType(type, relations, stableIdMap);
 
                 // Walk nested types
                 foreach (var nested in type.GetTypeMembers())
                 {
                     if (nested.IsImplicitlyDeclared) continue;
-                    ExtractForType(nested, relations, stableIdMap);
+                    if (nested.Locations.Any(location => ExtractionScope.Includes(location.SourceTree, includedAbsolutePaths)))
+                        ExtractForType(nested, relations, stableIdMap);
                 }
             }
         }

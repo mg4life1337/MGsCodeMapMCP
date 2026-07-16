@@ -57,9 +57,9 @@ public sealed class SymbolCardTests
     }
 
     [Fact]
-    public void SymbolCard_Has18Fields()
+    public void SymbolCard_HasExpectedFields()
     {
         var props = typeof(SymbolCard).GetProperties();
-        props.Should().HaveCount(19); // +1 for StableId (PHASE-03-01), +1 for IsDecompiled (PHASE-12-01)
+        props.Should().HaveCount(20); // includes StableId, ProjectName, and IsDecompiled
     }
 }

@@ -229,6 +229,16 @@ public interface ISymbolStore
         CancellationToken ct = default);
 
     /// <summary>
+    /// Returns stored baseline content for one canonical repository path without
+    /// loading every indexed file. Returns null when the baseline has no content.
+    /// </summary>
+    Task<string?> GetFileContentAsync(
+        RepoId repoId,
+        CommitSha commitSha,
+        FilePath filePath,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// Returns the repository root path stored in the baseline metadata.
     /// Used by <c>code.search_text</c> to resolve repo-relative paths to absolute paths for disk reads.
     /// </summary>
@@ -315,7 +325,9 @@ public record SymbolSearchHit(
     string? DocumentationSnippet,
     FilePath FilePath,
     int Line,
-    double Score
+    double Score,
+    StableId? StableId = null,
+    string? ProjectName = null
 );
 
 /// <summary>A stored reference from one symbol location to a target symbol.</summary>

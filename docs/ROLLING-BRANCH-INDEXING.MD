@@ -102,6 +102,43 @@ configuration, analyzer inputs, target frameworks, compiler constants, partial c
 Designer files invalidate the relevant solution/project graph. Documentation-only changes
 skip every solution. A project shared by several solutions marks exactly those solutions.
 
+### Semantic delta scope
+
+After the solution impact check, Roslyn compares the current source with stored baseline
+content and selects the smallest safe extraction scope:
+
+| Change | Scope |
+|---|---|
+| comments, whitespace, or other syntax trivia | no semantic delta |
+| method/accessor body only | changed document |
+| private or internal declaration signature | owning project |
+| public/protected API, base type, interface, constraint, project or build input | owning project plus transitive dependents |
+| missing baseline content or an unmapped structural change | conservative dependency/full fallback with a logged reason |
+
+Symbol, reference, type-relation, and architectural-fact extraction receives the same selected
+syntax-tree set. Repository paths are canonicalized before file authority is applied. Search and
+browse merge overlay and baseline symbols by identity before limits and counts, so one logical
+symbol is returned once while overloads remain distinct.
+
+Each rolling update logs its selected mode, fallback reason, changed files, semantic no-op files,
+reindexed documents, affected projects, written/deleted symbols, updated relations, and timings for
+Git diff, solution loading, classification, compilation, extraction, baseline diff, overlay write,
+and the complete update.
+
+### Measured VB.NET validation
+
+An isolated large VB.NET repository was used to repeat the original one-file regression on
+the same class and solution shape. The previous run had written 40,970 symbols in 45.75 s for
+a comment-only edit. With `2.8.0-mgs.3`, the cold validation classified one changed file as a
+semantic no-op, reindexed zero documents, wrote zero symbols and relations, and completed in
+6.96 s. Solution loading accounted for 6.82 s of that result; classification, extraction, and
+baseline/overlay diff performed no semantic work. Search returned one logical class result.
+
+The following body-only edit reused the loaded solution, reindexed exactly one document,
+wrote four symbols, updated only that document's relations, and completed in 4.36 s. The
+resulting overlay data for both changes was 1,429 bytes. These measurements are evidence for
+that isolated repository, not universal timing guarantees.
+
 ## Consistency and status
 
 Each update is built in a new shadow workspace. The active solution-specific workspace is
@@ -136,3 +173,12 @@ then restart. On the first rolling run an existing compatible commit index can b
 otherwise the solution receives one initial full build. Search `repo.status` and the compact
 per-solution log lines when an update is skipped or rebuilt. Performance numbers should be
 treated as repository-specific and are not claimed unless measured on that repository.
+
+Known boundaries:
+
+- Cold updates still pay the MSBuild/Roslyn solution-load cost; the bounded cache keeps at most
+  three loaded solutions and an evicted solution must be opened again.
+- Public API, hierarchy, project/build-input, and unmapped structural changes intentionally use
+  a conservative project/dependency scope to prevent stale cross-project relationships.
+- Linked source files outside the repository root are not persisted as repository files. This
+  keeps path identity and file reads inside the configured repository boundary.

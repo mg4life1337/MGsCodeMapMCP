@@ -1,6 +1,7 @@
 namespace CodeMap.Query;
 
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using CodeMap.Core.Enums;
 using CodeMap.Core.Errors;
 using CodeMap.Core.Interfaces;
@@ -126,6 +127,8 @@ public class WorkspaceManager
         IReadOnlyList<FilePath>? explicitFilePaths,
         CancellationToken ct = default)
     {
+        var refreshTimer = Stopwatch.StartNew();
+        TimeSpan gitDiffTime = TimeSpan.Zero;
         var key = (repoId, workspaceId);
         if (!_registry.TryGetValue(key, out var info))
             return Result<RefreshOverlayResponse, CodeMapError>.Failure(
@@ -137,13 +140,17 @@ public class WorkspaceManager
 
         if (explicitFilePaths is { Count: > 0 })
         {
-            changedFiles = [.. explicitFilePaths];
+            changedFiles = explicitFilePaths
+                .Distinct(RepositoryPath.FilePathComparer)
+                .ToList();
             deletedFiles = [];
         }
         else
         {
+            var gitTimer = Stopwatch.StartNew();
             var fileChanges = await _gitService.GetChangedFilesAsync(info.RepoRootPath, info.BaselineCommitSha, ct)
                                                .ConfigureAwait(false);
+            gitDiffTime = gitTimer.Elapsed;
             changedFiles = fileChanges
                 .Where(fc => fc.Kind != FileChangeKind.Deleted)
                 .Select(fc => fc.FilePath)
@@ -154,7 +161,7 @@ public class WorkspaceManager
                 .Concat(fileChanges
                     .Where(fc => fc.Kind == FileChangeKind.Renamed && fc.OldFilePath.HasValue)
                     .Select(fc => fc.OldFilePath!.Value))
-                .Distinct()
+                .Distinct(RepositoryPath.FilePathComparer)
                 .ToList();
         }
 
@@ -203,16 +210,23 @@ public class WorkspaceManager
                     extraDeletedIds.Add(sym.SymbolId);
             }
 
-            if (extraDeletedIds.Count > 0)
+            delta = delta with
             {
-                // Merge extra deleted IDs into the delta (record is immutable — create new)
-                var mergedDeleted = delta.DeletedSymbolIds.Concat(extraDeletedIds).ToList();
-                delta = delta with { DeletedSymbolIds = mergedDeleted };
-            }
+                DeletedSymbolIds = delta.DeletedSymbolIds
+                    .Concat(extraDeletedIds)
+                    .Distinct()
+                    .ToList(),
+                DeletedReferenceFiles = delta.DeletedReferenceFiles
+                    .Concat(deletedFiles)
+                    .Distinct(RepositoryPath.FilePathComparer)
+                    .ToList(),
+            };
         }
 
         // 7. Apply delta
+        var overlayWriteTimer = Stopwatch.StartNew();
         await _overlayStore.ApplyDeltaAsync(repoId, workspaceId, delta, ct).ConfigureAwait(false);
+        TimeSpan overlayWriteTime = overlayWriteTimer.Elapsed;
 
         // 7b. Resolution pass — upgrade any unresolved edges from syntactic fallback
         //     Uses storage-based symbol lookup (no Compilation needed in this layer).
@@ -236,18 +250,44 @@ public class WorkspaceManager
         info = info with { CurrentRevision = delta.NewRevision };
         _registry[key] = info;
 
+        refreshTimer.Stop();
+        var metrics = delta.Metrics ?? new IncrementalUpdateMetrics(
+            IncrementalUpdateMode.Dependency,
+            "deleted-files",
+            changedFiles.Count + deletedFiles.Count,
+            0,
+            deletedFiles.Count,
+            0,
+            0,
+            delta.DeletedSymbolIds.Count,
+            0,
+            new IncrementalUpdateTimings());
+        metrics = metrics with
+        {
+            DocumentsReindexed = delta.ReindexedFiles.Count + deletedFiles.Count,
+            SymbolsWritten = delta.AddedOrUpdatedSymbols.Count,
+            SymbolsDeleted = delta.DeletedSymbolIds.Count,
+            Timings = metrics.Timings with
+            {
+                GitDiff = gitDiffTime,
+                OverlayWrite = overlayWriteTime,
+                Total = refreshTimer.Elapsed,
+            },
+        };
+
         _logger.LogInformation(
             "Overlay refreshed for workspace {WorkspaceId}: {FilesReindexed} files, {SymbolsUpdated} symbols, revision {Rev}",
             workspaceId.Value,
-            changedFiles.Count + deletedFiles.Count,
+            metrics.DocumentsReindexed,
             delta.AddedOrUpdatedSymbols.Count + delta.DeletedSymbolIds.Count,
             delta.NewRevision);
 
         return Result<RefreshOverlayResponse, CodeMapError>.Success(
             new RefreshOverlayResponse(
-                FilesReindexed: changedFiles.Count + deletedFiles.Count,
+                FilesReindexed: metrics.DocumentsReindexed,
                 SymbolsUpdated: delta.AddedOrUpdatedSymbols.Count + delta.DeletedSymbolIds.Count,
-                NewOverlayRevision: delta.NewRevision));
+                NewOverlayRevision: delta.NewRevision,
+                Metrics: metrics));
     }
 
     // ── ResetWorkspaceAsync ───────────────────────────────────────────────────
@@ -389,7 +429,8 @@ public record CreateWorkspaceResponse(
 public record RefreshOverlayResponse(
     int FilesReindexed,
     int SymbolsUpdated,
-    int NewOverlayRevision);
+    int NewOverlayRevision,
+    IncrementalUpdateMetrics? Metrics = null);
 
 /// <summary>Response from a successful workspace reset operation.</summary>
 public record ResetWorkspaceResponse(

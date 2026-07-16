@@ -72,6 +72,27 @@ public sealed class EngineOverlayTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SameStableIdInDifferentProjects_PreservesBothSymbols()
+    {
+        using var overlay = new EngineOverlay(_overlayDir, "test-ws", _reader);
+        int stableIdSid = overlay.InternStringInternal("sym_shared_projects");
+        int firstFqnSid = overlay.InternStringInternal("T:First.Api");
+        int secondFqnSid = overlay.InternStringInternal("T:Second.Api");
+
+        using var batch = overlay.BeginBatch();
+        batch.UpsertSymbol(new SymbolRecord(
+            -1, stableIdSid, firstFqnSid, 0, 0, 0, 0, 1,
+            1, 7, 0, 1, 1, 0, 0), ["api"]);
+        batch.UpsertSymbol(new SymbolRecord(
+            -2, stableIdSid, secondFqnSid, 0, 0, 0, 0, 2,
+            1, 7, 0, 1, 1, 0, 0), ["api"]);
+        await batch.CommitAsync();
+
+        overlay.GetOverlayNewSymbols().Should().HaveCount(2);
+        overlay.GetOverlaySymbolsForTokenPrefix("api").Should().HaveCount(2);
+    }
+
+    [Fact]
     public async Task Tombstone_HidesSymbol()
     {
         using var overlay = new EngineOverlay(_overlayDir, "test-ws", _reader);
@@ -247,6 +268,51 @@ public sealed class EngineOverlayTests : IAsyncLifetime
 
         var filtered = snapshot.Where(p => !string.IsNullOrWhiteSpace(p)).ToList();
         filtered.Should().ContainSingle().Which.Should().Be("src/App.cs");
+    }
+
+    [Fact]
+    public async Task ReplaceFile_RemovesPriorSymbolsEdgesFactsAndWalState()
+    {
+        const string path = "src/Changed.cs";
+        {
+            using var overlay = new EngineOverlay(_overlayDir, "test-ws", _reader);
+            int pathSid = overlay.InternStringInternal(path);
+            int oldStableSid = overlay.InternStringInternal("sym_old_revision");
+            int oldFqnSid = overlay.InternStringInternal("T:OldRevision");
+            int oldTokensSid = overlay.InternStringInternal("old revision");
+
+            using (var first = overlay.BeginBatch())
+            {
+                first.UpsertFile(new FileRecord(-1, pathSid, pathSid, 0, 0, 0, 0, 0, 0));
+                first.UpsertSymbol(new SymbolRecord(
+                    -1, oldStableSid, oldFqnSid, 0, 0, 0, -1, 0,
+                    1, 7, 0, 1, 3, oldTokensSid, 0), ["old", "revision"]);
+                first.AddEdge(new EdgeRecord(-1, -1, 1, 0, -1, 2, 2, 1, 0, 0, 1));
+                first.AddFact(new FactRecord(-1, -1, -1, 2, 2, 1, oldFqnSid, 0, 3, 0));
+                await first.CommitAsync();
+            }
+
+            int newStableSid = overlay.InternStringInternal("sym_new_revision");
+            int newFqnSid = overlay.InternStringInternal("T:NewRevision");
+            using var second = overlay.BeginBatch();
+            second.ReplaceFile(path);
+            second.UpsertFile(new FileRecord(-2, pathSid, pathSid, 0, 0, 0, 0, 0, 0));
+            second.UpsertSymbol(new SymbolRecord(
+                -2, newStableSid, newFqnSid, 0, 0, 0, -2, 0,
+                1, 7, 0, 1, 3, 0, 0), ["new"]);
+            await second.CommitAsync();
+
+            overlay.TryGetOverlaySymbol("sym_old_revision", out _).Should().BeNull();
+            overlay.TryGetOverlaySymbol("sym_new_revision", out _).Should().NotBeNull();
+            overlay.GetOverlayOutgoingEdges(-1).Should().BeEmpty();
+            overlay.GetOverlayFacts(-1).Should().BeEmpty();
+            overlay.GetOverlaySymbolsForTokenPrefix("old").Should().BeEmpty();
+        }
+
+        using var reopened = new EngineOverlay(_overlayDir, "test-ws", _reader);
+        reopened.TryGetOverlaySymbol("sym_old_revision", out _).Should().BeNull();
+        reopened.TryGetOverlaySymbol("sym_new_revision", out _).Should().NotBeNull();
+        reopened.GetOverlayOutgoingEdges(-1).Should().BeEmpty();
     }
 }
 

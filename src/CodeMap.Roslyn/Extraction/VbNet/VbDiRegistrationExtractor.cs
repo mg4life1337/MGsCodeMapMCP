@@ -20,17 +20,22 @@ internal static class VbDiRegistrationExtractor
     public static IReadOnlyList<ExtractedFact> ExtractAll(
         Compilation compilation,
         string solutionDir,
-        IReadOnlyDictionary<string, StableId>? stableIdMap = null)
+        IReadOnlyDictionary<string, StableId>? stableIdMap = null,
+        IReadOnlySet<string>? includedAbsolutePaths = null)
     {
         var facts = new List<ExtractedFact>();
         string normalizedDir = solutionDir.Replace('\\', '/').TrimEnd('/') + '/';
 
         foreach (var syntaxTree in compilation.SyntaxTrees)
         {
+            if (!CodeMap.Roslyn.Extraction.ExtractionScope.Includes(
+                    syntaxTree, includedAbsolutePaths)) continue;
             if (syntaxTree.FilePath is null or "") continue;
 
             var semanticModel = compilation.GetSemanticModel(syntaxTree);
-            var filePath = MakeRepoRelative(syntaxTree.FilePath, normalizedDir);
+            var filePathNullable = MakeRepoRelative(syntaxTree.FilePath, normalizedDir);
+            if (filePathNullable is null) continue;
+            var filePath = filePathNullable.Value;
 
             foreach (var invocation in syntaxTree.GetRoot()
                 .DescendantNodes().OfType<InvocationExpressionSyntax>())
@@ -200,11 +205,8 @@ internal static class VbDiRegistrationExtractor
     private static string GetSymbolId(ISymbol symbol)
         => symbol.GetDocumentationCommentId() ?? symbol.ToDisplayString();
 
-    private static FilePath MakeRepoRelative(string filePath, string normalizedDir)
+    private static FilePath? MakeRepoRelative(string filePath, string normalizedDir)
     {
-        var normalized = filePath.Replace('\\', '/');
-        if (normalized.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase))
-            return FilePath.From(normalized[normalizedDir.Length..]);
-        return FilePath.From(Path.GetFileName(normalized));
+        return CodeMap.Roslyn.Extraction.ExtractionScope.ToRepositoryPath(normalizedDir.TrimEnd('/'), filePath);
     }
 }

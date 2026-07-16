@@ -130,8 +130,8 @@ public sealed class RollingVbDeltaTests : IAsyncLifetime
 
         refreshed.IsSuccess.Should().BeTrue();
         refreshed.Value.FilesReindexed.Should().BeGreaterThan(2);
-        var deleted = await _overlay.GetDeletedSymbolIdsAsync(_repoId, _workspaceId);
-        deleted.Should().Contain(id => id.Value.Contains("RemovedType", StringComparison.Ordinal));
+        var authoritativeFiles = await _overlay.GetOverlayFilePathsAsync(_repoId, _workspaceId);
+        authoritativeFiles.Should().Contain(FilePath.From("Library/Removed.vb"));
         var routing = new RoutingContext(
             _repoId, _workspaceId, ConsistencyMode.Workspace, _baselineCommit);
 
@@ -173,6 +173,62 @@ public sealed class RollingVbDeltaTests : IAsyncLifetime
         Directory.Exists(Path.Combine(_repoRoot, ".codex")).Should().BeFalse();
     }
 
+    [Fact]
+    public async Task TriviaOnlyVbChange_ProducesNoSemanticDeltaButServesCurrentSource()
+    {
+        const string comment = "' current source note";
+        File.AppendAllText(Path.Combine(_repoRoot, "Library", "Worker.vb"), Environment.NewLine + comment);
+        _ = Commit("trivia-only VB change");
+
+        var refreshed = await _manager.RefreshOverlayAsync(_repoId, _workspaceId, null);
+
+        refreshed.IsSuccess.Should().BeTrue();
+        refreshed.Value.FilesReindexed.Should().Be(0);
+        refreshed.Value.SymbolsUpdated.Should().Be(0);
+        refreshed.Value.Metrics!.Mode.Should().Be(IncrementalUpdateMode.NoOp);
+        refreshed.Value.Metrics.SemanticNoOpFiles.Should().Be(1);
+
+        var routing = new RoutingContext(
+            _repoId, _workspaceId, ConsistencyMode.Workspace, _baselineCommit);
+        (await Search(routing, "OldName")).Should().ContainSingle();
+        var span = await _engine.GetSpanAsync(
+            routing, FilePath.From("Library/Worker.vb"), 1, 100, 0, null);
+        span.IsSuccess.Should().BeTrue();
+        span.Value.Data.Content.Should().Contain(comment);
+    }
+
+    [Fact]
+    public async Task VbMethodBodyChange_ReindexesOnlyChangedDocument()
+    {
+        File.WriteAllText(Path.Combine(_repoRoot, "Application", "Caller.vb"), """
+            Imports Library
+            Namespace Application
+                Public Class Caller
+                    Public Function Execute() As Integer
+                        Dim worker = New Worker()
+                        Return worker.OldName("body update")
+                    End Function
+                End Class
+            End Namespace
+            """);
+        _ = Commit("VB body change");
+
+        var refreshed = await _manager.RefreshOverlayAsync(_repoId, _workspaceId, null);
+
+        refreshed.IsSuccess.Should().BeTrue();
+        refreshed.Value.FilesReindexed.Should().Be(1);
+        refreshed.Value.Metrics!.Mode.Should().Be(IncrementalUpdateMode.Document);
+        refreshed.Value.Metrics.DocumentsReindexed.Should().Be(1);
+        refreshed.Value.Metrics.AffectedProjects.Should().BeGreaterThanOrEqualTo(1);
+        _incremental.LastDelta!.AddedOrUpdatedReferences.Should().Contain(reference =>
+            reference.FromSymbol.Value.Contains("Execute", StringComparison.Ordinal) &&
+            reference.ToSymbol.Value.Contains("OldName", StringComparison.Ordinal));
+
+        var routing = new RoutingContext(
+            _repoId, _workspaceId, ConsistencyMode.Workspace, _baselineCommit);
+        (await Search(routing, "Execute")).Should().ContainSingle();
+    }
+
     private async Task<IReadOnlyList<SymbolSearchHit>> Search(
         RoutingContext routing,
         string query,
@@ -189,6 +245,7 @@ public sealed class RollingVbDeltaTests : IAsyncLifetime
 
     private void CreateFixture()
     {
+        File.WriteAllText(Path.Combine(_repoRoot, ".gitignore"), "bin/\nobj/\n");
         Directory.CreateDirectory(Path.Combine(_repoRoot, "Library"));
         Directory.CreateDirectory(Path.Combine(_repoRoot, "Application"));
         File.WriteAllText(Path.Combine(_repoRoot, "Library", "Library.vbproj"), Project(""));

@@ -77,6 +77,13 @@ internal sealed class WalWriter : IDisposable
         WriteRecord(0x06, payload); // AddFile
     }
 
+    public void WriteReplaceFile(int pathStringId)
+    {
+        Span<byte> payload = stackalloc byte[4];
+        BitConverter.TryWriteBytes(payload, pathStringId);
+        WriteRecord(0x0B, payload);
+    }
+
     public void WriteTombstone(int entityKind, int entityIntId, int stableIdStringId, int flags)
     {
         Span<byte> payload = stackalloc byte[16]; // TombstoneRecord = 16 bytes

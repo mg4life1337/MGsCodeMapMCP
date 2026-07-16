@@ -96,4 +96,5 @@ public class SymbolExtractorStableIdTests
 
         ids1.Should().Equal(ids2, "stable IDs must be deterministic for the same source");
     }
+
 }

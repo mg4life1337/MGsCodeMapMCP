@@ -46,6 +46,13 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
         using var batch = overlay.BeginBatch();
 
+        var authoritativeFiles = delta.ReindexedFiles.Select(file => file.Path)
+            .Concat(delta.DeletedReferenceFiles)
+            .Distinct(RepositoryPath.FilePathComparer)
+            .ToList();
+        foreach (var path in authoritativeFiles)
+            batch.ReplaceFile(path.Value);
+
         // Tombstone deleted symbols
         foreach (var deletedId in delta.DeletedSymbolIds)
         {
@@ -60,6 +67,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         // Upsert files and retain their overlay-local IDs so symbols can point back
         // to the correct path. FileIntId=0 loses source locations in workspace queries.
         var fileIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var fileProjectIds = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in delta.ReindexedFiles)
         {
             var pathSid = batch.InternString(file.Path.Value);
@@ -72,6 +80,22 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
                 RecordMappers.DetectLanguage(file.Path.Value), 0, 0);
             batch.UpsertFile(fileRecord);
             fileIds[file.Path.Value] = fileIntId;
+            fileProjectIds[file.Path.Value] = projectIntId;
+        }
+
+        foreach (var deletedPath in delta.DeletedReferenceFiles)
+        {
+            if (fileIds.ContainsKey(deletedPath.Value)) continue;
+            var baselineFile = reader.GetFileByPath(deletedPath.Value);
+            int projectIntId = baselineFile?.ProjectIntId ?? 0;
+            int pathSid = batch.InternString(deletedPath.Value);
+            int normalizedSid = batch.InternString(deletedPath.Value.ToLowerInvariant());
+            int fileIntId = overlay.NextOverlayFileIntId--;
+            batch.UpsertFile(new FileRecord(
+                fileIntId, pathSid, normalizedSid, projectIntId,
+                0, 0, RecordMappers.DetectLanguage(deletedPath.Value), 1, 0));
+            fileIds[deletedPath.Value] = fileIntId;
+            fileProjectIds[deletedPath.Value] = projectIntId;
         }
 
         // Upsert symbols. Keep the pending IDs because edges in this same atomic
@@ -86,7 +110,17 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
             // it never enters the overlay.
             if (string.IsNullOrWhiteSpace(sym.SymbolId.Value)) continue;
             var fqn = sym.SymbolId.Value;
-            var stableId = RecordMappers.ComputeDegradedStableId(sym.Kind, fqn, null);
+            var projectIntId = ResolveBaselineProjectId(reader, sym.ProjectName);
+            if (projectIntId == 0)
+                projectIntId = fileProjectIds.GetValueOrDefault(sym.FilePath.Value);
+            if (projectIntId == 0 && reader.GetFileByPath(sym.FilePath.Value) is { } baselineFile)
+                projectIntId = baselineFile.ProjectIntId;
+            string? projectName = projectIntId > 0 && projectIntId <= reader.ProjectCount
+                ? reader.ResolveString(reader.GetProjectByIntId(projectIntId).NameStringId)
+                : null;
+            var stableId = sym.StableId is { IsEmpty: false } sourceStableId
+                ? sourceStableId.Value
+                : RecordMappers.ComputeDegradedStableId(sym.Kind, fqn, projectName);
             var stableIdSid = batch.InternString(stableId);
             var fqnSid = batch.InternString(fqn);
             var displayName = sym.FullyQualifiedName.Split('.')[^1];
@@ -101,7 +135,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
             if (fileIntId == 0)
                 fileIntId = reader.GetFileByPath(sym.FilePath.Value)?.FileIntId ?? 0;
             var record = new SymbolRecord(intId, stableIdSid, fqnSid, displaySid, nsSid,
-                0, fileIntId, 0, RecordMappers.MapSymbolKind(sym.Kind),
+                0, fileIntId, projectIntId, RecordMappers.MapSymbolKind(sym.Kind),
                 RecordMappers.MapAccessibility(sym.Visibility),
                 RecordMappers.BuildSymbolFlags(sym),
                 sym.SpanStart, sym.SpanEnd, tokensSid, 0);
@@ -293,7 +327,8 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
             // Project name filter: overlay-new symbols inherit project from their file.
             if (filters?.ProjectName is { Length: > 0 } projFilter)
             {
-                var projName = ResolveOverlaySymbolProjectName(overlay, reader, sym.FileIntId);
+                var projName = ResolveOverlaySymbolProjectName(
+                    overlay, reader, sym.ProjectIntId, sym.FileIntId);
                 if (projName is null || !string.Equals(projName, projFilter, StringComparison.OrdinalIgnoreCase))
                     continue;
             }
@@ -307,7 +342,12 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
                 FilePath: FilePath.From(
                     ResolveOverlaySymbolFilePath(overlay, reader, sym.FileIntId) ?? "unknown"),
                 Line: sym.SpanStart,
-                Score: 1.0));
+                Score: 1.0,
+                StableId: sym.StableIdStringId > 0
+                    ? new StableId(overlay.ResolveString(sym.StableIdStringId))
+                    : null,
+                ProjectName: ResolveOverlaySymbolProjectName(
+                    overlay, reader, sym.ProjectIntId, sym.FileIntId)));
 
             if (results.Count >= limit) break;
         }
@@ -364,7 +404,8 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
             if (filters?.ProjectName is { Length: > 0 } projFilter)
             {
-                var projName = ResolveOverlaySymbolProjectName(overlay, reader, sym.FileIntId);
+                var projName = ResolveOverlaySymbolProjectName(
+                    overlay, reader, sym.ProjectIntId, sym.FileIntId);
                 if (projName is null || !string.Equals(projName, projFilter, StringComparison.OrdinalIgnoreCase))
                     continue;
             }
@@ -378,7 +419,12 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
                 FilePath: FilePath.From(
                     ResolveOverlaySymbolFilePath(overlay, reader, sym.FileIntId) ?? "unknown"),
                 Line: sym.SpanStart,
-                Score: 0));
+                Score: 0,
+                StableId: sym.StableIdStringId > 0
+                    ? new StableId(overlay.ResolveString(sym.StableIdStringId))
+                    : null,
+                ProjectName: ResolveOverlaySymbolProjectName(
+                    overlay, reader, sym.ProjectIntId, sym.FileIntId)));
 
             if (results.Count >= limit) break;
         }
@@ -403,16 +449,19 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         return null;
     }
 
-    private static string? ResolveOverlaySymbolProjectName(EngineOverlay overlay, EngineBaselineReader reader, int fileIntId)
+    private static string? ResolveOverlaySymbolProjectName(
+        EngineOverlay overlay,
+        EngineBaselineReader reader,
+        int symbolProjectIntId,
+        int fileIntId)
     {
-        int projectIntId;
-        if (fileIntId >= 1 && fileIntId <= reader.FileCount)
+        int projectIntId = symbolProjectIntId;
+        if (projectIntId == 0 && fileIntId >= 1 && fileIntId <= reader.FileCount)
         {
             projectIntId = reader.GetFileByIntId(fileIntId).ProjectIntId;
         }
-        else
+        else if (projectIntId == 0)
         {
-            projectIntId = 0;
             foreach (var kv in overlay.FilesByPath)
                 if (kv.Value.FileIntId == fileIntId) { projectIntId = kv.Value.ProjectIntId; break; }
         }
@@ -482,7 +531,8 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         if (overlay == null) return Task.FromResult<IReadOnlySet<FilePath>>(new HashSet<FilePath>());
         var snapshot = overlay.GetFilePathsSnapshot();
         var paths = new HashSet<FilePath>(
-            snapshot.Where(p => !string.IsNullOrWhiteSpace(p)).Select(FilePath.From));
+            snapshot.Where(p => !string.IsNullOrWhiteSpace(p)).Select(FilePath.From),
+            RepositoryPath.FilePathComparer);
         return Task.FromResult<IReadOnlySet<FilePath>>(paths);
     }
 

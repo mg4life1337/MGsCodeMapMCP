@@ -50,6 +50,11 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
                 if (!string.IsNullOrEmpty(f.ProjectName))
                     projectNames.Add(f.ProjectName);
             }
+            foreach (var symbol in input.Symbols)
+            {
+                if (!string.IsNullOrEmpty(symbol.ProjectName))
+                    projectNames.Add(symbol.ProjectName);
+            }
             var projectList = projectNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
             var projectIdByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             for (var i = 0; i < projectList.Count; i++)
@@ -93,8 +98,10 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
                 var fqn = sym.SymbolId.Value;
 
                 // Intern strings
-                var projectName = projectByFile.GetValueOrDefault(sym.FilePath.Value);
-                var stableId = RecordMappers.ComputeDegradedStableId(sym.Kind, fqn, projectName);
+                var projectName = sym.ProjectName ?? projectByFile.GetValueOrDefault(sym.FilePath.Value);
+                var stableId = sym.StableId is { IsEmpty: false } sourceStableId
+                    ? sourceStableId.Value
+                    : RecordMappers.ComputeDegradedStableId(sym.Kind, fqn, projectName);
                 var stableIdSid = dictBuilder.Intern(stableId);
                 var fqnSid = dictBuilder.Intern(fqn);
                 var displayName = ExtractDisplayName(sym.FullyQualifiedName);

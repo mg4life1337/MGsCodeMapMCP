@@ -24,26 +24,28 @@ internal static class VbSyntacticExtractor
     /// Extracts symbols and unresolved references from the given VB.NET source files.
     /// </summary>
     public static (IReadOnlyList<SymbolCard> Symbols, IReadOnlyList<ExtractedReference> Refs)
-        ExtractAll(IEnumerable<(string FilePath, string Content)> files, string solutionDir)
+        ExtractAll(
+            IEnumerable<(string FilePath, string Content)> files,
+            string solutionDir,
+            string? projectName = null)
     {
         var symbols = new List<SymbolCard>();
         var refs = new List<ExtractedReference>();
-        string normalizedDir = solutionDir.Replace('\\', '/').TrimEnd('/') + '/';
-
         foreach (var (absolutePath, content) in files)
         {
             if (string.IsNullOrEmpty(absolutePath) || string.IsNullOrEmpty(content)) continue;
 
             try
             {
-                var normalizedPath = absolutePath.Replace('\\', '/');
-                string relPath = normalizedPath.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase)
-                    ? normalizedPath[normalizedDir.Length..]
-                    : Path.GetFileName(normalizedPath);
+                var filePathNullable = CodeMap.Roslyn.Extraction.ExtractionScope
+                    .ToRepositoryPath(solutionDir, absolutePath);
+                if (filePathNullable is null)
+                    continue;
+                var filePath = filePathNullable.Value;
 
                 var tree = VisualBasicSyntaxTree.ParseText(content, path: absolutePath);
                 var root = tree.GetRoot();
-                var walker = new VbSyntaxWalker(relPath, symbols, refs);
+                var walker = new VbSyntaxWalker(filePath.Value, projectName, symbols, refs);
                 walker.Visit(root);
             }
             catch
@@ -71,12 +73,13 @@ internal static class VbSyntacticExtractor
             })
             .Where(f => !string.IsNullOrEmpty(f.Item1));
 
-        return ExtractAll(files, solutionDir);
+        return ExtractAll(files, solutionDir, project.Name);
     }
 
     private sealed class VbSyntaxWalker : VisualBasicSyntaxWalker
     {
         private readonly string _relPath;
+        private readonly string? _projectName;
         private readonly List<SymbolCard> _symbols;
         private readonly List<ExtractedReference> _refs;
         // Stack-based container tracking: push on enter, pop on exit for each type block.
@@ -84,9 +87,14 @@ internal static class VbSyntacticExtractor
         private readonly Stack<string> _containers = new();
         private string CurrentContainer => _containers.Count > 0 ? _containers.Peek() : "";
 
-        public VbSyntaxWalker(string relPath, List<SymbolCard> symbols, List<ExtractedReference> refs)
+        public VbSyntaxWalker(
+            string relPath,
+            string? projectName,
+            List<SymbolCard> symbols,
+            List<ExtractedReference> refs)
         {
             _relPath = relPath;
+            _projectName = projectName;
             _symbols = symbols;
             _refs = refs;
         }
@@ -222,7 +230,8 @@ internal static class VbSyntacticExtractor
                 SideEffects: [],
                 ThrownExceptions: [],
                 Evidence: [],
-                Confidence: Confidence.Low));
+                Confidence: Confidence.Low,
+                ProjectName: _projectName));
         }
 
         private static string TruncateHint(string text, int maxLength)

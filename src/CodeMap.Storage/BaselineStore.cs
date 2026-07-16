@@ -799,6 +799,23 @@ public sealed class BaselineStore : ISymbolStore
     }
 
     /// <inheritdoc/>
+    public async Task<string?> GetFileContentAsync(
+        RepoId repoId,
+        CommitSha commitSha,
+        FilePath filePath,
+        CancellationToken ct = default)
+    {
+        using var conn = _factory.OpenExisting(repoId, commitSha);
+        if (conn is null) return null;
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT content FROM files WHERE path = $path LIMIT 1";
+        cmd.Parameters.AddWithValue("$path", filePath.Value);
+        var content = await cmd.ExecuteScalarAsync(ct).ConfigureAwait(false);
+        return content is DBNull or null ? null : (string)content;
+    }
+
+    /// <inheritdoc/>
     public async Task<string?> GetRepoRootAsync(
         RepoId repoId, CommitSha commitSha, CancellationToken ct = default)
     {

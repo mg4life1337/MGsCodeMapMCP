@@ -58,7 +58,8 @@ public class MergedQueryEngine : IQueryEngine
     /// <b>Workspace merge:</b> overlay symbols appear first (recently modified files have priority).
     /// Baseline symbols are included only when their <c>symbol_id</c> is not in the deleted set
     /// AND their <c>file_path</c> is not in the overlay-reindexed file set (file-authoritative merge).
-    /// Deduplication is by file path — no FQN dedup applied.
+    /// Results are deduplicated by project-scoped symbol/stable identity before limits;
+    /// overloads and equal names from different projects remain distinct.
     /// </remarks>
     public async Task<Result<ResponseEnvelope<SymbolSearchResponse>, CodeMapError>> SearchSymbolsAsync(
         RoutingContext routing,
@@ -97,29 +98,26 @@ public class MergedQueryEngine : IQueryEngine
             var committedRoutingForBrowse = new RoutingContext(
                 repoId: routing.RepoId, baselineCommitSha: browseWs.BaselineCommitSha);
             var baselineBrowseResult = await _inner.SearchSymbolsAsync(
-                committedRoutingForBrowse, query, filters, budgets, ct).ConfigureAwait(false);
+                committedRoutingForBrowse, query, filters,
+                new BudgetLimits(maxResults: browseMaxResults * 2), ct).ConfigureAwait(false);
             if (baselineBrowseResult.IsFailure) return baselineBrowseResult;
             var baselineBrowse = baselineBrowseResult.Value.Data;
 
             var browseOverlayHits = await _overlayStore.GetOverlaySymbolsByKindsAsync(
                 routing.RepoId, RequiredWorkspaceId(routing),
                 filters.Kinds, filters, browseMaxResults + 1, ct).ConfigureAwait(false);
-
-            // Union, dedup by symbol_id, overlay first (newer wins).
-            var browseSeen = new HashSet<string>(StringComparer.Ordinal);
-            var browseMerged = new List<SymbolSearchHit>(browseOverlayHits.Count + baselineBrowse.Hits.Count);
-            foreach (var h in browseOverlayHits)
-                if (browseSeen.Add(h.SymbolId.Value)) browseMerged.Add(h);
-            foreach (var h in baselineBrowse.Hits)
-                if (browseSeen.Add(h.SymbolId.Value)) browseMerged.Add(h);
-            var browseTruncated = browseMerged.Count > browseMaxResults;
-            if (browseTruncated)
-                browseMerged = browseMerged.Take(browseMaxResults).ToList();
-            var browseTotal = browseTruncated ? browseMaxResults + 1 : browseMerged.Count;
+            var browseDeletedIds = await _overlayStore.GetDeletedSymbolIdsAsync(
+                routing.RepoId, RequiredWorkspaceId(routing), ct).ConfigureAwait(false);
+            var browseOverlayFiles = await _overlayStore.GetOverlayFilePathsAsync(
+                routing.RepoId, RequiredWorkspaceId(routing), ct).ConfigureAwait(false);
+            var browseMerged = MergeHelpers.MergeSearchResults(
+                baselineBrowse.Hits, browseOverlayHits, browseDeletedIds,
+                browseOverlayFiles, browseMaxResults);
 
             return Ok(baselineBrowseResult.Value with
             {
-                Data = new SymbolSearchResponse(browseMerged, browseTotal, browseTruncated),
+                Data = new SymbolSearchResponse(
+                    browseMerged.Hits, browseMerged.TotalCount, browseMerged.Truncated),
             });
         }
 
@@ -162,7 +160,7 @@ public class MergedQueryEngine : IQueryEngine
         var deletedIds = await _overlayStore.GetDeletedSymbolIdsAsync(routing.RepoId, RequiredWorkspaceId(routing), ct).ConfigureAwait(false);
         var overlayFiles = await _overlayStore.GetOverlayFilePathsAsync(routing.RepoId, RequiredWorkspaceId(routing), ct).ConfigureAwait(false);
         var overlayHits = await _overlayStore.SearchOverlaySymbolsAsync(
-            routing.RepoId, RequiredWorkspaceId(routing), query, filters, maxResults, ct).ConfigureAwait(false);
+            routing.RepoId, RequiredWorkspaceId(routing), query, filters, maxResults + 1, ct).ConfigureAwait(false);
         tc.EndDbQuery();
 
         // 5. Query baseline (request extra to compensate for later filtering)
@@ -376,14 +374,73 @@ public class MergedQueryEngine : IQueryEngine
                              .ConfigureAwait(false);
         }
 
-        // File content is read from disk (working copy). In workspace mode, the working copy
-        // IS the edited version. No overlay merge needed — delegate with committed routing.
-        var committedRouting = routing.Consistency == ConsistencyMode.Workspace
-            ? new RoutingContext(repoId: routing.RepoId, baselineCommitSha: routing.BaselineCommitSha)
-            : routing;
+        if (routing.Consistency != ConsistencyMode.Workspace)
+            return await _inner.GetSpanAsync(routing, filePath, startLine, endLine, contextLines, budgets, ct)
+                .ConfigureAwait(false);
 
-        return await _inner.GetSpanAsync(committedRouting, filePath, startLine, endLine, contextLines, budgets, ct)
-                           .ConfigureAwait(false);
+        if (startLine < 1 || endLine < startLine)
+            return Fail<ResponseEnvelope<SpanResponse>>(CodeMapError.InvalidArgument(
+                startLine < 1 ? "startLine must be >= 1." : "endLine must be >= startLine."));
+
+        var workspace = _workspaceManager.GetWorkspaceInfo(routing.RepoId, RequiredWorkspaceId(routing));
+        if (workspace is null)
+            return Fail<ResponseEnvelope<SpanResponse>>(
+                CodeMapError.NotFound("Workspace", RequiredWorkspaceId(routing).Value));
+
+        string candidate = Path.Combine(workspace.RepoRootPath, filePath.Value);
+        if (!RepositoryPath.TryCreate(workspace.RepoRootPath, candidate, out var canonicalPath) ||
+            !RepositoryPath.StringComparer.Equals(canonicalPath.Value, filePath.Value))
+            return Fail<ResponseEnvelope<SpanResponse>>(
+                CodeMapError.NotFound("File", filePath.Value));
+        if (!File.Exists(candidate))
+        {
+            var committedRouting = new RoutingContext(
+                repoId: routing.RepoId, baselineCommitSha: workspace.BaselineCommitSha);
+            return await _inner.GetSpanAsync(
+                committedRouting, filePath, startLine, endLine, contextLines, budgets, ct)
+                .ConfigureAwait(false);
+        }
+
+        var (clamped, limitsApplied) = (budgets ?? BudgetLimits.Defaults).ClampToHardCaps();
+        int effectiveStart = Math.Max(1, startLine - contextLines);
+        int effectiveEnd = endLine + contextLines;
+        int requestedLines = effectiveEnd - effectiveStart + 1;
+        if (requestedLines > clamped.MaxLines)
+        {
+            limitsApplied["MaxLines"] = new LimitApplied(requestedLines, clamped.MaxLines);
+            effectiveEnd = effectiveStart + clamped.MaxLines - 1;
+        }
+
+        string source = await File.ReadAllTextAsync(candidate, ct).ConfigureAwait(false);
+        string[] lines = source.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Split('\n');
+        int actualStart = Math.Min(effectiveStart, lines.Length + 1);
+        int actualEnd = Math.Min(effectiveEnd, lines.Length);
+        string content = actualEnd >= actualStart
+            ? string.Join('\n', lines[(actualStart - 1)..actualEnd])
+            : string.Empty;
+        bool truncated = actualEnd < effectiveEnd;
+        if (content.Length > clamped.MaxChars)
+        {
+            limitsApplied["MaxChars"] = new LimitApplied(content.Length, clamped.MaxChars);
+            content = content[..clamped.MaxChars];
+            truncated = true;
+        }
+
+        var workspaceData = new SpanResponse(
+            canonicalPath, actualStart, actualEnd, lines.Length, content, truncated);
+        int workspaceTokensSaved = TokenSavingsEstimator.ForSpan(
+            lines.Length, Math.Max(0, actualEnd - actualStart + 1));
+        decimal workspaceCostAvoided = TokenSavingsEstimator.EstimateCostAvoided(workspaceTokensSaved);
+        _tracker.RecordSaving(workspaceTokensSaved,
+            TokenSavingsEstimator.EstimateCostPerModel(workspaceTokensSaved));
+        var semanticLevel = await GetOverlaySemanticLevelAsync(
+            routing.RepoId, RequiredWorkspaceId(routing), ct).ConfigureAwait(false);
+        var workspaceEnvelope = EnvelopeBuilder.Build(
+            workspaceData, AnswerGenerator.ForSpan(workspaceData), [], [], Confidence.High,
+            new TimingBreakdown(0), limitsApplied, workspace.BaselineCommitSha,
+            workspaceTokensSaved, workspaceCostAvoided, routing.WorkspaceId, workspace.CurrentRevision,
+            semanticLevel: semanticLevel);
+        return Ok(workspaceEnvelope);
     }
 
     // ─── GetDefinitionSpanAsync ───────────────────────────────────────────────
@@ -518,10 +575,9 @@ public class MergedQueryEngine : IQueryEngine
         var ctxStart = Math.Max(1, card.SpanStart - contextLines);
         var ctxEnd = spanEnd + contextLines;
 
-        // Read from working copy (disk) using committed routing
-        var spanRouting = new RoutingContext(repoId: routing.RepoId, baselineCommitSha: ws.BaselineCommitSha);
-        var spanResult = await _inner.GetSpanAsync(spanRouting, card.FilePath, ctxStart, ctxEnd, 0, null, ct)
-                                      .ConfigureAwait(false);
+        // Read from the current workspace file. This also keeps trivia-only edits visible.
+        var spanResult = await GetSpanAsync(
+            routing, card.FilePath, ctxStart, ctxEnd, 0, null, ct).ConfigureAwait(false);
         if (spanResult.IsFailure)
             return spanResult;
 

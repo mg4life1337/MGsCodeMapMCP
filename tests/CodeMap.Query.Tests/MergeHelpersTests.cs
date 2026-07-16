@@ -173,4 +173,140 @@ public class MergeHelpersTests
         result.Hits.Should().HaveCount(1);
         result.Hits[0].SymbolId.Value.Should().Be("T:Untouched");
     }
+
+    [Fact]
+    public void Merge_SameSymbolWithFilenameOnlyAndFullPath_ReturnsOverlayOnce()
+    {
+        var baseline = new[] { MakeHit("T:Same", "Item.vb") };
+        var overlay = new[] { MakeHit("T:Same", "src/Feature/Item.vb") };
+
+        var result = MergeHelpers.MergeSearchResults(
+            baseline, overlay, NoDeleted, NoOverlayFiles, 10);
+
+        result.Hits.Should().ContainSingle();
+        result.Hits[0].FilePath.Value.Should().Be("src/Feature/Item.vb");
+    }
+
+    [Fact]
+    public void Merge_PathSlashAndCaseVariants_AreOneAuthoritativeFile()
+    {
+        var baseline = new[] { MakeHit("T:Old", "src/Feature/Item.vb") };
+        var overlayFiles = new HashSet<FilePath>(RepositoryPath.FilePathComparer)
+        {
+            FilePath.From("SRC\\FEATURE\\ITEM.VB"),
+        };
+
+        var result = MergeHelpers.MergeSearchResults(
+            baseline, [], NoDeleted, overlayFiles, 10);
+
+        result.Hits.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Merge_SignatureChangeWithSameSymbolId_UsesOverlaySignature()
+    {
+        var baseline = new[] { MakeHit("M:Api.Run", "src/Api.cs") with { Signature = "void Run()" } };
+        var overlay = new[] { MakeHit("M:Api.Run", "src/Api.cs") with { Signature = "int Run()" } };
+
+        var result = MergeHelpers.MergeSearchResults(
+            baseline, overlay, NoDeleted, NoOverlayFiles, 10);
+
+        result.Hits.Should().ContainSingle();
+        result.Hits[0].Signature.Should().Be("int Run()");
+    }
+
+    [Fact]
+    public void Merge_IdenticalBasenamesInDifferentDirectories_DoNotReplaceEachOther()
+    {
+        var baseline = new[] { MakeHit("T:First", "src/One/Item.cs") };
+        var overlay = new[] { MakeHit("T:Second", "src/Two/Item.cs") };
+        var overlayFiles = new HashSet<FilePath>(RepositoryPath.FilePathComparer)
+        {
+            FilePath.From("src/Two/Item.cs"),
+        };
+
+        var result = MergeHelpers.MergeSearchResults(
+            baseline, overlay, NoDeleted, overlayFiles, 10);
+
+        result.Hits.Select(hit => hit.SymbolId.Value).Should().Contain(["T:First", "T:Second"]);
+    }
+
+    [Fact]
+    public void Merge_OverloadsWithDifferentSymbolIds_ArePreserved()
+    {
+        var overlay = new[]
+        {
+            MakeHit("M:Api.Run(System.Int32)", "src/Api.cs") with { FullyQualifiedName = "Api.Run" },
+            MakeHit("M:Api.Run(System.String)", "src/Api.cs") with { FullyQualifiedName = "Api.Run" },
+        };
+
+        var result = MergeHelpers.MergeSearchResults([], overlay, NoDeleted, NoOverlayFiles, 10);
+
+        result.Hits.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public void Merge_RenamedSymbolWithSameStableIdAndProject_UsesOverlayOnce()
+    {
+        var baseline = new[]
+        {
+            MakeHit("T:OldName", "src/Old.cs") with
+            {
+                StableId = new StableId("sym_shared"),
+                ProjectName = "ProjectA",
+            },
+        };
+        var overlay = new[]
+        {
+            MakeHit("T:NewName", "src/New.cs") with
+            {
+                StableId = new StableId("sym_shared"),
+                ProjectName = "ProjectA",
+            },
+        };
+
+        var result = MergeHelpers.MergeSearchResults(
+            baseline, overlay, NoDeleted, NoOverlayFiles, 10);
+
+        result.Hits.Should().ContainSingle();
+        result.Hits[0].SymbolId.Value.Should().Be("T:NewName");
+    }
+
+    [Fact]
+    public void Merge_SameIdsFromDifferentProjects_RemainDistinct()
+    {
+        var first = MakeHit("T:Shared.Api", "src/A/Api.cs") with
+        {
+            StableId = new StableId("sym_shared"),
+            ProjectName = "ProjectA",
+        };
+        var second = MakeHit("T:Shared.Api", "src/B/Api.cs") with
+        {
+            StableId = new StableId("sym_shared"),
+            ProjectName = "ProjectB",
+        };
+
+        var result = MergeHelpers.MergeSearchResults(
+            [first, second], [], NoDeleted, NoOverlayFiles, 10);
+
+        result.Hits.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public void Merge_DeduplicatesBeforeLimitAndCount()
+    {
+        var baseline = new[] { MakeHit("T:Same", "Item.cs") };
+        var overlay = new[]
+        {
+            MakeHit("T:Same", "src/Item.cs"),
+            MakeHit("T:Same", "src/Item.cs"),
+        };
+
+        var result = MergeHelpers.MergeSearchResults(
+            baseline, overlay, NoDeleted, NoOverlayFiles, 1);
+
+        result.Hits.Should().ContainSingle();
+        result.TotalCount.Should().Be(1);
+        result.Truncated.Should().BeFalse();
+    }
 }

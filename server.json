@@ -2,10 +2,10 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mg4life1337/mgs-codemap-mcp",
   "title": "MGsCodeMapMCP",
-  "description": "Semantic MCP server for C#, VB.NET, and F# with rolling multi-solution branch indexes.",
+  "description": "Semantic MCP server for C#, VB.NET, and F# with targeted rolling deltas and duplicate-free overlay queries.",
   "repository": {
     "url": "https://github.com/mg4life1337/MGsCodeMapMCP",
     "source": "github"
   },
-  "version": "2.8.0-mgs.2"
+  "version": "2.8.0-mgs.3"
 }

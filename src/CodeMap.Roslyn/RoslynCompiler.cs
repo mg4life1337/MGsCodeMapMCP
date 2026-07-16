@@ -34,7 +34,7 @@ public sealed class RoslynCompiler : IRoslynCompiler
         if (!File.Exists(solutionPath))
             throw new FileNotFoundException($"Solution file not found: {solutionPath}", solutionPath);
 
-        string solutionDir = Path.GetDirectoryName(Path.GetFullPath(solutionPath))!;
+        string repositoryRoot = FindRepositoryRoot(solutionPath);
         var sw = Stopwatch.StartNew();
 
         using var workspace = MSBuildWorkspace.Create();
@@ -72,7 +72,7 @@ public sealed class RoslynCompiler : IRoslynCompiler
         // errors. Strip the on-disk copies so the in-memory SG output is the single source.
         solution = StripPersistedRazorSgFiles(solution);
 
-        var result = await ExtractSolutionAsync(solution, solutionDir, ct);
+        var result = await ExtractSolutionAsync(solution, repositoryRoot, ct);
         sw.Stop();
 
         var stats = result.Stats with { ElapsedSeconds = sw.Elapsed.TotalSeconds };
@@ -719,20 +719,15 @@ public sealed class RoslynCompiler : IRoslynCompiler
         }
     }
 
-private static void AddFile(
+    private static void AddFile(
         string filePath, string content, string projectName, string normalizedDir,
         List<ExtractedFile> files, HashSet<string> seenPaths)
     {
-        string normalizedPath = filePath.Replace('\\', '/');
-
-        FilePath relativePath;
-        if (normalizedPath.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase))
-            relativePath = FilePath.From(normalizedPath[normalizedDir.Length..]);
-        else
-            relativePath = FilePath.From(Path.GetFileName(normalizedPath));
+        if (!RepositoryPath.TryCreate(normalizedDir.TrimEnd('/'), filePath, out var relativePath))
+            return;
 
         if (!seenPaths.Add(relativePath.Value)) return;
-        seenPaths.Add(normalizedPath);
+        seenPaths.Add(Path.GetFullPath(filePath).Replace('\\', '/'));
 
         string sha256 = ComputeSha256(content);
         string fileId = sha256[..16];
@@ -747,10 +742,30 @@ private static void AddFile(
 
     private static string NormalizeForSeen(string filePath, string normalizedDir)
     {
-        var normalized = filePath.Replace('\\', '/');
-        return normalized.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase)
-            ? normalized[normalizedDir.Length..]
-            : Path.GetFileName(normalized);
+        return RepositoryPath.TryCreate(normalizedDir.TrimEnd('/'), filePath, out var relativePath)
+            ? relativePath.Value
+            : Path.GetFullPath(filePath).Replace('\\', '/');
+    }
+
+    /// <summary>
+    /// Finds the working-tree root that owns a solution or project. Repository-relative
+    /// identities must not change merely because the solution lives in a nested folder.
+    /// Falls back to the solution/project directory for non-Git source trees.
+    /// </summary>
+    internal static string FindRepositoryRoot(string solutionPath)
+    {
+        var fullPath = Path.GetFullPath(solutionPath);
+        var directory = new DirectoryInfo(Path.GetDirectoryName(fullPath)!);
+        var fallback = directory.FullName;
+
+        for (var current = directory; current is not null; current = current.Parent)
+        {
+            var marker = Path.Combine(current.FullName, ".git");
+            if (Directory.Exists(marker) || File.Exists(marker))
+                return current.FullName;
+        }
+
+        return fallback;
     }
 
     private static IEnumerable<(string FilePath, string Content)> GetProjectSourceFiles(Project project)

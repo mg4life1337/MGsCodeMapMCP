@@ -233,7 +233,7 @@ public class EndpointExtractorBlazorRouteTests
         // Razor SG output starts with #pragma checksum referencing the original
         // .razor file. EndpointExtractor should surface that path when present.
         const string razor = """
-            #pragma checksum "C:/repo/MyApp/Components/Pages/Counter.razor" "{guid}" "abc123"
+            #pragma checksum "/repo/MyApp/Components/Pages/Counter.razor" "{guid}" "abc123"
             using Microsoft.AspNetCore.Components;
             namespace MyApp.Components.Pages
             {

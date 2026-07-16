@@ -26,18 +26,14 @@ internal static class SyntacticReferenceExtractor
         string solutionDir)
     {
         var results = new List<ExtractedReference>();
-        string normalizedDir = solutionDir.Replace('\\', '/').TrimEnd('/') + '/';
-
         foreach (var (absolutePath, content) in files)
         {
             if (string.IsNullOrEmpty(absolutePath)) continue;
 
-            var normalizedPath = absolutePath.Replace('\\', '/');
-            string relPath = normalizedPath.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase)
-                ? normalizedPath[normalizedDir.Length..]
-                : System.IO.Path.GetFileName(normalizedPath);
-
-            var filePath = FilePath.From(relPath);
+            var filePathNullable = ExtractionScope.ToRepositoryPath(solutionDir, absolutePath);
+            if (filePathNullable is null)
+                continue;
+            var filePath = filePathNullable.Value;
             var tree = CSharpSyntaxTree.ParseText(content, path: absolutePath);
             var root = tree.GetRoot();
 

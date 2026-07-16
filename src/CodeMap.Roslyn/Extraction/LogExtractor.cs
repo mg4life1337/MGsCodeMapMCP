@@ -26,20 +26,25 @@ internal static class LogExtractor
     public static IReadOnlyList<ExtractedFact> ExtractAll(
         Compilation compilation,
         string solutionDir,
-        IReadOnlyDictionary<string, StableId>? stableIdMap = null)
+        IReadOnlyDictionary<string, StableId>? stableIdMap = null,
+        IReadOnlySet<string>? includedAbsolutePaths = null)
     {
         if (compilation.Language == Microsoft.CodeAnalysis.LanguageNames.VisualBasic)
-            return VbNet.VbLogExtractor.ExtractAll(compilation, solutionDir, stableIdMap);
+            return VbNet.VbLogExtractor.ExtractAll(
+                compilation, solutionDir, stableIdMap, includedAbsolutePaths);
         var facts = new List<ExtractedFact>();
         string normalizedDir = solutionDir.Replace('\\', '/').TrimEnd('/') + '/';
 
         foreach (var syntaxTree in compilation.SyntaxTrees)
         {
+            if (!ExtractionScope.Includes(syntaxTree, includedAbsolutePaths)) continue;
             if (syntaxTree.FilePath is null or "") continue;
 
             var semanticModel = compilation.GetSemanticModel(syntaxTree);
             var root = syntaxTree.GetRoot();
-            var filePath = MakeRepoRelative(syntaxTree.FilePath, normalizedDir);
+            var filePathNullable = MakeRepoRelative(syntaxTree.FilePath, normalizedDir);
+            if (filePathNullable is null) continue;
+            var filePath = filePathNullable.Value;
 
             foreach (var invocation in root.DescendantNodes()
                          .OfType<InvocationExpressionSyntax>())
@@ -183,11 +188,8 @@ internal static class LogExtractor
     private static string GetSymbolId(ISymbol symbol)
         => symbol.GetDocumentationCommentId() ?? symbol.ToDisplayString();
 
-    private static FilePath MakeRepoRelative(string filePath, string normalizedDir)
+    private static FilePath? MakeRepoRelative(string filePath, string normalizedDir)
     {
-        var normalized = filePath.Replace('\\', '/');
-        if (normalized.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase))
-            return FilePath.From(normalized[normalizedDir.Length..]);
-        return FilePath.From(Path.GetFileName(normalized));
+        return ExtractionScope.ToRepositoryPath(normalizedDir.TrimEnd('/'), filePath);
     }
 }

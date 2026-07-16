@@ -21,6 +21,11 @@
 
 MGsCodeMapMCP keeps CodeMap's Roslyn-powered semantic navigation and adds:
 
+- Targeted semantic deltas: comments and whitespace perform no semantic reindex; method-body
+  changes stay in one document; local API changes stay in one project; public API and hierarchy
+  changes expand only through dependent projects.
+- Duplicate-free workspace search and browse: canonical paths and symbol identity are merged
+  before result limits, with the current overlay revision taking precedence.
 - Visual Studio 2026 and MSBuild 18 support while retaining VS 2022 support.
 - Rolling branch indexes: one shared immutable baseline plus small solution-specific overlays.
 - Fast impact checks across every discovered `.sln`/`.slnx`; unaffected solutions are skipped.
@@ -30,6 +35,8 @@ MGsCodeMapMCP keeps CodeMap's Roslyn-powered semantic navigation and adds:
 - Persisted branch state, safe hashed branch directories, retention, and overlay checkpoints.
 - Correct incremental C# and VB.NET updates across project references, renames, deletions,
   partial/Designer files, caller graphs, and type relations.
+- Structured rolling metrics for selected mode, fallback reason, changed and reindexed files,
+  affected projects, symbol/relation counts, and per-stage timings.
 - Data and logs only below the configured MCP directories—never inside analyzed repositories.
 
 The upstream overview and tool reference remain below. Fork-specific installation and

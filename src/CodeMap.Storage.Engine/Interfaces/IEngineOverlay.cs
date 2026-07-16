@@ -29,6 +29,7 @@ internal interface IOverlayWriteBatch : IDisposable
     void UpsertSymbol(SymbolRecord record, string[] tokens);
     void AddEdge(EdgeRecord record);
     void AddFact(FactRecord record);
+    void ReplaceFile(string repositoryPath);
     void UpsertFile(FileRecord record);
     void Tombstone(int entityKind, int entityIntId, string? stableId = null);
     void ResolveEdge(int fromSymbolIntId, int fileIntId, int spanStart, int resolvedToSymbolIntId);
