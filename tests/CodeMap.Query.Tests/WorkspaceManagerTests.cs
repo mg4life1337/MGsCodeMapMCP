@@ -253,6 +253,77 @@ public sealed class WorkspaceManagerTests
         await act.Should().ThrowAsync<InvalidOperationException>();
     }
 
+    [Fact]
+    public async Task Fork_CreatesIndependentWorkspaceAtExactRevision()
+    {
+        await SetupWorkspaceAsync();
+        var target = WorkspaceId.From("ws-fork");
+
+        var result = await _manager.ForkWorkspaceAsync(
+            Repo,
+            WsId,
+            sourceRevision: 0,
+            target);
+
+        result.IsSuccess.Should().BeTrue();
+        _manager.GetWorkspaceInfo(Repo, target)!.CurrentRevision.Should().Be(0);
+        await _overlay.Received(1).ForkOverlayAsync(
+            Repo,
+            WsId,
+            0,
+            target,
+            Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task SeededRefresh_DeletesSymbolsFromMergedSeedView()
+    {
+        await SetupWorkspaceAsync();
+        var target = WorkspaceId.From("ws-seeded");
+        (await _manager.ForkWorkspaceAsync(Repo, WsId, 0, target))
+            .IsSuccess.Should().BeTrue();
+        var changedFile = FilePath.From("src/Foo.cs");
+        _overlay.GetOverlayFilePathsAsync(
+                Repo,
+                WsId,
+                Arg.Any<CancellationToken>())
+            .Returns(new HashSet<FilePath> { changedFile });
+        _overlay.GetOverlaySymbolsByFileAsync(
+                Repo,
+                WsId,
+                changedFile,
+                Arg.Any<CancellationToken>())
+            .Returns([MakeSymbolCard("T:SeedOnly")]);
+        _compiler.ComputeDeltaAsync(
+                Arg.Any<string>(),
+                Arg.Any<string>(),
+                Arg.Any<IReadOnlyList<FilePath>>(),
+                Arg.Any<ISymbolStore>(),
+                Arg.Any<RepoId>(),
+                Arg.Any<CommitSha>(),
+                Arg.Any<int>(),
+                Arg.Any<CancellationToken>())
+            .Returns(MakeDelta());
+
+        await _manager.RefreshSeededOverlayAsync(
+            Repo,
+            target,
+            [new FileChange(changedFile, FileChangeKind.Modified)],
+            WsId);
+
+        await _overlay.Received(1).ApplyDeltaAsync(
+            Repo,
+            target,
+            Arg.Is<OverlayDelta>(delta =>
+                delta.DeletedSymbolIds.Contains(SymbolId.From("T:SeedOnly"))),
+            Arg.Any<CancellationToken>());
+        await _baseline.DidNotReceive().GetSymbolsByFileAsync(
+            Repo,
+            Sha,
+            changedFile,
+            Arg.Any<CancellationToken>());
+    }
+
     // ── ResetWorkspaceAsync ───────────────────────────────────────────────────
 
     [Fact]

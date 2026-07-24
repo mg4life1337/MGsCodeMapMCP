@@ -93,11 +93,17 @@ Minimal `codemap.json`:
       "autoIndex": true,
       "watchGitHead": true,
       "indexMode": "rollingBranch",
-      "updateStrategy": "incremental"
+      "updateStrategy": "incremental",
+      "branchSeedMode": "closestCompatible",
+      "branchSeedCandidateCount": 3,
+      "branchSeedMinimumSimilarity": 0.60,
+      "strictGenerationPublish": true,
+      "servePreviousIndexWhileUpdating": false
     }
   ],
   "indexingResources": {
     "maxConcurrentIndexes": 1,
+    "maxConcurrentIncrementalSolutions": 2,
     "maxParallelProjects": 2,
     "incrementalSolutionCacheSize": 1,
     "incrementalSolutionCacheIdleMinutes": 5,
@@ -114,6 +120,10 @@ Minimal `codemap.json`:
 Relative `dataDirectory`, `logDirectory`, repository, and solution paths are resolved relative to `codemap.json`.
 
 When `discoverGitRepositories` and `discoverSolutions` are enabled on a root, explicit `repositories` entries are unnecessary unless you need per-repository overrides or an explicit default solution. If several solutions are found, MCP responses expose their stable `solution_id`; pass `solution_path` or `solution_id` where selection is ambiguous. A Solution ID includes the normalized repository root and repository-relative Solution path. Two clones in different folders therefore have separate indexes even when they share the same remote, commit, and `.sln` name.
+
+In `rollingBranch` mode, the branch is the logical cache key. Each Solution independently selects an exact or closest compatible seed. The comparison weights solution/build files more heavily than source files; the default `0.60` threshold chooses between a seeded incremental update and a full rebuild of only that Solution. Seeds are forked into isolated overlays and remain immutable.
+
+All configured Solutions are published as one repository generation. The daemon revalidates branch, HEAD, index, and working tree immediately before atomically replacing `active-generation.json`. With the safe default `servePreviousIndexWhileUpdating: false`, queries return `INDEX_UPDATING` or `INDEX_NOT_READY` until a complete generation exists for the current target. Git observation uses LibGit2Sharp only and never performs an implicit network fetch.
 
 Full-index memory reclamation is batch-scoped. After publication and the reader idle timeout, the daemon waits until there is no full index, incremental update, or active MCP request and the last MCP request has been quiet for at least 120 seconds. If the managed heap remains above `memoryReclaimMinimumManagedHeapMb`, it requests one LOH compaction and performs one blocking full collection. It does not collect after each Solution.
 

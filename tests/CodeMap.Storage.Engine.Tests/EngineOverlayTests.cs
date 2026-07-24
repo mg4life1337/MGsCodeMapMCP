@@ -50,6 +50,64 @@ public sealed class EngineOverlayTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ForkSnapshot_IsRevisionExactAndIsolated()
+    {
+        using var source = new EngineOverlay(_overlayDir, "source", _reader);
+        var stableId = source.InternStringInternal("sym_seed");
+        var fqn = source.InternStringInternal("T:Seed.Type");
+        using (var batch = source.BeginBatch())
+        {
+            batch.UpsertSymbol(
+                new SymbolRecord(
+                    -1, stableId, fqn, 0, 0, 0, 0, 0,
+                    1, 7, 0, 1, 1, 0, 0),
+                ["seed"]);
+            await batch.CommitAsync();
+        }
+
+        var targetDirectory = Path.Combine(
+            Path.GetDirectoryName(_overlayDir)!,
+            "forked-ws");
+        source.ForkSnapshot(targetDirectory, "forked-ws", expectedRevision: 1);
+
+        using var target = new EngineOverlay(targetDirectory, "forked-ws", _reader);
+        target.Revision.Should().Be(1);
+        target.TryGetOverlaySymbol("sym_seed", out _).Should().NotBeNull();
+
+        var targetStableId = target.InternStringInternal("sym_target_only");
+        using (var batch = target.BeginBatch())
+        {
+            batch.UpsertSymbol(
+                new SymbolRecord(
+                    -2, targetStableId, fqn, 0, 0, 0, 0, 0,
+                    1, 7, 0, 1, 1, 0, 0),
+                ["target"]);
+            await batch.CommitAsync();
+        }
+
+        target.Revision.Should().Be(2);
+        source.Revision.Should().Be(1);
+        source.TryGetOverlaySymbol("sym_target_only", out _).Should().BeNull();
+    }
+
+    [Fact]
+    public void ForkSnapshot_RejectsRevisionMismatchWithoutTarget()
+    {
+        using var source = new EngineOverlay(_overlayDir, "source", _reader);
+        var targetDirectory = Path.Combine(
+            Path.GetDirectoryName(_overlayDir)!,
+            "rejected-ws");
+
+        var act = () => source.ForkSnapshot(
+            targetDirectory,
+            "rejected-ws",
+            expectedRevision: 99);
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*revision changed*");
+        Directory.Exists(targetDirectory).Should().BeFalse();
+    }
+
+    [Fact]
     public async Task UpsertSymbol_ThenQuery_ReturnsIt()
     {
         using var overlay = new EngineOverlay(_overlayDir, "test-ws", _reader);

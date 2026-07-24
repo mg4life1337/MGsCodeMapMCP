@@ -119,6 +119,10 @@ public sealed class ConfigLoadingTests : IDisposable
                   "updateStrategy": "incremental",
                   "checkAllSolutions": true,
                   "skipUnaffectedSolutions": true,
+                  "branchSeedMode": "closestCompatible",
+                  "branchSeedCandidateCount": 5,
+                  "branchSeedMinimumSimilarity": 0.72,
+                  "strictGenerationPublish": true,
                   "servePreviousIndexWhileUpdating": true,
                   "retentionDays": 14,
                   "maxRollingBranches": 4,
@@ -135,6 +139,10 @@ public sealed class ConfigLoadingTests : IDisposable
         repository.UpdateStrategy.Should().Be("incremental");
         repository.CheckAllSolutions.Should().BeTrue();
         repository.SkipUnaffectedSolutions.Should().BeTrue();
+        repository.BranchSeedMode.Should().Be("closestCompatible");
+        repository.BranchSeedCandidateCount.Should().Be(5);
+        repository.BranchSeedMinimumSimilarity.Should().Be(0.72);
+        repository.StrictGenerationPublish.Should().BeTrue();
         repository.ServePreviousIndexWhileUpdating.Should().BeTrue();
         repository.RetentionDays.Should().Be(14);
         repository.MaxRollingBranches.Should().Be(4);
@@ -163,6 +171,7 @@ public sealed class ConfigLoadingTests : IDisposable
             {
               "indexingResources": {
                 "maxConcurrentIndexes": 2,
+                "maxConcurrentIncrementalSolutions": 4,
                 "maxParallelProjects": 3,
                 "incrementalSolutionCacheSize": 2,
                 "incrementalSolutionCacheIdleMinutes": 10,
@@ -180,6 +189,7 @@ public sealed class ConfigLoadingTests : IDisposable
 
         resources.Should().NotBeNull();
         resources!.MaxConcurrentIndexes.Should().Be(2);
+        resources.MaxConcurrentIncrementalSolutions.Should().Be(4);
         resources.MaxParallelProjects.Should().Be(3);
         resources.IncrementalSolutionCacheSize.Should().Be(2);
         resources.IncrementalSolutionCacheIdleMinutes.Should().Be(10);
@@ -193,6 +203,7 @@ public sealed class ConfigLoadingTests : IDisposable
 
     [Theory]
     [InlineData("maxConcurrentIndexes", 0)]
+    [InlineData("maxConcurrentIncrementalSolutions", 0)]
     [InlineData("maxParallelProjects", 0)]
     [InlineData("incrementalSolutionCacheSize", 0)]
     [InlineData("incrementalSolutionCacheIdleMinutes", 0)]
@@ -271,6 +282,7 @@ public sealed class ConfigLoadingTests : IDisposable
 
         var resources = config.IndexingResources ?? new IndexingResourceConfig();
         resources.MaxConcurrentIndexes.Should().Be(1);
+        resources.MaxConcurrentIncrementalSolutions.Should().Be(2);
         resources.MaxParallelProjects.Should().Be(2);
         resources.IncrementalSolutionCacheSize.Should().Be(1);
         resources.IncrementalSolutionCacheIdleMinutes.Should().Be(5);
@@ -280,5 +292,33 @@ public sealed class ConfigLoadingTests : IDisposable
         resources.MaxOpenBaselineReaders.Should().Be(2);
         resources.MaxOpenOverlayReaders.Should().Be(2);
         resources.StorageReaderIdleSeconds.Should().Be(60);
+    }
+
+    [Fact]
+    public void RepositoryDefaults_UseStrictCompatibleSeeding()
+    {
+        var repository = new RepositoryConfig(".");
+
+        repository.BranchSeedMode.Should().Be("closestCompatible");
+        repository.BranchSeedCandidateCount.Should().Be(3);
+        repository.BranchSeedMinimumSimilarity.Should().Be(0.60);
+        repository.StrictGenerationPublish.Should().BeTrue();
+        repository.ServePreviousIndexWhileUpdating.Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData(-0.01)]
+    [InlineData(1.01)]
+    public void LoadConfig_InvalidSeedSimilarity_IsRejected(double similarity)
+    {
+        var configPath = Path.Combine(_tempDir, "codemap.json");
+        File.WriteAllText(configPath, $$"""
+            { "repositories": [{ "root": ".", "branchSeedMinimumSimilarity": {{similarity.ToString(System.Globalization.CultureInfo.InvariantCulture)}} }] }
+            """);
+
+        var act = () => RuntimeConfiguration.LoadConfig(configPath);
+
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*branchSeedMinimumSimilarity*");
     }
 }

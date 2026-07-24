@@ -80,24 +80,23 @@ public sealed class WorkspaceStickyRegistryTests
     }
 
     [Fact]
-    public void SolutionSpecificWorkspace_WinsForThatSolutionOnly()
+    public void SolutionLookup_FallsBackToManualSticky_WhenRollingIsNotManaged()
     {
         var r = new WorkspaceStickyRegistry();
         var first = SolutionId.From("solution-first");
         var second = SolutionId.From("solution-second");
         r.Set("/repo", "fallback");
-        r.Set("/repo", first, "first-workspace");
 
-        r.Get("/repo", first).Should().Be("first-workspace");
+        r.Get("/repo", first).Should().Be("fallback");
         r.Get("/repo", second).Should().Be("fallback");
     }
 
     [Fact]
-    public void Clear_RemovesMatchingSolutionSpecificWorkspace()
+    public void Clear_RemovesManualWorkspace_ForSolutionLookup()
     {
         var r = new WorkspaceStickyRegistry();
         var solution = SolutionId.From("solution-first");
-        r.Set("/repo", solution, "workspace");
+        r.Set("/repo", "workspace");
 
         r.Clear("/repo", "workspace");
 

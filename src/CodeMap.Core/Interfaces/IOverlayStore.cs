@@ -22,6 +22,17 @@ public interface IOverlayStore
         CancellationToken ct = default);
 
     /// <summary>
+    /// Creates an isolated target overlay from one immutable source revision.
+    /// The operation fails if the source revision changed or the target exists.
+    /// </summary>
+    Task ForkOverlayAsync(
+        RepoId repoId,
+        WorkspaceId sourceWorkspaceId,
+        int sourceRevision,
+        WorkspaceId targetWorkspaceId,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// Applies a delta to the overlay: upserts files/symbols/refs from changed files,
     /// records deleted symbol IDs, and increments the revision counter.
     /// All writes are performed in a single transaction.
@@ -122,6 +133,13 @@ public interface IOverlayStore
     Task<IReadOnlySet<FilePath>> GetOverlayFilePathsAsync(
         RepoId repoId,
         WorkspaceId workspaceId,
+        CancellationToken ct = default);
+
+    /// <summary>Returns overlay symbols whose authoritative source is the requested file.</summary>
+    Task<IReadOnlyList<SymbolCard>> GetOverlaySymbolsByFileAsync(
+        RepoId repoId,
+        WorkspaceId workspaceId,
+        FilePath filePath,
         CancellationToken ct = default);
 
     /// <summary>

@@ -110,6 +110,55 @@ public class WorkspaceManager
             new CreateWorkspaceResponse(workspaceId, baselineCommitSha, persistedRevision));
     }
 
+    /// <summary>
+    /// Forks a registered workspace at its exact current revision into a new,
+    /// independently mutable workspace.
+    /// </summary>
+    public virtual async Task<Result<CreateWorkspaceResponse, CodeMapError>> ForkWorkspaceAsync(
+        RepoId repoId,
+        WorkspaceId sourceWorkspaceId,
+        int sourceRevision,
+        WorkspaceId targetWorkspaceId,
+        CancellationToken ct = default)
+    {
+        if (!_registry.TryGetValue((repoId, sourceWorkspaceId), out var source))
+            return Result<CreateWorkspaceResponse, CodeMapError>.Failure(
+                CodeMapError.NotFound("Workspace", sourceWorkspaceId.Value));
+        if (source.CurrentRevision != sourceRevision)
+            return Result<CreateWorkspaceResponse, CodeMapError>.Failure(
+                CodeMapError.InvalidArgument(
+                    $"Source workspace revision changed: expected {sourceRevision}, current {source.CurrentRevision}."));
+        if (_registry.ContainsKey((repoId, targetWorkspaceId)))
+            return Result<CreateWorkspaceResponse, CodeMapError>.Failure(
+                CodeMapError.InvalidArgument("Target workspace already exists."));
+
+        await _overlayStore.ForkOverlayAsync(
+            repoId,
+            sourceWorkspaceId,
+            sourceRevision,
+            targetWorkspaceId,
+            ct).ConfigureAwait(false);
+
+        var target = source with
+        {
+            WorkspaceId = targetWorkspaceId,
+            CreatedAt = DateTimeOffset.UtcNow,
+        };
+        if (!_registry.TryAdd((repoId, targetWorkspaceId), target))
+        {
+            await _overlayStore.DeleteOverlayAsync(repoId, targetWorkspaceId, ct)
+                .ConfigureAwait(false);
+            return Result<CreateWorkspaceResponse, CodeMapError>.Failure(
+                CodeMapError.InvalidArgument("Target workspace was registered concurrently."));
+        }
+
+        return Result<CreateWorkspaceResponse, CodeMapError>.Success(
+            new CreateWorkspaceResponse(
+                targetWorkspaceId,
+                target.BaselineCommitSha,
+                target.CurrentRevision));
+    }
+
     // ── RefreshOverlayAsync ───────────────────────────────────────────────────
 
     /// <summary>
@@ -127,7 +176,40 @@ public class WorkspaceManager
         RepoId repoId,
         WorkspaceId workspaceId,
         IReadOnlyList<FilePath>? explicitFilePaths,
-        CancellationToken ct = default)
+        CancellationToken ct = default) =>
+        await RefreshOverlayCoreAsync(
+            repoId,
+            workspaceId,
+            explicitFilePaths,
+            explicitChanges: null,
+            seedWorkspaceId: null,
+            ct).ConfigureAwait(false);
+
+    /// <summary>
+    /// Refreshes a fork using explicit Git changes and computes removals against
+    /// the merged seed view rather than the original baseline alone.
+    /// </summary>
+    public virtual async Task<Result<RefreshOverlayResponse, CodeMapError>> RefreshSeededOverlayAsync(
+        RepoId repoId,
+        WorkspaceId workspaceId,
+        IReadOnlyList<FileChange> changes,
+        WorkspaceId seedWorkspaceId,
+        CancellationToken ct = default) =>
+        await RefreshOverlayCoreAsync(
+            repoId,
+            workspaceId,
+            explicitFilePaths: null,
+            explicitChanges: changes,
+            seedWorkspaceId,
+            ct).ConfigureAwait(false);
+
+    private async Task<Result<RefreshOverlayResponse, CodeMapError>> RefreshOverlayCoreAsync(
+        RepoId repoId,
+        WorkspaceId workspaceId,
+        IReadOnlyList<FilePath>? explicitFilePaths,
+        IReadOnlyList<FileChange>? explicitChanges,
+        WorkspaceId? seedWorkspaceId,
+        CancellationToken ct)
     {
         var refreshTimer = Stopwatch.StartNew();
         TimeSpan gitDiffTime = TimeSpan.Zero;
@@ -140,7 +222,25 @@ public class WorkspaceManager
         List<FilePath> changedFiles;
         List<FilePath> deletedFiles;
 
-        if (explicitFilePaths is { Count: > 0 })
+        if (explicitChanges is not null)
+        {
+            changedFiles = explicitChanges
+                .Where(change => change.Kind != FileChangeKind.Deleted)
+                .Select(change => change.FilePath)
+                .Distinct(RepositoryPath.FilePathComparer)
+                .ToList();
+            deletedFiles = explicitChanges
+                .Where(change => change.Kind == FileChangeKind.Deleted)
+                .Select(change => change.FilePath)
+                .Concat(explicitChanges
+                    .Where(change =>
+                        change.Kind == FileChangeKind.Renamed &&
+                        change.OldFilePath.HasValue)
+                    .Select(change => change.OldFilePath!.Value))
+                .Distinct(RepositoryPath.FilePathComparer)
+                .ToList();
+        }
+        else if (explicitFilePaths is { Count: > 0 })
         {
             changedFiles = explicitFilePaths
                 .Distinct(RepositoryPath.FilePathComparer)
@@ -200,8 +300,55 @@ public class WorkspaceManager
             delta = OverlayDelta.Empty(currentRevision + 1);
         }
 
-        // 6. Handle deleted files — gather baseline symbols from those files
-        if (deletedFiles.Count > 0)
+        // 6. Compare against the actual prior merged view for a fork. A seed may
+        // contain symbols that never existed in the original baseline.
+        if (seedWorkspaceId.HasValue)
+        {
+            var seedFiles = await _overlayStore.GetOverlayFilePathsAsync(
+                repoId,
+                seedWorkspaceId.Value,
+                ct).ConfigureAwait(false);
+            var priorDeletedIds = new List<SymbolId>();
+            foreach (var path in changedFiles.Concat(deletedFiles)
+                         .Distinct(RepositoryPath.FilePathComparer))
+            {
+                IReadOnlyList<SymbolCard> previous;
+                if (seedFiles.Contains(path))
+                {
+                    previous = await _overlayStore.GetOverlaySymbolsByFileAsync(
+                        repoId,
+                        seedWorkspaceId.Value,
+                        path,
+                        ct).ConfigureAwait(false);
+                }
+                else
+                {
+                    previous = await _baselineStore.GetSymbolsByFileAsync(
+                        repoId,
+                        info.BaselineCommitSha,
+                        path,
+                        ct).ConfigureAwait(false);
+                }
+
+                var currentIds = delta.AddedOrUpdatedSymbols
+                    .Where(symbol => RepositoryPath.FilePathComparer.Equals(symbol.FilePath, path))
+                    .Select(symbol => symbol.SymbolId)
+                    .ToHashSet();
+                priorDeletedIds.AddRange(previous
+                    .Select(symbol => symbol.SymbolId)
+                    .Where(symbolId => !currentIds.Contains(symbolId)));
+            }
+            delta = delta with
+            {
+                DeletedSymbolIds = delta.DeletedSymbolIds
+                    .Concat(priorDeletedIds)
+                    .Distinct()
+                    .ToList(),
+            };
+        }
+
+        // 6b. Handle deleted files without a seed by gathering baseline symbols.
+        if (deletedFiles.Count > 0 && !seedWorkspaceId.HasValue)
         {
             var extraDeletedIds = new List<SymbolId>();
             foreach (var deletedFile in deletedFiles)
@@ -218,6 +365,16 @@ public class WorkspaceManager
                     .Concat(extraDeletedIds)
                     .Distinct()
                     .ToList(),
+                DeletedReferenceFiles = delta.DeletedReferenceFiles
+                    .Concat(deletedFiles)
+                    .Distinct(RepositoryPath.FilePathComparer)
+                    .ToList(),
+            };
+        }
+        else if (deletedFiles.Count > 0)
+        {
+            delta = delta with
+            {
                 DeletedReferenceFiles = delta.DeletedReferenceFiles
                     .Concat(deletedFiles)
                     .Distinct(RepositoryPath.FilePathComparer)

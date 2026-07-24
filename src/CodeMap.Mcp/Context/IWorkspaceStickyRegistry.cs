@@ -1,5 +1,6 @@
 namespace CodeMap.Mcp.Context;
 
+using CodeMap.Core.Models;
 using CodeMap.Core.Types;
 
 /// <summary>
@@ -19,9 +20,6 @@ public interface IWorkspaceStickyRegistry
     /// <summary>Records <paramref name="workspaceId"/> as the sticky default for <paramref name="repoPath"/>.</summary>
     void Set(string repoPath, string workspaceId);
 
-    /// <summary>Records a rolling workspace for one repository solution.</summary>
-    void Set(string repoPath, SolutionId solutionId, string workspaceId);
-
     /// <summary>
     /// Clears the sticky default for <paramref name="repoPath"/> if and only if it currently
     /// equals <paramref name="workspaceId"/>. No-op otherwise — prevents <c>workspace.delete</c>
@@ -32,8 +30,11 @@ public interface IWorkspaceStickyRegistry
     /// <summary>Returns the sticky workspace for <paramref name="repoPath"/>, or null if none.</summary>
     string? Get(string repoPath);
 
-    /// <summary>Returns the solution-specific workspace, falling back to the repository default.</summary>
+    /// <summary>Returns the active rolling-generation workspace, falling back to the manual default.</summary>
     string? Get(string repoPath, SolutionId solutionId);
+
+    /// <summary>Returns rolling-generation availability without changing manual stickiness.</summary>
+    RollingGenerationResolution Resolve(string repoPath, SolutionId solutionId);
 
     /// <summary>Registers a lightweight callback used to prioritize explicitly queried rolling solutions.</summary>
     void SetSolutionRequestedCallback(Action<string, SolutionId>? callback);

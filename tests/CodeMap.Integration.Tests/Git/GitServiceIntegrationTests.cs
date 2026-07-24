@@ -86,6 +86,47 @@ public class GitServiceIntegrationTests
         result.Should().Be(defaultBranch);
     }
 
+    [Fact]
+    public async Task RepositorySnapshot_TracksBranchHeadAndWorkingTree()
+    {
+        using var repo = TempGitRepo.Create();
+        var head = repo.CommitFile("src/App.cs", "class App {}");
+        var service = CreateService();
+
+        var clean = await service.GetRepositorySnapshotAsync(repo.Path);
+        repo.ModifyFile("src/App.cs", "class App { void Changed() {} }");
+        var dirty = await service.GetRepositorySnapshotAsync(repo.Path);
+
+        clean.HeadCommit.Value.Should().Be(head);
+        dirty.HeadCommit.Should().Be(clean.HeadCommit);
+        dirty.Branch.Should().Be(clean.Branch);
+        dirty.WorkingTreeFingerprint.Should().NotBe(clean.WorkingTreeFingerprint);
+
+        var inputs = await service.GetInputFingerprintsAsync(
+            repo.Path,
+            dirty,
+            ["src/App.cs"]);
+        inputs["src/App.cs"].Should().NotBe("missing");
+        inputs["src/App.cs"].Should().NotBe(clean.WorkingTreeFingerprint);
+    }
+
+    [Fact]
+    public async Task RepositorySnapshot_SameCommitOnAnotherBranch_IsDistinctTarget()
+    {
+        using var repo = TempGitRepo.Create();
+        repo.CommitFile("README.md", "content");
+        var service = CreateService();
+        var first = await service.GetRepositorySnapshotAsync(repo.Path);
+
+        repo.CreateBranch("parallel-work");
+        var second = await service.GetRepositorySnapshotAsync(repo.Path);
+
+        second.HeadCommit.Should().Be(first.HeadCommit);
+        second.WorkingTreeFingerprint.Should().Be(first.WorkingTreeFingerprint);
+        second.Branch.Should().NotBe(first.Branch);
+        second.HasSameTarget(first).Should().BeFalse();
+    }
+
     // ===== Multiple Remotes =====
 
     [Fact]

@@ -14,11 +14,111 @@ using Microsoft.Extensions.Logging;
 /// </summary>
 public sealed class GitService : IGitService
 {
+    private const int SnapshotCaptureAttempts = 3;
+    private const string MissingInputHash = "missing";
     private readonly ILogger<GitService> _logger;
 
     public GitService(ILogger<GitService> logger)
     {
         _logger = logger;
+    }
+
+    /// <inheritdoc/>
+    public Task<RepositorySnapshot> GetRepositorySnapshotAsync(
+        string repoPath,
+        CancellationToken ct = default)
+    {
+        string validatedPath = GitPathValidator.ValidateAndNormalize(repoPath);
+
+        for (var attempt = 1; attempt <= SnapshotCaptureAttempts; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            using var repo = new Repository(validatedPath);
+            if (repo.Head.Tip is null)
+                throw new InvalidOperationException("Repository has no commits (unborn HEAD).");
+
+            var repoId = DeriveRepoId(repo);
+            var branchBefore = GetBranch(repo);
+            var headBefore = repo.Head.Tip.Sha;
+            var fingerprintBefore = ComputeWorkingTreeFingerprint(repo, ct);
+            var branchAfter = GetBranch(repo);
+            var headAfter = repo.Head.Tip?.Sha;
+            var fingerprintAfter = ComputeWorkingTreeFingerprint(repo, ct);
+
+            if (string.Equals(branchBefore, branchAfter, StringComparison.Ordinal) &&
+                string.Equals(headBefore, headAfter, StringComparison.Ordinal) &&
+                string.Equals(fingerprintBefore, fingerprintAfter, StringComparison.Ordinal))
+            {
+                var generationSource = string.Join(
+                    '\n',
+                    repoId.Value,
+                    branchBefore,
+                    headBefore,
+                    fingerprintBefore,
+                    Guid.NewGuid().ToString("N"));
+                return Task.FromResult(new RepositorySnapshot(
+                    repoId,
+                    branchBefore,
+                    CommitSha.From(headBefore),
+                    fingerprintBefore,
+                    DateTimeOffset.UtcNow,
+                    Sha256Hex(generationSource)[..32]));
+            }
+        }
+
+        throw new InvalidOperationException(
+            "Repository state changed repeatedly while capturing a consistent snapshot.");
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyDictionary<string, string>> GetInputFingerprintsAsync(
+        string repoPath,
+        RepositorySnapshot snapshot,
+        IReadOnlyCollection<string> repositoryRelativePaths,
+        CancellationToken ct = default)
+    {
+        string validatedPath = GitPathValidator.ValidateAndNormalize(repoPath);
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        using (var repo = new Repository(validatedPath))
+        {
+            EnsureSnapshotHead(repo, snapshot);
+            var changedPaths = repo.RetrieveStatus(new StatusOptions
+                {
+                    IncludeUntracked = true,
+                    RecurseUntrackedDirs = true,
+                })
+                .Select(entry => NormalizeGitPath(entry.FilePath))
+                .ToHashSet(StringComparer.Ordinal);
+
+            foreach (var requestedPath in repositoryRelativePaths
+                         .Select(NormalizeGitPath)
+                         .Distinct(StringComparer.Ordinal)
+                         .OrderBy(path => path, StringComparer.Ordinal))
+            {
+                ct.ThrowIfCancellationRequested();
+                var worktreePath = ResolveRepositoryFile(validatedPath, requestedPath);
+                if (changedPaths.Contains(requestedPath))
+                {
+                    result[requestedPath] = File.Exists(worktreePath)
+                        ? HashFile(worktreePath, ct)
+                        : MissingInputHash;
+                    continue;
+                }
+
+                var entry = repo.Head.Tip?[requestedPath];
+                result[requestedPath] = entry?.Target is Blob blob
+                    ? blob.Id.Sha
+                    : MissingInputHash;
+            }
+        }
+
+        var revalidated = await GetRepositorySnapshotAsync(repoPath, ct).ConfigureAwait(false);
+        if (!snapshot.HasSameTarget(revalidated))
+            throw new InvalidOperationException(
+                "Repository state changed while reading solution input fingerprints.");
+
+        return result;
     }
 
     /// <inheritdoc/>
@@ -255,6 +355,93 @@ public sealed class GitService : IGitService
     {
         byte[] bytes = SHA256.HashData(Encoding.UTF8.GetBytes(input));
         return Convert.ToHexStringLower(bytes);
+    }
+
+    private static string GetBranch(Repository repo) =>
+        repo.Info.IsHeadDetached || repo.Head.FriendlyName == "(no branch)"
+            ? "HEAD"
+            : repo.Head.FriendlyName;
+
+    private static string ComputeWorkingTreeFingerprint(
+        Repository repo,
+        CancellationToken ct)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var status = repo.RetrieveStatus(new StatusOptions
+            {
+                IncludeUntracked = true,
+                RecurseUntrackedDirs = true,
+            })
+            .OrderBy(entry => entry.FilePath, StringComparer.Ordinal)
+            .ToList();
+
+        foreach (var entry in status)
+        {
+            ct.ThrowIfCancellationRequested();
+            var path = NormalizeGitPath(entry.FilePath);
+            AppendHashText(hash, path);
+            AppendHashText(hash, ((int)entry.State).ToString(System.Globalization.CultureInfo.InvariantCulture));
+            AppendHashText(hash, repo.Index[path]?.Id.Sha ?? MissingInputHash);
+
+            var fullPath = ResolveRepositoryFile(repo.Info.WorkingDirectory, path);
+            AppendHashText(hash, File.Exists(fullPath) ? HashFile(fullPath, ct) : MissingInputHash);
+        }
+
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
+    }
+
+    private static void EnsureSnapshotHead(Repository repo, RepositorySnapshot snapshot)
+    {
+        if (repo.Head.Tip is null ||
+            !string.Equals(repo.Head.Tip.Sha, snapshot.HeadCommit.Value, StringComparison.Ordinal) ||
+            !string.Equals(GetBranch(repo), snapshot.Branch, StringComparison.Ordinal) ||
+            DeriveRepoId(repo) != snapshot.RepoId)
+        {
+            throw new InvalidOperationException(
+                "Repository branch or HEAD no longer matches the captured snapshot.");
+        }
+    }
+
+    private static string NormalizeGitPath(string path) =>
+        path.Replace('\\', '/').TrimStart('/');
+
+    private static string ResolveRepositoryFile(string repositoryRoot, string relativePath)
+    {
+        var root = Path.GetFullPath(repositoryRoot)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var fullPath = Path.GetFullPath(Path.Combine(
+            root,
+            relativePath.Replace('/', Path.DirectorySeparatorChar)));
+        if (!fullPath.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Repository-relative input path escapes the repository root.");
+        return fullPath;
+    }
+
+    private static string HashFile(string path, CancellationToken ct)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            64 * 1024,
+            FileOptions.SequentialScan);
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var buffer = new byte[64 * 1024];
+        int read;
+        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            ct.ThrowIfCancellationRequested();
+            hash.AppendData(buffer, 0, read);
+        }
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
+    }
+
+    private static void AppendHashText(IncrementalHash hash, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value);
+        hash.AppendData(bytes);
+        hash.AppendData([0]);
     }
 
     private static FileChangeKind MapChangeKind(ChangeKind kind) => kind switch

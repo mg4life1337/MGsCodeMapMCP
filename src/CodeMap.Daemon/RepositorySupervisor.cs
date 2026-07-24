@@ -121,7 +121,10 @@ public sealed class RepositorySupervisor : BackgroundService
                     repository.AutoIndex, repository.WatchGitHead, repository.WatchIntervalSeconds,
                     repository.IndexMode, repository.UpdateStrategy,
                     repository.SkipUnaffectedSolutions, repository.RetentionDays,
-                    repository.MaxRollingBranches, repository.FullRebuildChangeThreshold));
+                    repository.MaxRollingBranches, repository.FullRebuildChangeThreshold,
+                    repository.BranchSeedMode, repository.BranchSeedCandidateCount,
+                    repository.BranchSeedMinimumSimilarity, repository.StrictGenerationPublish,
+                    repository.ServePreviousIndexWhileUpdating));
         }
 
         foreach (var rootConfig in _runtime.Config.RepositoryRoots ?? [])
@@ -145,7 +148,10 @@ public sealed class RepositorySupervisor : BackgroundService
                         rootConfig.AutoIndex, rootConfig.WatchGitHead, rootConfig.WatchIntervalSeconds,
                         rootConfig.IndexMode, rootConfig.UpdateStrategy,
                         rootConfig.SkipUnaffectedSolutions, rootConfig.RetentionDays,
-                        rootConfig.MaxRollingBranches, rootConfig.FullRebuildChangeThreshold));
+                        rootConfig.MaxRollingBranches, rootConfig.FullRebuildChangeThreshold,
+                        rootConfig.BranchSeedMode, rootConfig.BranchSeedCandidateCount,
+                        rootConfig.BranchSeedMinimumSimilarity, rootConfig.StrictGenerationPublish,
+                        rootConfig.ServePreviousIndexWhileUpdating));
             }
         }
 
@@ -163,9 +169,12 @@ public sealed class RepositorySupervisor : BackgroundService
         var first = targets[0];
         try
         {
-            var head = await _git.GetCurrentCommitAsync(first.RepositoryPath, ct).ConfigureAwait(false);
-            var branch = await _git.GetCurrentBranchAsync(first.RepositoryPath, ct).ConfigureAwait(false);
-            var observation = branch + "\n" + head.Value;
+            var snapshot = await _git.GetRepositorySnapshotAsync(
+                first.RepositoryPath,
+                ct).ConfigureAwait(false);
+            var observation = snapshot.Branch + "\n" +
+                              snapshot.HeadCommit.Value + "\n" +
+                              snapshot.WorkingTreeFingerprint;
             var firstObservation = !_lastScheduledRepositoryState.TryGetValue(first.RepositoryPath, out var previous);
             var changed = !firstObservation && !string.Equals(previous, observation, StringComparison.Ordinal);
             _lastScheduledRepositoryState[first.RepositoryPath] = observation;
@@ -173,8 +182,8 @@ public sealed class RepositorySupervisor : BackgroundService
 
             _rolling.Schedule(new RollingRepositoryRequest(
                 first.RepositoryPath,
-                branch,
-                head,
+                snapshot.Branch,
+                snapshot.HeadCommit,
                 targets.Select(target => new RollingSolutionTarget(
                     target.SolutionPath,
                     SolutionId.GetRepositoryRelativePath(target.RepositoryPath, target.SolutionPath),
@@ -184,7 +193,13 @@ public sealed class RepositorySupervisor : BackgroundService
                 first.SkipUnaffectedSolutions,
                 first.RetentionDays,
                 first.MaxRollingBranches,
-                first.FullRebuildChangeThreshold));
+                first.FullRebuildChangeThreshold,
+                snapshot,
+                first.BranchSeedMode,
+                first.BranchSeedCandidateCount,
+                first.BranchSeedMinimumSimilarity,
+                first.StrictGenerationPublish,
+                first.ServePreviousIndexWhileUpdating));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -303,7 +318,12 @@ public sealed class RepositorySupervisor : BackgroundService
         bool skipUnaffectedSolutions,
         int retentionDays,
         int maxRollingBranches,
-        int fullRebuildChangeThreshold) =>
+        int fullRebuildChangeThreshold,
+        string branchSeedMode,
+        int branchSeedCandidateCount,
+        double branchSeedMinimumSimilarity,
+        bool strictGenerationPublish,
+        bool servePreviousIndexWhileUpdating) =>
         new(
             repositoryRoot,
             solution,
@@ -316,7 +336,12 @@ public sealed class RepositorySupervisor : BackgroundService
             skipUnaffectedSolutions,
             Math.Max(1, retentionDays),
             Math.Max(1, maxRollingBranches),
-            Math.Max(1, fullRebuildChangeThreshold));
+            Math.Max(1, fullRebuildChangeThreshold),
+            branchSeedMode,
+            Math.Max(1, branchSeedCandidateCount),
+            branchSeedMinimumSimilarity,
+            strictGenerationPublish,
+            servePreviousIndexWhileUpdating);
 
     private static void AddTarget(
         IDictionary<string, RepositorySolutionTarget> targets,
@@ -335,7 +360,12 @@ internal sealed record RepositorySolutionTarget(
     bool SkipUnaffectedSolutions,
     int RetentionDays,
     int MaxRollingBranches,
-    int FullRebuildChangeThreshold)
+    int FullRebuildChangeThreshold,
+    string BranchSeedMode,
+    int BranchSeedCandidateCount,
+    double BranchSeedMinimumSimilarity,
+    bool StrictGenerationPublish,
+    bool ServePreviousIndexWhileUpdating)
 {
     public string Key => $"{Path.GetFullPath(RepositoryPath)}|{Path.GetFullPath(SolutionPath)}";
 }

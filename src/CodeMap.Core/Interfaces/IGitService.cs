@@ -10,6 +10,38 @@ using CodeMap.Core.Types;
 public interface IGitService
 {
     /// <summary>
+    /// Captures branch, HEAD and local index/worktree state as one consistency boundary.
+    /// Implementations must not invoke an external Git process or perform network I/O.
+    /// </summary>
+    async Task<RepositorySnapshot> GetRepositorySnapshotAsync(
+        string repoPath,
+        CancellationToken ct = default)
+    {
+        var repoId = await GetRepoIdentityAsync(repoPath, ct).ConfigureAwait(false);
+        var branch = await GetCurrentBranchAsync(repoPath, ct).ConfigureAwait(false);
+        var head = await GetCurrentCommitAsync(repoPath, ct).ConfigureAwait(false);
+        return new RepositorySnapshot(
+            repoId,
+            branch,
+            head,
+            await IsCleanAsync(repoPath, ct).ConfigureAwait(false) ? "clean" : "dirty",
+            DateTimeOffset.UtcNow,
+            Guid.NewGuid().ToString("N"));
+    }
+
+    /// <summary>
+    /// Gets content identities for repository-relative paths at an already captured target.
+    /// Missing inputs are represented by a stable deletion marker.
+    /// </summary>
+    Task<IReadOnlyDictionary<string, string>> GetInputFingerprintsAsync(
+        string repoPath,
+        RepositorySnapshot snapshot,
+        IReadOnlyCollection<string> repositoryRelativePaths,
+        CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyDictionary<string, string>>(
+            new Dictionary<string, string>(StringComparer.Ordinal));
+
+    /// <summary>
     /// Gets a stable identifier for the repository.
     /// Derived from the first remote URL, or a hash of the absolute path if no remote.
     /// </summary>

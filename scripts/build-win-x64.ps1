@@ -60,7 +60,9 @@ foreach ($file in @("codemap.example.json", "README.md", "LICENSE.MD", "THIRD-PA
     Copy-Item -LiteralPath (Join-Path $repoRoot $file) -Destination $releaseDir
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "docs") | Out-Null
-foreach ($doc in @("CENTRAL-DAEMON.MD", "WINDOWS-INSTALLATION.MD", "ROLLING-BRANCH-INDEXING.MD")) {
+foreach ($doc in @(
+    "CENTRAL-DAEMON.MD", "WINDOWS-INSTALLATION.MD",
+    "ROLLING-BRANCH-INDEXING.MD", "ROLLING-GENERATIONS.md")) {
     Copy-Item -LiteralPath (Join-Path $repoRoot "docs\$doc") -Destination (Join-Path $releaseDir "docs")
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "scripts") | Out-Null

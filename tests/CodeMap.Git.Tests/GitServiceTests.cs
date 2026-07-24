@@ -8,6 +8,14 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 public class GitServiceTests
 {
+    [Fact]
+    public void ProductAssembly_DoesNotReferenceProcessExecution()
+    {
+        typeof(GitService).Assembly.GetReferencedAssemblies()
+            .Should().NotContain(reference =>
+                reference.Name == "System.Diagnostics.Process");
+    }
+
     private static GitService CreateService() =>
         new(NullLogger<GitService>.Instance);
 

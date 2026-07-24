@@ -217,7 +217,17 @@ public sealed class McpServer
         }
 
         var arguments = @params?["arguments"] as JsonObject;
-        var toolResult = await tool.Handler(arguments, ct).ConfigureAwait(false);
+        ToolCallResult toolResult;
+        try
+        {
+            toolResult = await tool.Handler(arguments, ct).ConfigureAwait(false);
+        }
+        catch (RollingGenerationUnavailableException ex)
+        {
+            toolResult = new ToolCallResult(
+                JsonSerializer.Serialize(ex.Error, Serialization.CodeMapJsonOptions.Default),
+                IsError: true);
+        }
 
         return BuildSuccess(id, new JsonObject
         {

@@ -18,6 +18,12 @@ public static class ErrorCodes
     /// <summary>No baseline index exists for the requested repo + commit. Retryable after indexing.</summary>
     public const string IndexNotAvailable = "INDEX_NOT_AVAILABLE";
 
+    /// <summary>The requested target is currently being assembled and is not published yet.</summary>
+    public const string IndexUpdating = "INDEX_UPDATING";
+
+    /// <summary>No complete generation has been published for the requested target.</summary>
+    public const string IndexNotReady = "INDEX_NOT_READY";
+
     /// <summary>A workspace-scoped operation was attempted without providing a workspace ID.</summary>
     public const string WorkspaceRequired = "WORKSPACE_REQUIRED";
 

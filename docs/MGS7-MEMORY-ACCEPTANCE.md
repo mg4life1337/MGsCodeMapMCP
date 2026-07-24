@@ -1,8 +1,8 @@
 # 2.8.0-mgs.7 Windows memory acceptance
 
 Measured on 2026-07-24 on Windows with 31.84 GB physical memory, .NET 10,
-`maxConcurrentIndexes=1`, `maxParallelProjects=2`, and the default mgs.7
-reader/reclaim settings.
+`maxConcurrentIndexes=1`, `maxConcurrentIncrementalSolutions=2`,
+`maxParallelProjects=2`, and the default mgs.7 reader/reclaim settings.
 
 ## Workload
 
@@ -97,8 +97,31 @@ Multiple MCP sessions were used during the test. A second daemon targeting the
 same data directory exited with code 17, and the primary daemon stopped
 gracefully through `/shutdown`.
 
+## Atomic generation and exact-seed verification
+
+The rolling-generation implementation was also exercised against an isolated
+discovery root containing 10 Git repository instances and 38 Solutions.
+Publication produced 10 path-scoped active-generation pointers and complete
+bindings for all 38 Solutions, with no failed repository generation.
+
+On an unchanged restart, all 38 bindings used the exact immutable seed:
+
+- reused bindings: 38
+- full rebuilds: 0
+- incremental refreshes: 0
+- exact-seed fallback failures: 0
+- slowest individual repository generation: 4.67 seconds
+- complete 10-repository startup to ready: 14.88 seconds
+- peak working set: 0.98 GB
+- peak private bytes: 1.05 GB
+
+The same-remote/different-folder regression test confirms that each local
+repository instance has its own durable active-generation pointer. A separate
+retention regression test confirms that Solution-state cleanup cannot remove
+repository-generation history.
+
 ## Verification
 
 The final Release build completed with 0 warnings and 0 errors. The complete
-Release test suite passed 1,875 tests with 0 failures and 0 skips; the benchmark
+Release test suite passed 1,901 tests with 0 failures and 0 skips; the benchmark
 assembly also completed successfully.

@@ -1,5 +1,6 @@
 namespace CodeMap.Roslyn;
 
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
@@ -26,11 +27,16 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
     private readonly ILogger<IncrementalCompiler> _logger;
     private readonly RuntimeActivityTracker? _activity;
 
-    // Workspace caching — protects cached solutions from concurrent callers.
+    // Metadata access and shutdown serialization.
     private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly SemaphoreSlim _incrementalGate;
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _solutionLocks =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _cacheSync = new();
     private readonly Dictionary<string, CacheEntry> _solutionCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly LinkedList<string> _lru = new();
     private readonly int _maxCachedSolutions;
+    private readonly int _maxConcurrentIncrementalSolutions;
     private readonly TimeSpan _cacheIdleTime;
     private readonly TimeProvider _timeProvider;
     private readonly Timer _cacheTrimTimer;
@@ -58,6 +64,11 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
         _activity = activity;
         var effectiveResources = resources ?? new IndexingResourceConfig();
         _maxCachedSolutions = effectiveResources.IncrementalSolutionCacheSize;
+        _maxConcurrentIncrementalSolutions =
+            effectiveResources.MaxConcurrentIncrementalSolutions;
+        _incrementalGate = new SemaphoreSlim(
+            _maxConcurrentIncrementalSolutions,
+            _maxConcurrentIncrementalSolutions);
         _cacheIdleTime = TimeSpan.FromMinutes(effectiveResources.IncrementalSolutionCacheIdleMinutes);
         _timeProvider = timeProvider ?? TimeProvider.System;
         _cacheTrimTimer = new Timer(TrimIdleCache, null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
@@ -81,6 +92,9 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
         int currentRevision,
         CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(
+            Volatile.Read(ref _disposed) != 0,
+            this);
         if (changedFiles.Count == 0)
         {
             _logger.LogDebug("No changed files — returning empty delta");
@@ -90,16 +104,26 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
         using var activityLease = _activity?.BeginIncrementalUpdate();
         MsBuildInitializer.EnsureRegistered();
 
-        await _lock.WaitAsync(ct);
+        string cacheKey = NormalizePath(Path.GetFullPath(solutionPath));
+        var solutionLock = _solutionLocks.GetOrAdd(cacheKey, _ => new SemaphoreSlim(1, 1));
+        await _incrementalGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            return await ComputeDeltaCoreAsync(
-                solutionPath, repoRootPath, changedFiles,
-                baselineStore, repoId, commitSha, currentRevision, ct);
+            await solutionLock.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                return await ComputeDeltaCoreAsync(
+                    solutionPath, repoRootPath, changedFiles,
+                    baselineStore, repoId, commitSha, currentRevision, ct);
+            }
+            finally
+            {
+                solutionLock.Release();
+            }
         }
         finally
         {
-            _lock.Release();
+            _incrementalGate.Release();
         }
     }
 
@@ -147,8 +171,13 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
             {
                 string absolute = NormalizePath(Path.GetFullPath(Path.Combine(repoRootPath, path.Value)));
                 string extension = Path.GetExtension(absolute).ToLowerInvariant();
-                return IsBuildInput(extension) ||
-                    (IsSourceFile(extension) && (!File.Exists(absolute) || !oldIndex.ContainsKey(absolute)));
+                if (IsSourceFile(extension) &&
+                    (!File.Exists(absolute) || !oldIndex.ContainsKey(absolute)))
+                {
+                    throw new IncrementalCompilationException(
+                        $"Changed source file is not mapped by the loaded solution: {path.Value}");
+                }
+                return IsBuildInput(extension);
             });
 
             if (structuralFallback)
@@ -214,13 +243,16 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
             {
                 string absolute = NormalizePath(Path.GetFullPath(Path.Combine(repoRootPath, changed.Value)));
                 string extension = Path.GetExtension(absolute).ToLowerInvariant();
-                if (!IsSourceFile(extension) || !File.Exists(absolute) ||
-                    !currentIndex.TryGetValue(absolute, out var documentIds))
+                if (!IsSourceFile(extension))
                 {
                     structuralFallback = true;
-                    fallbackReason = "cold-structural-or-unmapped-change";
+                    fallbackReason = "cold-structural-change";
                     continue;
                 }
+                if (!File.Exists(absolute) ||
+                    !currentIndex.TryGetValue(absolute, out var documentIds))
+                    throw new IncrementalCompilationException(
+                        $"Changed source file is not mapped by the loaded solution: {changed.Value}");
 
                 string? baselineContent = await baselineStore
                     .GetFileContentAsync(repoId, commitSha, changed, ct)
@@ -253,8 +285,11 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
                 string extension = Path.GetExtension(absolute).ToLowerInvariant();
                 if (!IsSourceFile(extension) || !currentDocumentIndex.TryGetValue(absolute, out var documentIds))
                 {
+                    if (IsSourceFile(extension))
+                        throw new IncrementalCompilationException(
+                            $"Changed source file is not mapped by the loaded solution: {changed.Value}");
                     structuralFallback = true;
-                    fallbackReason = "unsupported-or-unmapped-change";
+                    fallbackReason = "structural-change";
                     break;
                 }
 
@@ -315,11 +350,8 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
             ? solution.ProjectIds.ToHashSet()
             : directProjectIds;
         if (affectedProjectIds.Count == 0)
-        {
-            mode = IncrementalUpdateMode.Dependency;
-            fallbackReason = "no-owning-project";
-            affectedProjectIds = solution.ProjectIds.ToHashSet();
-        }
+            throw new IncrementalCompilationException(
+                "No owning project was found for one or more changed source files.");
 
         if (mode == IncrementalUpdateMode.Dependency)
         {
@@ -372,10 +404,8 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
             var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
             compilationTime += compileTimer.Elapsed;
             if (compilation is null)
-            {
-                _logger.LogWarning("Compilation returned null for project {Project}", group.CanonicalName);
-                continue;
-            }
+                throw new IncrementalCompilationException(
+                    $"Compilation returned null for project '{group.CanonicalName}'.");
 
             var extractTimer = Stopwatch.StartNew();
             var (projectSymbols, stableIds) = SymbolExtractor.ExtractAllWithStableIds(
@@ -489,19 +519,22 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
         try
         {
             var solution = await workspace.OpenSolutionAsync(solutionPath, cancellationToken: ct).ConfigureAwait(false);
-            if (_solutionCache.Remove(solutionPath, out var previous))
+            lock (_cacheSync)
             {
-                _lru.Remove(previous.LruNode);
-                previous.Workspace.Dispose();
-            }
+                if (_solutionCache.Remove(solutionPath, out var previous))
+                {
+                    _lru.Remove(previous.LruNode);
+                    previous.Workspace.Dispose();
+                }
 
-            var node = _lru.AddFirst(solutionPath);
-            var entry = new CacheEntry(workspace, solution, node, _timeProvider.GetUtcNow());
-            _solutionCache[solutionPath] = entry;
-            Volatile.Write(ref _cachedSolutionCount, _solutionCache.Count);
-            _mostRecent = entry;
-            EvictOldestSolutions();
-            return entry;
+                var node = _lru.AddFirst(solutionPath);
+                var entry = new CacheEntry(workspace, solution, node, _timeProvider.GetUtcNow());
+                _solutionCache[solutionPath] = entry;
+                Volatile.Write(ref _cachedSolutionCount, _solutionCache.Count);
+                _mostRecent = entry;
+                EvictOldestSolutions();
+                return entry;
+            }
         }
         catch
         {
@@ -512,27 +545,34 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
 
     private bool TryGetCached(string solutionPath, out CacheEntry? entry)
     {
-        if (!_solutionCache.TryGetValue(solutionPath, out entry))
+        lock (_cacheSync)
         {
-            Interlocked.Increment(ref _cacheMisses);
-            return false;
+            if (!_solutionCache.TryGetValue(solutionPath, out entry))
+            {
+                Interlocked.Increment(ref _cacheMisses);
+                return false;
+            }
+
+            Interlocked.Increment(ref _cacheHits);
+
+            _lru.Remove(entry.LruNode);
+            _lru.AddFirst(entry.LruNode);
+            entry.LastAccess = _timeProvider.GetUtcNow();
+            _mostRecent = entry;
+            return true;
         }
-
-        Interlocked.Increment(ref _cacheHits);
-
-        _lru.Remove(entry.LruNode);
-        _lru.AddFirst(entry.LruNode);
-        entry.LastAccess = _timeProvider.GetUtcNow();
-        _mostRecent = entry;
-        return true;
     }
 
     private void EvictOldestSolutions()
     {
-        while (_solutionCache.Count > _maxCachedSolutions && _lru.Last is { } last)
+        while (_solutionCache.Count > _maxCachedSolutions)
         {
-            string path = last.Value;
-            _lru.RemoveLast();
+            var candidate = _lru.Reverse().FirstOrDefault(path =>
+                _solutionCache[path].LeaseCount == 0 &&
+                (!_solutionLocks.TryGetValue(path, out var gate) || gate.CurrentCount > 0));
+            if (candidate is null) break;
+            string path = candidate;
+            _lru.Remove(path);
             if (!_solutionCache.Remove(path, out var entry))
                 continue;
             entry.Workspace.Dispose();
@@ -558,27 +598,33 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
 
     internal int TrimIdleSolutions(DateTimeOffset now)
     {
-        var removed = 0;
-        while (_lru.Last is { } last)
+        lock (_cacheSync)
         {
-            if (!_solutionCache.TryGetValue(last.Value, out var entry))
+            var removed = 0;
+            while (_lru.Last is { } last)
             {
-                _lru.RemoveLast();
-                continue;
-            }
-            if (now - entry.LastAccess < _cacheIdleTime) break;
+                if (!_solutionCache.TryGetValue(last.Value, out var entry))
+                {
+                    _lru.RemoveLast();
+                    continue;
+                }
+                if (entry.LeaseCount > 0 ||
+                    _solutionLocks.TryGetValue(last.Value, out var gate) && gate.CurrentCount == 0)
+                    break;
+                if (now - entry.LastAccess < _cacheIdleTime) break;
 
-            _lru.RemoveLast();
-            _solutionCache.Remove(last.Value);
-            entry.Workspace.Dispose();
-            Interlocked.Increment(ref _cacheEvictions);
-            if (ReferenceEquals(_mostRecent, entry)) _mostRecent = null;
-            removed++;
+                _lru.RemoveLast();
+                _solutionCache.Remove(last.Value);
+                entry.Workspace.Dispose();
+                Interlocked.Increment(ref _cacheEvictions);
+                if (ReferenceEquals(_mostRecent, entry)) _mostRecent = null;
+                removed++;
+            }
+            if (removed > 0)
+                _logger.LogInformation("Released {Count} idle incremental solution workspace(s)", removed);
+            Volatile.Write(ref _cachedSolutionCount, _solutionCache.Count);
+            return removed;
         }
-        if (removed > 0)
-            _logger.LogInformation("Released {Count} idle incremental solution workspace(s)", removed);
-        Volatile.Write(ref _cachedSolutionCount, _solutionCache.Count);
-        return removed;
     }
 
     internal int CachedSolutionCount => CachedSolutions;
@@ -705,13 +751,33 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
     /// </summary>
     internal async Task<Compilation?> GetMetadataCompilationAsync(CancellationToken ct = default)
     {
+        ObjectDisposedException.ThrowIf(
+            Volatile.Read(ref _disposed) != 0,
+            this);
         await _lock.WaitAsync(ct).ConfigureAwait(false);
+        CacheEntry? entry = null;
+        SemaphoreSlim? solutionGate = null;
+        var solutionGateAcquired = false;
         try
         {
-            var entry = _mostRecent;
-            var solution = entry?.Solution;
-            if (solution is null) return null;
-            entry!.LastAccess = _timeProvider.GetUtcNow();
+            string? solutionPath;
+            lock (_cacheSync)
+            {
+                entry = _mostRecent;
+                if (entry is null) return null;
+                solutionPath = _solutionCache
+                    .FirstOrDefault(pair => ReferenceEquals(pair.Value, entry))
+                    .Key;
+                if (solutionPath is null) return null;
+                entry.LeaseCount++;
+            }
+            solutionGate = _solutionLocks.GetOrAdd(
+                solutionPath,
+                _ => new SemaphoreSlim(1, 1));
+            await solutionGate.WaitAsync(ct).ConfigureAwait(false);
+            solutionGateAcquired = true;
+            var solution = entry.Solution;
+            entry.LastAccess = _timeProvider.GetUtcNow();
 
             foreach (var project in solution.Projects)
             {
@@ -731,6 +797,13 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
         }
         finally
         {
+            if (solutionGateAcquired)
+                solutionGate!.Release();
+            if (entry is not null)
+            {
+                lock (_cacheSync)
+                    entry.LeaseCount--;
+            }
             _lock.Release();
         }
     }
@@ -743,20 +816,28 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _cacheTrimTimer.Dispose();
+        for (var i = 0; i < _maxConcurrentIncrementalSolutions; i++)
+            _incrementalGate.Wait();
         _lock.Wait();
         try
         {
-            foreach (var entry in _solutionCache.Values)
-                entry.Workspace.Dispose();
-            _solutionCache.Clear();
-            Volatile.Write(ref _cachedSolutionCount, 0);
-            _lru.Clear();
-            _mostRecent = null;
+            lock (_cacheSync)
+            {
+                foreach (var entry in _solutionCache.Values)
+                    entry.Workspace.Dispose();
+                _solutionCache.Clear();
+                Volatile.Write(ref _cachedSolutionCount, 0);
+                _lru.Clear();
+                _mostRecent = null;
+            }
         }
         finally
         {
             _lock.Release();
             _lock.Dispose();
+            _incrementalGate.Dispose();
+            foreach (var gate in _solutionLocks.Values)
+                gate.Dispose();
         }
     }
 
@@ -770,5 +851,6 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
         public Solution Solution { get; set; } = solution;
         public LinkedListNode<string> LruNode { get; } = lruNode;
         public DateTimeOffset LastAccess { get; set; } = lastAccess;
+        public int LeaseCount { get; set; }
     }
 }

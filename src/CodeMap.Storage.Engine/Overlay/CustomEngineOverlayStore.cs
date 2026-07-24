@@ -42,6 +42,41 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         return Task.CompletedTask;
     }
 
+    public Task ForkOverlayAsync(
+        RepoId repoId,
+        WorkspaceId sourceWorkspaceId,
+        int sourceRevision,
+        WorkspaceId targetWorkspaceId,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        var sourceLogicalKey = OverlayKey(repoId, sourceWorkspaceId);
+        if (!_wsToCommit.TryGetValue(sourceLogicalKey, out var source))
+            throw new InvalidOperationException("Source overlay is not attached.");
+
+        var targetLogicalKey = OverlayKey(repoId, targetWorkspaceId);
+        var targetPhysicalKey = targetLogicalKey;
+        if (_symbolStore.OverlayExists(targetPhysicalKey))
+            throw new InvalidOperationException("Target overlay already exists.");
+
+        using var lease = GetOverlayLease(repoId, sourceWorkspaceId)
+            ?? throw new InvalidOperationException("Source overlay does not exist.");
+        lease.Overlay.ForkSnapshot(
+            Path.Combine(_storeBaseDir, "overlays", targetPhysicalKey),
+            targetPhysicalKey,
+            sourceRevision);
+
+        _wsToCommit[targetLogicalKey] = source;
+        _wsToOverlayKey[targetLogicalKey] = targetPhysicalKey;
+        using var targetLease = _symbolStore.AcquireOverlay(
+            targetPhysicalKey,
+            source.RepoId,
+            source.CommitSha);
+        if (targetLease.Overlay.Revision != sourceRevision)
+            throw new InvalidOperationException("Forked overlay revision verification failed.");
+        return Task.CompletedTask;
+    }
+
     public async Task ApplyDeltaAsync(RepoId repoId, WorkspaceId workspaceId, OverlayDelta delta, CancellationToken ct = default)
     {
         using var lease = GetOverlayLease(repoId, workspaceId);
@@ -551,6 +586,35 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
             snapshot.Where(p => !string.IsNullOrWhiteSpace(p)).Select(FilePath.From),
             RepositoryPath.FilePathComparer);
         return Task.FromResult<IReadOnlySet<FilePath>>(paths);
+    }
+
+    public Task<IReadOnlyList<SymbolCard>> GetOverlaySymbolsByFileAsync(
+        RepoId repoId,
+        WorkspaceId workspaceId,
+        FilePath filePath,
+        CancellationToken ct = default)
+    {
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null)
+            return Task.FromResult<IReadOnlyList<SymbolCard>>([]);
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
+        var cards = new List<SymbolCard>();
+        foreach (var symbol in overlay.GetOverlayNewSymbols())
+        {
+            ct.ThrowIfCancellationRequested();
+            var path = ResolveOverlaySymbolFilePath(overlay, reader, symbol.FileIntId);
+            if (string.IsNullOrWhiteSpace(path) ||
+                !RepositoryPath.FilePathComparer.Equals(FilePath.From(path), filePath))
+                continue;
+            cards.Add(RecordToCoreMappings.ToSymbolCard(
+                symbol,
+                reader,
+                overlay.ResolveString) with
+            {
+                FilePath = filePath,
+            });
+        }
+        return Task.FromResult<IReadOnlyList<SymbolCard>>(cards);
     }
 
     public Task<IReadOnlyList<StoredOutgoingReference>> GetOutgoingOverlayReferencesAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, RefKind? kind, int limit, CancellationToken ct = default)

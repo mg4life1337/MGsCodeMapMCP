@@ -73,7 +73,9 @@ public sealed class OverlayRefreshHandler
         var (repoPath, repoErr) = HandlerHelpers.ResolveRepoPath(args, _repoRegistry);
         if (repoErr is { } re) return re;
 
-        var workspaceStr = HandlerHelpers.ResolveWorkspaceId(args, repoPath!, _stickyRegistry, _repoRegistry);
+        var workspaceStr = args?["workspace_id"] is { } workspaceNode
+            ? workspaceNode.GetValue<string>()
+            : _stickyRegistry.Get(repoPath!);
         if (string.IsNullOrEmpty(workspaceStr)) return InvalidArg("workspace_id is required");
 
         try

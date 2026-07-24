@@ -2,27 +2,32 @@ namespace CodeMap.Daemon;
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json.Nodes;
+using CodeMap.Core.Interfaces;
 using CodeMap.Core.Models;
 using CodeMap.Core.Types;
 using CodeMap.Mcp.Context;
 using CodeMap.Mcp.Handlers;
 using CodeMap.Query;
+using CodeMap.Roslyn;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
-/// Maintains latest-only per-repository update queues. Queries keep using the active workspace
-/// while a new branch state is prepared; overlay batches become visible atomically.
+/// Builds complete repository generations in staging workspaces and publishes
+/// exactly one generation pointer after every solution succeeds.
 /// </summary>
 public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
 {
     private readonly RuntimeConfiguration _runtime;
-    private readonly Core.Interfaces.IGitService _git;
+    private readonly IGitService _git;
     private readonly IndexHandler _indexHandler;
     private readonly WorkspaceManager _workspaceManager;
-    private readonly Core.Interfaces.IOverlayStore _overlayStore;
+    private readonly IOverlayStore _overlayStore;
     private readonly IRepoRegistry _repoRegistry;
     private readonly IWorkspaceStickyRegistry _sticky;
+    private readonly RollingGenerationRegistry _generations;
     private readonly ILogger<RollingIndexCoordinator> _logger;
     private readonly RuntimeActivityTracker _activity;
     private readonly RollingIndexStateStore _stateStore;
@@ -31,17 +36,16 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, RollingSolutionStatus>> _statuses =
         new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, SolutionId> _priorities =
-        new(StringComparer.OrdinalIgnoreCase);
 
     public RollingIndexCoordinator(
         RuntimeConfiguration runtime,
-        Core.Interfaces.IGitService git,
+        IGitService git,
         IndexHandler indexHandler,
         WorkspaceManager workspaceManager,
-        Core.Interfaces.IOverlayStore overlayStore,
+        IOverlayStore overlayStore,
         IRepoRegistry repoRegistry,
         IWorkspaceStickyRegistry sticky,
+        RollingGenerationRegistry generations,
         RuntimeActivityTracker activity,
         ILogger<RollingIndexCoordinator> logger)
     {
@@ -52,6 +56,7 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
         _overlayStore = overlayStore;
         _repoRegistry = repoRegistry;
         _sticky = sticky;
+        _generations = generations;
         _activity = activity;
         _logger = logger;
         _stateStore = new RollingIndexStateStore(runtime.DataDirectory);
@@ -67,7 +72,9 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
         {
             queue.Pending = request;
             if (queue.Runner is null || queue.Runner.IsCompleted)
-                queue.Runner = Task.Run(() => RunQueueAsync(key, queue, _shutdown.Token), CancellationToken.None);
+                queue.Runner = Task.Run(
+                    () => RunQueueAsync(key, queue, _shutdown.Token),
+                    CancellationToken.None);
         }
     }
 
@@ -75,19 +82,26 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
     {
         var key = Normalize(repoPath);
         return _statuses.TryGetValue(key, out var statuses)
-            ? statuses.Values.OrderBy(status => status.SolutionPath, StringComparer.OrdinalIgnoreCase).ToList()
+            ? statuses.Values
+                .OrderBy(status => status.SolutionPath, StringComparer.OrdinalIgnoreCase)
+                .ToList()
             : [];
     }
 
     public int TrackedSolutionCount => _statuses.Values.Sum(statuses => statuses.Count);
 
-    public int ActiveQueueCount => _queues.Values.Count(queue => queue.Runner is { IsCompleted: false });
+    public int ActiveQueueCount => _queues.Values.Count(
+        queue => queue.Runner is { IsCompleted: false });
 
     public async Task StopAsync()
     {
         _shutdown.Cancel();
         _sticky.SetSolutionRequestedCallback(null);
-        var runners = _queues.Values.Select(queue => queue.Runner).Where(task => task is not null).Cast<Task>().ToArray();
+        var runners = _queues.Values
+            .Select(queue => queue.Runner)
+            .Where(task => task is not null)
+            .Cast<Task>()
+            .ToArray();
         try { await Task.WhenAll(runners).ConfigureAwait(false); }
         catch (OperationCanceledException) { }
     }
@@ -109,473 +123,976 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
                 using var publication = _activity.BeginPublication();
                 await ProcessAsync(key, request, ct).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Rolling update failed for repository {Repository}", SafeRepositoryLabel(request.RepositoryPath));
+                _logger.LogError(
+                    ex,
+                    "Rolling generation failed for repository {Repository}",
+                    SafeRepositoryLabel(request.RepositoryPath));
             }
         }
     }
 
-    private async Task ProcessAsync(string key, RollingRepositoryRequest request, CancellationToken ct)
+    private async Task ProcessAsync(
+        string key,
+        RollingRepositoryRequest request,
+        CancellationToken ct)
     {
-        var repoId = await _git.GetRepoIdentityAsync(request.RepositoryPath, ct).ConfigureAwait(false);
-        var orderedTargets = request.Solutions
+        var snapshot = request.Snapshot ??
+            await _git.GetRepositorySnapshotAsync(request.RepositoryPath, ct)
+                .ConfigureAwait(false);
+        request = request with
+        {
+            Branch = snapshot.Branch,
+            HeadCommit = snapshot.HeadCommit,
+            Snapshot = snapshot,
+        };
+        _generations.BeginUpdate(
+            request.RepositoryPath,
+            snapshot,
+            request.ServePreviousIndexWhileUpdating);
+
+        var targets = request.Solutions
             .OrderByDescending(target => target.IsDefault)
             .ThenBy(target => target.RelativePath, StringComparer.OrdinalIgnoreCase)
             .ToList();
-        var currentStates = orderedTargets.ToDictionary(
-            target => target.SolutionId,
-            target => _stateStore.Load(repoId, target.SolutionId, request.Branch));
-
-        foreach (var target in orderedTargets)
-            _repoRegistry.RegisterSolution(request.RepositoryPath,
-                new SolutionRegistration(target.SolutionId, target.RelativePath, target.SolutionPath));
-        var defaultTarget = orderedTargets.FirstOrDefault(target => target.IsDefault);
+        foreach (var target in targets)
+        {
+            _repoRegistry.RegisterSolution(
+                request.RepositoryPath,
+                new SolutionRegistration(
+                    target.SolutionId,
+                    target.RelativePath,
+                    target.SolutionPath));
+        }
+        var defaultTarget = targets.FirstOrDefault(target => target.IsDefault);
         if (defaultTarget is not null)
             _repoRegistry.SetDefaultSolution(request.RepositoryPath, defaultTarget.SolutionId);
 
-        if (string.Equals(request.Branch, "HEAD", StringComparison.Ordinal))
-        {
-            foreach (var target in orderedTargets)
-            {
-                var detachedWorkspace = WorkspaceFor(repoId, request.Branch, target.SolutionId, request.HeadCommit);
-                var state = await FullBuildAsync(
-                    request, repoId, target, detachedWorkspace,
-                    "detached HEAD uses commit-specific baseline mode", ct).ConfigureAwait(false);
-                Publish(key, state);
-                _sticky.Set(request.RepositoryPath, target.SolutionId, detachedWorkspace.Value);
-            }
-            return;
-        }
+        var compatibility = GetCompatibilityFingerprint();
+        var history = _generations.LoadHistory(
+            snapshot.RepoId,
+            request.RepositoryPath);
+        await RecoverIncompleteStagingAsync(
+            snapshot.RepoId,
+            request.RepositoryPath,
+            ct).ConfigureAwait(false);
+        _generations.BeginStaging(
+            request.RepositoryPath,
+            new StagingRepositoryGeneration(
+                snapshot.GenerationId,
+                snapshot.RepoId,
+                targets.Select(target => new StagingWorkspaceBinding(
+                    target.SolutionId,
+                    WorkspaceFor(
+                        snapshot.RepoId,
+                        snapshot.Branch,
+                        target.SolutionId,
+                        snapshot.GenerationId))).ToList()));
+        var staged = new ConcurrentBag<SolutionBuildResult>();
+        var parallelism = Math.Max(
+            1,
+            _runtime.Config.IndexingResources?.MaxConcurrentIncrementalSolutions ??
+            new IndexingResourceConfig().MaxConcurrentIncrementalSolutions);
+        using var solutionGate = new SemaphoreSlim(parallelism, parallelism);
+        var totalTimer = Stopwatch.StartNew();
+        var published = false;
 
-        // A branch created at an already indexed commit aliases the existing logical state.
-        if (currentStates.Values.All(state => state is null))
+        try
         {
-            var reusable = orderedTargets
-                .Select(target => _stateStore.FindAtCommit(repoId, target.SolutionId, request.HeadCommit))
-                .ToList();
-            if (reusable.All(state => state is not null))
+            var tasks = targets.Select(async target =>
             {
-                foreach (var (target, reused) in orderedTargets.Zip(reusable))
+                await solutionGate.WaitAsync(ct).ConfigureAwait(false);
+                try
                 {
-                    var state = reused! with
-                    {
-                        Branch = request.Branch,
-                        HeadCommit = request.HeadCommit,
-                        IndexedCommit = request.HeadCommit,
-                        IndexState = RollingIndexState.UpToDate,
-                        PossiblyStale = false,
-                        Affected = false,
-                        ChangedFileCount = 0,
-                        UpdatedSymbolCount = 0,
-                        Strategy = RollingUpdateStrategy.Reused,
-                        LastUpdatedAt = DateTimeOffset.UtcNow,
-                        LastError = null,
-                    };
-                    await RestoreWorkspaceAsync(request.RepositoryPath, target, state, ct).ConfigureAwait(false);
-                    SaveAndPublish(key, state);
-                    _sticky.Set(request.RepositoryPath, target.SolutionId, state.WorkspaceId.Value);
+                    var result = await BuildSolutionAsync(
+                        key,
+                        request,
+                        snapshot,
+                        compatibility,
+                        history,
+                        target,
+                        ct).ConfigureAwait(false);
+                    staged.Add(result);
                 }
-                _logger.LogInformation("Branch state reused at {Head}; no full rebuild", Short(request.HeadCommit));
+                finally
+                {
+                    solutionGate.Release();
+                }
+            });
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+
+            var revalidated = await _git.GetRepositorySnapshotAsync(
+                request.RepositoryPath,
+                ct).ConfigureAwait(false);
+            if (!snapshot.HasSameTarget(revalidated))
+            {
+                if (await DeleteStagingAsync(staged, ct).ConfigureAwait(false))
+                {
+                    _generations.CompleteStaging(
+                        snapshot.RepoId,
+                        request.RepositoryPath,
+                        snapshot.GenerationId);
+                }
+                _generations.Fail(request.RepositoryPath, snapshot);
+                Schedule(request with
+                {
+                    Branch = revalidated.Branch,
+                    HeadCommit = revalidated.HeadCommit,
+                    Snapshot = revalidated,
+                });
+                _logger.LogInformation(
+                    "Repository changed during indexing; discarded generation {Generation} and queued the newest target",
+                    snapshot.GenerationId);
                 return;
             }
+
+            var orderedResults = staged
+                .OrderBy(result => result.Target.RelativePath, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (orderedResults.Count != targets.Count)
+                throw new InvalidOperationException(
+                    "Generation is incomplete and cannot be published.");
+
+            var generation = new RepositoryIndexGeneration(
+                snapshot.GenerationId,
+                snapshot.RepoId,
+                snapshot.Branch,
+                snapshot.HeadCommit,
+                snapshot.WorkingTreeFingerprint,
+                compatibility,
+                orderedResults.Select(result => result.Binding).ToList(),
+                DateTimeOffset.UtcNow);
+
+            // This is the sole query-visible publication point.
+            _generations.Activate(request.RepositoryPath, generation);
+            published = true;
+            _generations.CompleteStaging(
+                snapshot.RepoId,
+                request.RepositoryPath,
+                snapshot.GenerationId);
+            foreach (var result in orderedResults)
+            {
+                _stateStore.Save(result.Status);
+                Publish(key, result.Status);
+            }
+
+            await ApplyRetentionAsync(
+                snapshot.RepoId,
+                request.RetentionDays,
+                request.MaxRollingBranches,
+                ct).ConfigureAwait(false);
+            _logger.LogInformation(
+                "Published repository generation {Generation} at {Head}: {Solutions} solutions in {Duration:F1}ms",
+                generation.GenerationId,
+                Short(snapshot.HeadCommit),
+                generation.Solutions.Count,
+                totalTimer.Elapsed.TotalMilliseconds);
         }
-
-        if (!request.Incremental && currentStates.Values.Any(state => state?.IndexedCommit != request.HeadCommit))
+        catch
         {
-            foreach (var target in orderedTargets)
+            if (!published &&
+                await DeleteStagingAsync(staged, ct).ConfigureAwait(false))
             {
-                var workspace = WorkspaceFor(repoId, request.Branch, target.SolutionId, request.HeadCommit);
-                var rebuilt = await FullBuildAsync(
-                    request, repoId, target, workspace,
-                    "configured update strategy requires commit baseline", ct).ConfigureAwait(false);
-                Publish(key, rebuilt);
-                _sticky.Set(request.RepositoryPath, target.SolutionId, workspace.Value);
-            }
-            return;
-        }
-
-        var summaryWatch = Stopwatch.StartNew();
-        var affectedCount = 0;
-        var skippedCount = 0;
-
-        var remainingTargets = new List<RollingSolutionTarget>(orderedTargets);
-        while (remainingTargets.Count > 0)
-        {
-            var selectedIndex = 0;
-            var defaultStillFirst = remainingTargets.Count == orderedTargets.Count && remainingTargets[0].IsDefault;
-            if (!defaultStillFirst && _priorities.TryRemove(key, out var prioritizedSolution))
-            {
-                var requestedIndex = remainingTargets.FindIndex(target => target.SolutionId == prioritizedSolution);
-                if (requestedIndex >= 0) selectedIndex = requestedIndex;
-            }
-            var target = remainingTargets[selectedIndex];
-            remainingTargets.RemoveAt(selectedIndex);
-            ct.ThrowIfCancellationRequested();
-            var state = currentStates[target.SolutionId];
-            if (state is null)
-            {
-                var created = await FullBuildAsync(
-                    request, repoId, target,
-                    WorkspaceFor(repoId, request.Branch, target.SolutionId, request.HeadCommit),
-                    "no compatible rolling state", ct).ConfigureAwait(false);
-                Publish(key, created);
-                _sticky.Set(request.RepositoryPath, target.SolutionId, created.WorkspaceId.Value);
-                currentStates[target.SolutionId] = created;
-                affectedCount++;
-                continue;
-            }
-
-            if (state.IndexedCommit == request.HeadCommit)
-            {
-                await RestoreWorkspaceAsync(request.RepositoryPath, target, state, ct).ConfigureAwait(false);
-                var current = state with
-                {
-                    HeadCommit = request.HeadCommit,
-                    IndexState = RollingIndexState.UpToDate,
-                    PossiblyStale = false,
-                    Affected = false,
-                    Strategy = RollingUpdateStrategy.Reused,
-                    LastUpdatedAt = DateTimeOffset.UtcNow,
-                    LastError = null,
-                };
-                SaveAndPublish(key, current);
-                _sticky.Set(request.RepositoryPath, target.SolutionId, current.WorkspaceId.Value);
-                skippedCount++;
-                continue;
-            }
-
-            Publish(key, state with
-            {
-                Branch = request.Branch,
-                HeadCommit = request.HeadCommit,
-                IndexState = RollingIndexState.Checking,
-                PossiblyStale = true,
-                Affected = false,
-                ChangedFileCount = 0,
-                UpdatedSymbolCount = 0,
-                LastError = null,
-            });
-
-            var checkWatch = Stopwatch.StartNew();
-            IReadOnlyList<FileChange> changes;
-            bool fastForward;
-            CommitSha? mergeBase;
-            try
-            {
-                fastForward = await _git.IsAncestorAsync(
-                    request.RepositoryPath, state.IndexedCommit, request.HeadCommit, ct).ConfigureAwait(false);
-                mergeBase = fastForward ? state.IndexedCommit : await _git.FindMergeBaseAsync(
-                    request.RepositoryPath, state.IndexedCommit, request.HeadCommit, ct).ConfigureAwait(false);
-                changes = await _git.GetChangedFilesAsync(
+                _generations.CompleteStaging(
+                    snapshot.RepoId,
                     request.RepositoryPath,
-                    fastForward ? state.IndexedCommit : mergeBase ?? state.IndexedCommit,
-                    request.HeadCommit,
-                    ct).ConfigureAwait(false);
+                    snapshot.GenerationId);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                var failed = state with
-                {
-                    Branch = request.Branch,
-                    HeadCommit = request.HeadCommit,
-                    IndexState = RollingIndexState.FullRebuildRequired,
-                    PossiblyStale = true,
-                    LastError = Sanitize(ex.Message, request.RepositoryPath),
-                    LastCheckDurationMilliseconds = checkWatch.Elapsed.TotalMilliseconds,
-                    LastUpdatedAt = DateTimeOffset.UtcNow,
-                };
-                SaveAndPublish(key, failed);
-                var rebuilt = await FullBuildAsync(
-                    request, repoId, target,
-                    WorkspaceFor(repoId, request.Branch, target.SolutionId, request.HeadCommit),
-                    "commit comparison failed", ct).ConfigureAwait(false);
-                Publish(key, rebuilt);
-                _sticky.Set(request.RepositoryPath, target.SolutionId, rebuilt.WorkspaceId.Value);
-                affectedCount++;
-                continue;
-            }
+            if (!published)
+                _generations.Fail(request.RepositoryPath, snapshot);
+            throw;
+        }
+    }
 
-            var map = _stateStore.LoadImpactMap(repoId, target.SolutionId);
-            if (map is null || !string.Equals(map.SolutionPath, target.RelativePath, StringComparison.OrdinalIgnoreCase))
-            {
-                map = SolutionImpactMap.Build(request.RepositoryPath, target.SolutionPath);
-                _stateStore.SaveImpactMap(repoId, target.SolutionId, map);
-            }
-            var impact = map.Analyze(changes);
-            checkWatch.Stop();
+    private async Task<SolutionBuildResult> BuildSolutionAsync(
+        string key,
+        RollingRepositoryRequest request,
+        RepositorySnapshot snapshot,
+        IndexCompatibilityFingerprint compatibility,
+        IReadOnlyList<RepositoryIndexGeneration> history,
+        RollingSolutionTarget target,
+        CancellationToken ct)
+    {
+        var timer = Stopwatch.StartNew();
+        var workspace = WorkspaceFor(
+            snapshot.RepoId,
+            snapshot.Branch,
+            target.SolutionId,
+            snapshot.GenerationId);
 
-            if (!impact.IsAffected && request.SkipUnaffectedSolutions)
+        Publish(key, CreateTransientStatus(
+            snapshot,
+            target,
+            workspace,
+            RollingIndexState.Checking));
+
+        if (request.Incremental &&
+            string.Equals(
+                request.BranchSeedMode,
+                "closestCompatible",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            var exactSeed = await FindExactSeedAsync(
+                snapshot,
+                compatibility,
+                history,
+                target,
+                ct).ConfigureAwait(false);
+            if (exactSeed is not null)
             {
-                var skipped = state with
+                var exactStorageRepoId = SolutionScope.ToStorageRepoId(
+                    snapshot.RepoId,
+                    target.SolutionId);
+                try
                 {
-                    Branch = request.Branch,
-                    HeadCommit = request.HeadCommit,
-                    IndexedCommit = request.HeadCommit,
-                    IndexState = RollingIndexState.UpToDate,
-                    PossiblyStale = false,
-                    Affected = false,
-                    ChangedFileCount = 0,
-                    UpdatedSymbolCount = 0,
-                    Strategy = RollingUpdateStrategy.Reused,
-                    LastCheckDurationMilliseconds = checkWatch.Elapsed.TotalMilliseconds,
-                    LastUpdateDurationMilliseconds = 0,
-                    LastUpdatedAt = DateTimeOffset.UtcNow,
-                    LastError = null,
-                };
-                SaveAndPublish(key, skipped);
-                _sticky.Set(request.RepositoryPath, target.SolutionId, skipped.WorkspaceId.Value);
-                _logger.LogInformation("{Solution}: unaffected; {Reason}; skipped", target.RelativePath, impact.Reason);
-                skippedCount++;
-                continue;
+                    await AttachSeedAsync(
+                        request.RepositoryPath,
+                        target,
+                        exactStorageRepoId,
+                        exactSeed.Solution,
+                        ct).ConfigureAwait(false);
+                    var forked = await _workspaceManager.ForkWorkspaceAsync(
+                        exactStorageRepoId,
+                        exactSeed.Solution.WorkspaceId,
+                        exactSeed.Solution.OverlayRevision,
+                        workspace,
+                        ct).ConfigureAwait(false);
+                    if (forked.IsFailure)
+                        throw new InvalidOperationException(forked.Error.Message);
+
+                    timer.Stop();
+                    return CreateResult(
+                        snapshot,
+                        target,
+                        workspace,
+                        exactSeed.Solution.BaselineCommit,
+                        exactSeed.Solution.OverlayRevision,
+                        RollingUpdateStrategy.Reused,
+                        affected: false,
+                        changedFiles: 0,
+                        symbols: 0,
+                        timer.Elapsed,
+                        exactSeed.Solution.RelevantInputs);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    await _workspaceManager.DeleteWorkspaceAsync(
+                        exactStorageRepoId,
+                        workspace,
+                        ct).ConfigureAwait(false);
+                    _logger.LogWarning(
+                        ex,
+                        "{Solution}: exact seed fast path failed; continuing with validated fallback",
+                        target.RelativePath);
+                }
+            }
+        }
+
+        var impactMap = SolutionImpactMap.Build(
+            request.RepositoryPath,
+            target.SolutionPath);
+        _stateStore.SaveImpactMap(snapshot.RepoId, target.SolutionId, impactMap);
+        var targetInputs = await CaptureInputsAsync(
+            request.RepositoryPath,
+            snapshot,
+            impactMap,
+            ct).ConfigureAwait(false);
+
+        var decision = await SelectSeedAsync(
+            request,
+            snapshot,
+            compatibility,
+            history,
+            target,
+            impactMap,
+            targetInputs,
+            ct).ConfigureAwait(false);
+
+        if (!request.Incremental ||
+            decision.Selected is null ||
+            !decision.UseIncremental)
+        {
+            return await FullBuildAsync(
+                request,
+                snapshot,
+                target,
+                workspace,
+                impactMap,
+                targetInputs,
+                decision.Reason,
+                timer,
+                ct).ConfigureAwait(false);
+        }
+
+        var seed = decision.Selected;
+        var storageRepoId = SolutionScope.ToStorageRepoId(
+            snapshot.RepoId,
+            target.SolutionId);
+        try
+        {
+            await AttachSeedAsync(
+                request.RepositoryPath,
+                target,
+                storageRepoId,
+                seed.Solution,
+                ct).ConfigureAwait(false);
+            var forked = await _workspaceManager.ForkWorkspaceAsync(
+                storageRepoId,
+                seed.Solution.WorkspaceId,
+                seed.Solution.OverlayRevision,
+                workspace,
+                ct).ConfigureAwait(false);
+            if (forked.IsFailure)
+                throw new InvalidOperationException(forked.Error.Message);
+
+            IReadOnlyList<FileChange> changes =
+                seed.Solution.IndexedCommit == snapshot.HeadCommit &&
+                string.Equals(
+                    seed.Generation.WorkingTreeFingerprint,
+                    snapshot.WorkingTreeFingerprint,
+                    StringComparison.Ordinal)
+                    ? []
+                    : await GetChangesFromSeedAsync(
+                        request.RepositoryPath,
+                        seed.Solution,
+                        targetInputs,
+                        ct).ConfigureAwait(false);
+            var impact = impactMap.Analyze(changes);
+
+            if (changes.Count == 0 ||
+                (!impact.IsAffected && request.SkipUnaffectedSolutions))
+            {
+                timer.Stop();
+                return CreateResult(
+                    snapshot,
+                    target,
+                    workspace,
+                    seed.Solution.BaselineCommit,
+                    seed.Solution.OverlayRevision,
+                    RollingUpdateStrategy.Reused,
+                    affected: false,
+                    changedFiles: changes.Count,
+                    symbols: 0,
+                    timer.Elapsed,
+                    targetInputs);
             }
 
             if (changes.Count > request.FullRebuildChangeThreshold)
-            {
-                SaveAndPublish(key, state with
-                {
-                    Branch = request.Branch,
-                    HeadCommit = request.HeadCommit,
-                    IndexState = RollingIndexState.FullRebuildRequired,
-                    PossiblyStale = true,
-                    Affected = true,
-                    ChangedFileCount = changes.Count,
-                    LastCheckDurationMilliseconds = checkWatch.Elapsed.TotalMilliseconds,
-                    LastUpdatedAt = DateTimeOffset.UtcNow,
-                    LastError = $"change threshold exceeded ({changes.Count} files)",
-                });
-                var rebuilt = await FullBuildAsync(
-                    request, repoId, target,
-                    WorkspaceFor(repoId, request.Branch, target.SolutionId, request.HeadCommit),
-                    $"change threshold exceeded ({changes.Count} files)", ct).ConfigureAwait(false);
-                Publish(key, rebuilt);
-                _sticky.Set(request.RepositoryPath, target.SolutionId, rebuilt.WorkspaceId.Value);
-                affectedCount++;
-                continue;
-            }
+                throw new IncrementalCompilationException(
+                    $"Change threshold exceeded ({changes.Count} files).");
 
-            affectedCount++;
-            var updating = state with
-            {
-                Branch = request.Branch,
-                HeadCommit = request.HeadCommit,
-                IndexState = RollingIndexState.Updating,
-                PossiblyStale = true,
-                Affected = true,
-                ChangedFileCount = impact.ChangedInputCount,
-                Strategy = RollingUpdateStrategy.Incremental,
-                LastCheckDurationMilliseconds = checkWatch.Elapsed.TotalMilliseconds,
-                LastUpdatedAt = DateTimeOffset.UtcNow,
-                LastError = null,
-            };
-            SaveAndPublish(key, updating);
+            Publish(key, CreateTransientStatus(
+                snapshot,
+                target,
+                workspace,
+                RollingIndexState.Updating));
+            var refreshed = await _workspaceManager.RefreshSeededOverlayAsync(
+                storageRepoId,
+                workspace,
+                changes,
+                seed.Solution.WorkspaceId,
+                ct).ConfigureAwait(false);
+            if (refreshed.IsFailure)
+                throw new IncrementalCompilationException(refreshed.Error.Message);
 
-            var updateWatch = Stopwatch.StartNew();
-            var nextWorkspace = WorkspaceFor(
-                repoId, request.Branch, target.SolutionId, request.HeadCommit);
-            var storageRepoId = SolutionScope.ToStorageRepoId(repoId, target.SolutionId);
-            try
-            {
-                var created = await _workspaceManager.CreateWorkspaceAsync(
-                    storageRepoId, nextWorkspace, state.BaselineCommit,
-                    target.SolutionPath, request.RepositoryPath, ct).ConfigureAwait(false);
-                if (created.IsFailure) throw new InvalidOperationException(created.Error.Message);
-                var result = await _workspaceManager.RefreshOverlayAsync(
-                    storageRepoId,
-                    nextWorkspace,
-                    explicitFilePaths: null,
-                    ct).ConfigureAwait(false);
-                if (result.IsFailure) throw new InvalidOperationException(result.Error.Message);
-                if (result.Value.Metrics is { } metrics)
-                {
-                    _logger.LogInformation(
-                        "Rolling delta for {Solution}: mode={Mode}, changed={Changed}, noOp={NoOp}, " +
-                        "documents={Documents}, projects={Projects}, symbolsWritten={Written}, " +
-                        "symbolsDeleted={Deleted}, relations={Relations}, fallback={Fallback}, " +
-                        "gitMs={GitMs:F1}, compileMs={CompileMs:F1}, symbolsMs={SymbolsMs:F1}, " +
-                        "referencesMs={ReferencesMs:F1}, overlayMs={OverlayMs:F1}, totalMs={TotalMs:F1}",
-                        target.RelativePath,
-                        metrics.Mode,
-                        metrics.ChangedFiles,
-                        metrics.SemanticNoOpFiles,
-                        metrics.DocumentsReindexed,
-                        metrics.AffectedProjects,
-                        metrics.SymbolsWritten,
-                        metrics.SymbolsDeleted,
-                        metrics.RelationsUpdated,
-                        metrics.FallbackReason,
-                        metrics.Timings.GitDiff.TotalMilliseconds,
-                        metrics.Timings.DirectCompilation.TotalMilliseconds,
-                        metrics.Timings.SymbolExtraction.TotalMilliseconds,
-                        metrics.Timings.ReferenceExtraction.TotalMilliseconds,
-                        metrics.Timings.OverlayWrite.TotalMilliseconds,
-                        metrics.Timings.Total.TotalMilliseconds);
-                }
+            timer.Stop();
+            _logger.LogInformation(
+                "{Solution}: seeded incremental update, similarity {Similarity:P1}, {Files} changed files, {Symbols} symbols",
+                target.RelativePath,
+                seed.Similarity,
+                changes.Count,
+                refreshed.Value.SymbolsUpdated);
+            return CreateResult(
+                snapshot,
+                target,
+                workspace,
+                seed.Solution.BaselineCommit,
+                refreshed.Value.NewOverlayRevision,
+                RollingUpdateStrategy.Incremental,
+                affected: true,
+                changedFiles: changes.Count,
+                symbols: refreshed.Value.SymbolsUpdated,
+                timer.Elapsed,
+                targetInputs);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            await _workspaceManager.DeleteWorkspaceAsync(
+                storageRepoId,
+                workspace,
+                ct).ConfigureAwait(false);
+            _logger.LogWarning(
+                ex,
+                "{Solution}: seed update failed; rebuilding only this solution",
+                target.RelativePath);
+            return await FullBuildAsync(
+                request,
+                snapshot,
+                target,
+                workspace,
+                impactMap,
+                targetInputs,
+                "strict incremental fallback",
+                timer,
+                ct).ConfigureAwait(false);
+        }
+    }
 
-                updateWatch.Stop();
-                var updated = updating with
-                {
-                    IndexedCommit = request.HeadCommit,
-                    WorkspaceId = nextWorkspace,
-                    OverlayRevision = result.Value.NewOverlayRevision,
-                    IndexState = RollingIndexState.UpToDate,
-                    PossiblyStale = false,
-                    UpdatedSymbolCount = result.Value.SymbolsUpdated,
-                    LastUpdateDurationMilliseconds = updateWatch.Elapsed.TotalMilliseconds,
-                    LastUpdatedAt = DateTimeOffset.UtcNow,
-                };
-                SaveAndPublish(key, updated);
-                _sticky.Set(request.RepositoryPath, target.SolutionId, nextWorkspace.Value);
-                if (impact.RebuildMap)
-                {
-                    var refreshedMap = SolutionImpactMap.Build(request.RepositoryPath, target.SolutionPath);
-                    _stateStore.SaveImpactMap(repoId, target.SolutionId, refreshedMap);
-                }
-                _logger.LogInformation(
-                    "{Solution}: incremental, {Files} files, {Symbols} symbols, {Duration:F1}ms",
-                    target.RelativePath, impact.ChangedInputCount, result.Value.SymbolsUpdated,
-                    updateWatch.Elapsed.TotalMilliseconds);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                updateWatch.Stop();
-                var failed = updating with
-                {
-                    IndexState = RollingIndexState.Failed,
-                    PossiblyStale = true,
-                    LastError = Sanitize(ex.Message, request.RepositoryPath),
-                    LastUpdateDurationMilliseconds = updateWatch.Elapsed.TotalMilliseconds,
-                    LastUpdatedAt = DateTimeOffset.UtcNow,
-                };
-                SaveAndPublish(key, failed);
-                await _workspaceManager.DeleteWorkspaceAsync(
-                    storageRepoId, nextWorkspace, ct).ConfigureAwait(false);
-                _logger.LogError(ex, "Incremental update failed for {Solution}; previous index remains active", target.RelativePath);
-            }
+    private async Task<BranchSeedDecision> SelectSeedAsync(
+        RollingRepositoryRequest request,
+        RepositorySnapshot targetSnapshot,
+        IndexCompatibilityFingerprint compatibility,
+        IReadOnlyList<RepositoryIndexGeneration> history,
+        RollingSolutionTarget target,
+        SolutionImpactMap impactMap,
+        IReadOnlyList<RelevantInputFingerprint> targetInputs,
+        CancellationToken ct)
+    {
+        if (!string.Equals(
+                request.BranchSeedMode,
+                "closestCompatible",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return new BranchSeedDecision(
+                target.SolutionId,
+                null,
+                false,
+                "branch seeding is disabled");
         }
 
-        var finalStates = currentStates.Keys
-            .Select(solutionId => _statuses[key].GetValueOrDefault(solutionId.Value))
-            .Where(state => state is not null)
-            .Cast<RollingSolutionStatus>()
+        var compatible = history
+            .Where(generation => generation.Compatibility == compatibility)
+            .Select(generation => (
+                Generation: generation,
+                Solution: generation.Solutions.FirstOrDefault(
+                    solution => solution.SolutionId == target.SolutionId)))
+            .Where(candidate => candidate.Solution is not null)
+            .Select(candidate => (
+                candidate.Generation,
+                Solution: candidate.Solution!))
             .ToList();
-        foreach (var state in finalStates.Where(state => state.IndexState == RollingIndexState.UpToDate))
-            _sticky.Set(request.RepositoryPath, state.SolutionId, state.WorkspaceId.Value);
 
+        var selected = await FindExactSeedAsync(
+            targetSnapshot,
+            compatibility,
+            history,
+            target,
+            ct).ConfigureAwait(false);
+        if (selected is not null)
+        {
+            return new BranchSeedDecision(
+                target.SolutionId,
+                selected,
+                true,
+                "exact target seed");
+        }
+
+        var candidates = new List<BranchSeedCandidate>();
+        foreach (var candidate in compatible
+                     .OrderByDescending(candidate => candidate.Generation.PublishedAt)
+                     .Take(Math.Max(1, request.BranchSeedCandidateCount)))
+        {
+            if (!await SeedOverlayExistsAsync(
+                    targetSnapshot.RepoId,
+                    target.SolutionId,
+                    candidate.Solution.WorkspaceId,
+                    ct).ConfigureAwait(false))
+                continue;
+            var similarity = BranchSeedScoring.WeightedSimilarity(
+                targetInputs,
+                candidate.Solution.RelevantInputs);
+            var relationship = await GetRelationshipAsync(
+                request.RepositoryPath,
+                candidate.Solution.IndexedCommit,
+                targetSnapshot.HeadCommit,
+                ct).ConfigureAwait(false);
+            var changes = await _git.GetChangedFilesAsync(
+                request.RepositoryPath,
+                candidate.Solution.IndexedCommit,
+                ct).ConfigureAwait(false);
+            candidates.Add(new BranchSeedCandidate(
+                candidate.Generation,
+                candidate.Solution,
+                relationship,
+                similarity,
+                impactMap.CountChangedProjects(changes)));
+        }
+
+        var best = BranchSeedScoring.SelectBest(candidates);
+        if (best is null)
+            return new BranchSeedDecision(
+                target.SolutionId,
+                null,
+                false,
+                "no compatible seed");
+        if (best.Similarity < request.BranchSeedMinimumSimilarity)
+            return new BranchSeedDecision(
+                target.SolutionId,
+                best,
+                false,
+                $"best seed similarity {best.Similarity:F3} is below threshold");
+        return new BranchSeedDecision(
+            target.SolutionId,
+            best,
+            true,
+            $"compatible seed similarity {best.Similarity:F3}");
+    }
+
+    private async Task<BranchSeedCandidate?> FindExactSeedAsync(
+        RepositorySnapshot targetSnapshot,
+        IndexCompatibilityFingerprint compatibility,
+        IReadOnlyList<RepositoryIndexGeneration> history,
+        RollingSolutionTarget target,
+        CancellationToken ct)
+    {
+        var exact = history
+            .Where(generation =>
+                generation.Compatibility == compatibility &&
+                generation.HeadCommit == targetSnapshot.HeadCommit &&
+                string.Equals(
+                    generation.WorkingTreeFingerprint,
+                    targetSnapshot.WorkingTreeFingerprint,
+                    StringComparison.Ordinal))
+            .Select(generation => (
+                Generation: generation,
+                Solution: generation.Solutions.FirstOrDefault(
+                    solution => solution.SolutionId == target.SolutionId)))
+            .Where(candidate => candidate.Solution is not null)
+            .OrderByDescending(candidate => candidate.Generation.PublishedAt);
+        foreach (var candidate in exact)
+        {
+            if (!await SeedOverlayExistsAsync(
+                    targetSnapshot.RepoId,
+                    target.SolutionId,
+                    candidate.Solution!.WorkspaceId,
+                    ct).ConfigureAwait(false))
+                continue;
+            return new BranchSeedCandidate(
+                candidate.Generation,
+                candidate.Solution!,
+                BranchSeedRelationship.Identical,
+                1,
+                0);
+        }
+
+        return null;
+    }
+
+    private async Task<SolutionBuildResult> FullBuildAsync(
+        RollingRepositoryRequest request,
+        RepositorySnapshot snapshot,
+        RollingSolutionTarget target,
+        WorkspaceId workspace,
+        SolutionImpactMap impactMap,
+        IReadOnlyList<RelevantInputFingerprint> targetInputs,
+        string reason,
+        Stopwatch timer,
+        CancellationToken ct)
+    {
+        _logger.LogInformation(
+            "Full rebuild for {Solution}: {Reason}",
+            target.RelativePath,
+            reason);
+        var result = await _indexHandler.HandleAsync(new JsonObject
+        {
+            ["repo_path"] = request.RepositoryPath,
+            ["solution_path"] = target.SolutionPath,
+            ["commit_sha"] = BaselineFor(snapshot).Value,
+        }, ct).ConfigureAwait(false);
+        if (result.IsError)
+            throw new InvalidOperationException(
+                "Full rebuild failed: " +
+                Sanitize(result.Content, request.RepositoryPath));
+
+        var storageRepoId = SolutionScope.ToStorageRepoId(
+            snapshot.RepoId,
+            target.SolutionId);
+        var created = await _workspaceManager.CreateWorkspaceAsync(
+            storageRepoId,
+            workspace,
+            BaselineFor(snapshot),
+            target.SolutionPath,
+            request.RepositoryPath,
+            ct).ConfigureAwait(false);
+        if (created.IsFailure)
+            throw new InvalidOperationException(created.Error.Message);
+
+        timer.Stop();
+        return CreateResult(
+            snapshot,
+            target,
+            workspace,
+            BaselineFor(snapshot),
+            created.Value.CurrentRevision,
+            RollingUpdateStrategy.FullRebuild,
+            affected: true,
+            changedFiles: 0,
+            symbols: 0,
+            timer.Elapsed,
+            targetInputs);
+    }
+
+    private async Task AttachSeedAsync(
+        string repoPath,
+        RollingSolutionTarget target,
+        RepoId storageRepoId,
+        SolutionGenerationBinding seed,
+        CancellationToken ct)
+    {
+        var existing = _workspaceManager.GetWorkspaceInfo(
+            storageRepoId,
+            seed.WorkspaceId);
+        if (existing is not null)
+        {
+            if (existing.CurrentRevision != seed.OverlayRevision)
+                throw new InvalidOperationException(
+                    "Seed overlay revision no longer matches its generation.");
+            return;
+        }
+
+        var attached = await _workspaceManager.CreateWorkspaceAsync(
+            storageRepoId,
+            seed.WorkspaceId,
+            seed.BaselineCommit,
+            target.SolutionPath,
+            repoPath,
+            ct).ConfigureAwait(false);
+        if (attached.IsFailure)
+            throw new InvalidOperationException(attached.Error.Message);
+        if (attached.Value.CurrentRevision != seed.OverlayRevision)
+            throw new InvalidOperationException(
+                "Seed overlay revision no longer matches its generation.");
+    }
+
+    private async Task<bool> SeedOverlayExistsAsync(
+        RepoId repoId,
+        SolutionId solutionId,
+        WorkspaceId workspaceId,
+        CancellationToken ct) =>
+        await _overlayStore.OverlayExistsAsync(
+            SolutionScope.ToStorageRepoId(repoId, solutionId),
+            workspaceId,
+            ct).ConfigureAwait(false);
+
+    private async Task<IReadOnlyList<RelevantInputFingerprint>> CaptureInputsAsync(
+        string repoPath,
+        RepositorySnapshot snapshot,
+        SolutionImpactMap impactMap,
+        CancellationToken ct)
+    {
+        var weighted = impactMap.GetWeightedInputs();
+        var hashes = await _git.GetInputFingerprintsAsync(
+            repoPath,
+            snapshot,
+            weighted.Keys.ToList(),
+            ct).ConfigureAwait(false);
+        return weighted
+            .OrderBy(input => input.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(input => new RelevantInputFingerprint(
+                input.Key,
+                hashes.GetValueOrDefault(input.Key, "missing"),
+                input.Value))
+            .ToList();
+    }
+
+    private async Task<IReadOnlyList<FileChange>> GetChangesFromSeedAsync(
+        string repoPath,
+        SolutionGenerationBinding seed,
+        IReadOnlyList<RelevantInputFingerprint> targetInputs,
+        CancellationToken ct)
+    {
+        var changes = (await _git.GetChangedFilesAsync(
+                repoPath,
+                seed.IndexedCommit,
+                ct).ConfigureAwait(false))
+            .ToDictionary(
+                change => change.FilePath.Value,
+                StringComparer.OrdinalIgnoreCase);
+        var before = seed.RelevantInputs.ToDictionary(
+            input => input.Path,
+            StringComparer.OrdinalIgnoreCase);
+        var after = targetInputs.ToDictionary(
+            input => input.Path,
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var path in before.Keys
+                     .Concat(after.Keys)
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            before.TryGetValue(path, out var oldInput);
+            after.TryGetValue(path, out var newInput);
+            if (oldInput is not null &&
+                newInput is not null &&
+                string.Equals(
+                    oldInput.ContentHash,
+                    newInput.ContentHash,
+                    StringComparison.Ordinal))
+                continue;
+
+            var kind = oldInput is null || oldInput.ContentHash == "missing"
+                ? FileChangeKind.Added
+                : newInput is null || newInput.ContentHash == "missing"
+                    ? FileChangeKind.Deleted
+                    : FileChangeKind.Modified;
+            changes[path] = new FileChange(FilePath.From(path), kind);
+        }
+        return changes.Values.ToList();
+    }
+
+    private async Task<BranchSeedRelationship> GetRelationshipAsync(
+        string repoPath,
+        CommitSha candidate,
+        CommitSha target,
+        CancellationToken ct)
+    {
+        if (candidate == target)
+            return BranchSeedRelationship.Identical;
+        if (await _git.IsAncestorAsync(repoPath, candidate, target, ct)
+                .ConfigureAwait(false))
+            return BranchSeedRelationship.Ancestor;
+        return await _git.FindMergeBaseAsync(repoPath, candidate, target, ct)
+                   .ConfigureAwait(false) is not null
+            ? BranchSeedRelationship.MergeBase
+            : BranchSeedRelationship.Divergent;
+    }
+
+    private IndexCompatibilityFingerprint GetCompatibilityFingerprint()
+    {
+        MsBuildInitializer.EnsureRegistered(_runtime.MsBuildPath);
+        var instance = MsBuildInitializer.SelectedInstance;
+        var msBuildSource = instance is null
+            ? "host-registered"
+            : $"{instance.Version}|{instance.Kind}|{Normalize(instance.MSBuildPath)}";
+        var msBuildHash = Convert.ToHexStringLower(
+            SHA256.HashData(Encoding.UTF8.GetBytes(msBuildSource)));
+        return new IndexCompatibilityFingerprint(
+            "engine-2.0",
+            typeof(IncrementalCompiler).Assembly.GetName().Version?.ToString() ?? "unknown",
+            msBuildHash);
+    }
+
+    private static SolutionBuildResult CreateResult(
+        RepositorySnapshot snapshot,
+        RollingSolutionTarget target,
+        WorkspaceId workspace,
+        CommitSha baseline,
+        int revision,
+        RollingUpdateStrategy strategy,
+        bool affected,
+        int changedFiles,
+        int symbols,
+        TimeSpan elapsed,
+        IReadOnlyList<RelevantInputFingerprint> inputs)
+    {
+        var binding = new SolutionGenerationBinding(
+            target.SolutionId,
+            target.RelativePath,
+            workspace,
+            snapshot.HeadCommit,
+            baseline,
+            revision,
+            strategy,
+            inputs);
+        var status = new RollingSolutionStatus(
+            snapshot.RepoId,
+            target.SolutionId,
+            target.RelativePath,
+            snapshot.Branch,
+            snapshot.HeadCommit,
+            snapshot.HeadCommit,
+            baseline,
+            workspace,
+            revision,
+            RollingIndexState.UpToDate,
+            false,
+            affected,
+            changedFiles,
+            symbols,
+            strategy,
+            0,
+            elapsed.TotalMilliseconds,
+            DateTimeOffset.UtcNow,
+            null);
+        return new SolutionBuildResult(target, binding, status);
+    }
+
+    private static RollingSolutionStatus CreateTransientStatus(
+        RepositorySnapshot snapshot,
+        RollingSolutionTarget target,
+        WorkspaceId workspace,
+        RollingIndexState state) =>
+        new(
+            snapshot.RepoId,
+            target.SolutionId,
+            target.RelativePath,
+            snapshot.Branch,
+            snapshot.HeadCommit,
+            snapshot.HeadCommit,
+            snapshot.HeadCommit,
+            workspace,
+            0,
+            state,
+            true,
+            null,
+            0,
+            0,
+            RollingUpdateStrategy.Reused,
+            0,
+            0,
+            DateTimeOffset.UtcNow,
+            null);
+
+    private async Task RecoverIncompleteStagingAsync(
+        RepoId repoId,
+        string repositoryPath,
+        CancellationToken ct)
+    {
+        var incomplete = _generations.LoadStaging(repoId, repositoryPath);
+        if (incomplete is null) return;
+
+        var active = _generations.GetActive(repositoryPath);
+        if (!string.Equals(
+                active?.GenerationId,
+                incomplete.GenerationId,
+                StringComparison.Ordinal))
+        {
+            var cleanupComplete = true;
+            foreach (var binding in incomplete.Workspaces)
+            {
+                try
+                {
+                    await _workspaceManager.DeleteWorkspaceAsync(
+                        SolutionScope.ToStorageRepoId(repoId, binding.SolutionId),
+                        binding.WorkspaceId,
+                        ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    cleanupComplete = false;
+                    _logger.LogWarning(
+                        ex,
+                        "Could not clean workspace from incomplete generation {Generation}",
+                        incomplete.GenerationId);
+                }
+            }
+
+            if (!cleanupComplete)
+                throw new IOException(
+                    "An incomplete generation could not be cleaned safely.");
+        }
+
+        _generations.CompleteStaging(
+            repoId,
+            repositoryPath,
+            incomplete.GenerationId);
+    }
+
+    private async Task<bool> DeleteStagingAsync(
+        IEnumerable<SolutionBuildResult> staged,
+        CancellationToken ct)
+    {
+        var cleanupComplete = true;
+        foreach (var result in staged)
+        {
+            try
+            {
+                await _workspaceManager.DeleteWorkspaceAsync(
+                    SolutionScope.ToStorageRepoId(
+                        result.Status.RepoId,
+                        result.Status.SolutionId),
+                    result.Status.WorkspaceId,
+                    ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                cleanupComplete = false;
+                _logger.LogWarning(
+                    ex,
+                    "Could not clean incomplete workspace {Workspace}",
+                    result.Status.WorkspaceId.Value);
+            }
+        }
+        return cleanupComplete;
+    }
+
+    private async Task ApplyRetentionAsync(
+        RepoId repoId,
+        int retentionDays,
+        int maxBranches,
+        CancellationToken ct)
+    {
         var removedStates = _stateStore.ApplyRetention(
-            repoId, request.RetentionDays, request.MaxRollingBranches);
-        var retainedWorkspaceKeys = _stateStore.LoadAll(repoId)
+            repoId,
+            retentionDays,
+            maxBranches);
+        var retained = _stateStore.LoadAll(repoId)
             .Select(state => state.SolutionId.Value + "|" + state.WorkspaceId.Value)
             .ToHashSet(StringComparer.Ordinal);
         foreach (var removed in removedStates)
         {
-            var workspaceKey = removed.SolutionId.Value + "|" + removed.WorkspaceId.Value;
-            if (retainedWorkspaceKeys.Contains(workspaceKey)) continue;
+            var key = removed.SolutionId.Value + "|" + removed.WorkspaceId.Value;
+            if (retained.Contains(key)) continue;
             await _overlayStore.DeleteOverlayAsync(
                 SolutionScope.ToStorageRepoId(repoId, removed.SolutionId),
                 removed.WorkspaceId,
                 ct).ConfigureAwait(false);
         }
-        _logger.LogInformation(
-            "HEAD transition complete at {Head}: {Solutions} solutions checked, {Affected} affected, {Skipped} skipped, {Duration:F1}ms",
-            Short(request.HeadCommit), orderedTargets.Count, affectedCount, skippedCount, summaryWatch.Elapsed.TotalMilliseconds);
-    }
-
-    private async Task<RollingSolutionStatus> FullBuildAsync(
-        RollingRepositoryRequest request,
-        RepoId repoId,
-        RollingSolutionTarget target,
-        WorkspaceId workspaceId,
-        string reason,
-        CancellationToken ct)
-    {
-        _logger.LogWarning("Full rebuild for {Solution}: {Reason}", target.RelativePath, reason);
-        var watch = Stopwatch.StartNew();
-        var result = await _indexHandler.HandleAsync(new JsonObject
-        {
-            ["repo_path"] = request.RepositoryPath,
-            ["solution_path"] = target.SolutionPath,
-            ["commit_sha"] = request.HeadCommit.Value,
-        }, ct).ConfigureAwait(false);
-        if (result.IsError)
-            throw new InvalidOperationException("Full rebuild failed: " + Sanitize(result.Content, request.RepositoryPath));
-
-        var storageRepoId = SolutionScope.ToStorageRepoId(repoId, target.SolutionId);
-        var existing = _workspaceManager.GetWorkspaceInfo(storageRepoId, workspaceId);
-        if (existing is not null && existing.BaselineCommitSha != request.HeadCommit)
-            await _workspaceManager.DeleteWorkspaceAsync(storageRepoId, workspaceId, ct).ConfigureAwait(false);
-        var created = await _workspaceManager.CreateWorkspaceAsync(
-            storageRepoId, workspaceId, request.HeadCommit,
-            target.SolutionPath, request.RepositoryPath, ct).ConfigureAwait(false);
-        if (created.IsFailure) throw new InvalidOperationException(created.Error.Message);
-
-        var map = SolutionImpactMap.Build(request.RepositoryPath, target.SolutionPath);
-        _stateStore.SaveImpactMap(repoId, target.SolutionId, map);
-        watch.Stop();
-        var state = new RollingSolutionStatus(
-            repoId, target.SolutionId, target.RelativePath, request.Branch,
-            request.HeadCommit, request.HeadCommit, request.HeadCommit,
-            workspaceId, created.Value.CurrentRevision,
-            RollingIndexState.UpToDate, false, true, 0, 0,
-            RollingUpdateStrategy.FullRebuild, 0, watch.Elapsed.TotalMilliseconds,
-            DateTimeOffset.UtcNow, null);
-        _stateStore.Save(state);
-        return state;
-    }
-
-    private async Task RestoreWorkspaceAsync(
-        string repoPath,
-        RollingSolutionTarget target,
-        RollingSolutionStatus state,
-        CancellationToken ct)
-    {
-        var storageRepoId = SolutionScope.ToStorageRepoId(state.RepoId, target.SolutionId);
-        var existing = _workspaceManager.GetWorkspaceInfo(storageRepoId, state.WorkspaceId);
-        if (existing is not null) return;
-        var baseline = await _indexHandler.HandleAsync(new JsonObject
-        {
-            ["repo_path"] = repoPath,
-            ["solution_path"] = target.SolutionPath,
-            ["commit_sha"] = state.BaselineCommit.Value,
-        }, ct).ConfigureAwait(false);
-        if (baseline.IsError)
-            throw new InvalidOperationException(
-                "Could not restore rolling baseline: " + Sanitize(baseline.Content, repoPath));
-        var restored = await _workspaceManager.CreateWorkspaceAsync(
-            storageRepoId, state.WorkspaceId, state.BaselineCommit,
-            target.SolutionPath, repoPath, ct).ConfigureAwait(false);
-        if (restored.IsFailure) throw new InvalidOperationException(restored.Error.Message);
-    }
-
-    private void SaveAndPublish(string key, RollingSolutionStatus state)
-    {
-        _stateStore.Save(state);
-        Publish(key, state);
     }
 
     private void Publish(string key, RollingSolutionStatus state)
     {
-        var statuses = _statuses.GetOrAdd(key,
-            _ => new ConcurrentDictionary<string, RollingSolutionStatus>(StringComparer.OrdinalIgnoreCase));
+        var statuses = _statuses.GetOrAdd(
+            key,
+            _ => new ConcurrentDictionary<string, RollingSolutionStatus>(
+                StringComparer.OrdinalIgnoreCase));
         statuses[state.SolutionId.Value] = state;
     }
 
     private static string Normalize(string path) =>
         Path.GetFullPath(path).Replace('\\', '/').TrimEnd('/');
-    private void RequestPriority(string repoPath, SolutionId solutionId) =>
-        _priorities[Normalize(repoPath)] = solutionId;
-    private static string Short(CommitSha sha) => sha.Value[..Math.Min(8, sha.Value.Length)];
-    private static string SafeRepositoryLabel(string path) => Path.GetFileName(Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar));
+
+    private void RequestPriority(string repoPath, SolutionId solutionId)
+    {
+        // Query priority no longer changes publication order: independent solutions
+        // already run concurrently and only a complete generation is visible.
+    }
+
+    private static string Short(CommitSha sha) =>
+        sha.Value[..Math.Min(8, sha.Value.Length)];
+
+    private static string SafeRepositoryLabel(string path) =>
+        Path.GetFileName(
+            Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar));
+
     private static string Sanitize(string message, string repoPath) =>
-        message.Replace(Path.GetFullPath(repoPath), "<repository>", StringComparison.OrdinalIgnoreCase);
+        message.Replace(
+            Path.GetFullPath(repoPath),
+            "<repository>",
+            StringComparison.OrdinalIgnoreCase);
+
     private static WorkspaceId WorkspaceFor(
         RepoId repoId,
         string branch,
         SolutionId solutionId,
-        CommitSha head) =>
-        WorkspaceId.From("rolling-" + RollingIndexStateStore.StableId(
-            repoId.Value + "\n" + branch + "\n" + solutionId.Value + "\n" + head.Value));
+        string generationId) =>
+        WorkspaceId.From(
+            "rolling-" +
+            RollingIndexStateStore.StableId(
+                repoId.Value + "\n" +
+                branch + "\n" +
+                solutionId.Value + "\n" +
+                generationId));
+
+    private static CommitSha BaselineFor(RepositorySnapshot snapshot)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(
+            snapshot.HeadCommit.Value + "\n" + snapshot.WorkingTreeFingerprint));
+        return CommitSha.From(Convert.ToHexStringLower(bytes)[..40]);
+    }
 
     private sealed class QueueState
     {
@@ -583,6 +1100,11 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
         public RollingRepositoryRequest? Pending { get; set; }
         public Task? Runner { get; set; }
     }
+
+    private sealed record SolutionBuildResult(
+        RollingSolutionTarget Target,
+        SolutionGenerationBinding Binding,
+        RollingSolutionStatus Status);
 }
 
 public sealed record RollingRepositoryRequest(
@@ -594,7 +1116,13 @@ public sealed record RollingRepositoryRequest(
     bool SkipUnaffectedSolutions,
     int RetentionDays,
     int MaxRollingBranches,
-    int FullRebuildChangeThreshold);
+    int FullRebuildChangeThreshold,
+    RepositorySnapshot? Snapshot = null,
+    string BranchSeedMode = "closestCompatible",
+    int BranchSeedCandidateCount = 3,
+    double BranchSeedMinimumSimilarity = 0.60,
+    bool StrictGenerationPublish = true,
+    bool ServePreviousIndexWhileUpdating = false);
 
 public sealed record RollingSolutionTarget(
     string SolutionPath,

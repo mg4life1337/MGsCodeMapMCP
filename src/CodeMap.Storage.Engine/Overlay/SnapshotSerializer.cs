@@ -90,6 +90,7 @@ internal static class SnapshotSerializer
         }
 
         bw.Flush();
+        fs.Flush(flushToDisk: true);
     }
 
     public static void Read(string path, EngineOverlay overlay)

@@ -137,6 +137,9 @@ public static class ServiceRegistration
         services.AddSingleton<IMcpSymbolResolver, McpSymbolResolver>();
         // Context registries — in-memory, per-process. No persistence across daemon restarts.
         services.AddSingleton<IRepoRegistry, RepoRegistry>();
+        services.AddSingleton<RollingGenerationRegistry>();
+        services.AddSingleton<IRollingGenerationRegistry>(sp =>
+            sp.GetRequiredService<RollingGenerationRegistry>());
         services.AddSingleton<IWorkspaceStickyRegistry, WorkspaceStickyRegistry>();
         services.AddSingleton<RollingIndexCoordinator>();
         services.AddSingleton<IRollingIndexStatusProvider>(sp =>

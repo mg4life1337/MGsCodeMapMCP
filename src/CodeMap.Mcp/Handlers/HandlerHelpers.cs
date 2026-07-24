@@ -112,7 +112,19 @@ internal static class HandlerHelpers
                 args?["solution_id"]?.GetValue<string>(),
                 args?["solution_path"]?.GetValue<string>());
             if (solution.Error is null && solution.SolutionId is { } solutionId)
-                return sticky.Get(repoPath, solutionId);
+            {
+                var rolling = sticky.Resolve(repoPath, solutionId);
+                if (rolling.Availability == RollingGenerationAvailability.Ready)
+                    return rolling.WorkspaceId?.Value;
+                if (rolling.Availability == RollingGenerationAvailability.Updating)
+                    throw new RollingGenerationUnavailableException(new CodeMapError(
+                        ErrorCodes.IndexUpdating,
+                        "The complete index generation for the current repository target is still being assembled. Retry shortly."));
+                if (rolling.Availability == RollingGenerationAvailability.NotReady)
+                    throw new RollingGenerationUnavailableException(new CodeMapError(
+                        ErrorCodes.IndexNotReady,
+                        "No complete index generation is available for the current repository target."));
+            }
         }
         return sticky.Get(repoPath);
     }

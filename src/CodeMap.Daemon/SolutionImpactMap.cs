@@ -32,7 +32,7 @@ public sealed record SolutionImpactMap(
             .Select(path => Path.GetFullPath(Path.IsPathRooted(path)
                 ? path
                 : Path.Combine(Path.GetDirectoryName(solution)!, path)))
-            .Where(File.Exists)
+            .Where(path => File.Exists(path) && IsInside(root, path))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
@@ -95,6 +95,40 @@ public sealed record SolutionImpactMap(
             changed.Count,
             $"{affected.Count} affected project(s)",
             rebuildMap);
+    }
+
+    /// <summary>
+    /// Returns solution-relevant inputs and their similarity weights. Inputs not
+    /// reachable from this solution are deliberately absent.
+    /// </summary>
+    public IReadOnlyDictionary<string, int> GetWeightedInputs()
+    {
+        var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        AddWeightedInput(result, SolutionPath, 8);
+        foreach (var project in Projects)
+        {
+            AddWeightedInput(result, project.ProjectPath, 5);
+            foreach (var reference in project.ProjectReferences)
+                AddWeightedInput(result, reference, 5);
+            foreach (var global in project.GlobalInputs)
+                AddWeightedInput(result, global, 8);
+            foreach (var file in project.Files)
+                AddWeightedInput(result, file, 1, overwrite: false);
+        }
+        return result;
+    }
+
+    public int CountChangedProjects(IReadOnlyList<FileChange> changes)
+    {
+        var changed = changes
+            .SelectMany(change => change.OldFilePath is { } old
+                ? new[] { Normalize(change.FilePath.Value), Normalize(old.Value) }
+                : new[] { Normalize(change.FilePath.Value) })
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return Projects.Count(project =>
+            changed.Contains(Normalize(project.ProjectPath)) ||
+            project.Files.Any(file => changed.Contains(Normalize(file))) ||
+            project.GlobalInputs.Any(file => changed.Contains(Normalize(file))));
     }
 
     private static ProjectImpactNode BuildProject(string repoRoot, string projectPath)
@@ -215,6 +249,25 @@ public sealed record SolutionImpactMap(
         return inputDirectory.Length == 0 ||
                project.Equals(inputDirectory, StringComparison.OrdinalIgnoreCase) ||
                project.StartsWith(inputDirectory + "/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void AddWeightedInput(
+        IDictionary<string, int> target,
+        string path,
+        int weight,
+        bool overwrite = true)
+    {
+        var normalized = Normalize(path);
+        if (Path.IsPathRooted(normalized) ||
+            normalized == ".." ||
+            normalized.StartsWith("../", StringComparison.Ordinal) ||
+            normalized.Split('/').Any(segment => segment == "..") ||
+            normalized.Contains(':', StringComparison.Ordinal))
+            return;
+        if (overwrite)
+            target[normalized] = weight;
+        else
+            target.TryAdd(normalized, weight);
     }
 }
 

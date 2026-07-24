@@ -88,6 +88,18 @@ public sealed record RuntimeConfiguration(
                 ?? throw new InvalidOperationException("The configuration file contains JSON null.");
             ValidateIndexingResources(config.IndexingResources);
             ValidateServer(config.Server ?? new ServerConfig());
+            foreach (var repository in config.Repositories ?? [])
+                ValidateRollingSettings(
+                    repository.BranchSeedMode,
+                    repository.BranchSeedCandidateCount,
+                    repository.BranchSeedMinimumSimilarity,
+                    "repositories");
+            foreach (var root in config.RepositoryRoots ?? [])
+                ValidateRollingSettings(
+                    root.BranchSeedMode,
+                    root.BranchSeedCandidateCount,
+                    root.BranchSeedMinimumSimilarity,
+                    "repositoryRoots");
             return config;
         }
         catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
@@ -130,6 +142,8 @@ public sealed record RuntimeConfiguration(
     {
         if (resources is null) return;
         ValidateRange(resources.MaxConcurrentIndexes, 1, 16, "indexingResources.maxConcurrentIndexes");
+        ValidateRange(resources.MaxConcurrentIncrementalSolutions, 1, 16,
+            "indexingResources.maxConcurrentIncrementalSolutions");
         ValidateRange(resources.MaxParallelProjects, 1, 64, "indexingResources.maxParallelProjects");
         ValidateRange(resources.IncrementalSolutionCacheSize, 1, 16, "indexingResources.incrementalSolutionCacheSize");
         ValidateRange(resources.IncrementalSolutionCacheIdleMinutes, 1, 1440, "indexingResources.incrementalSolutionCacheIdleMinutes");
@@ -137,6 +151,24 @@ public sealed record RuntimeConfiguration(
         ValidateRange(resources.MaxOpenBaselineReaders, 1, 128, "indexingResources.maxOpenBaselineReaders");
         ValidateRange(resources.MaxOpenOverlayReaders, 1, 128, "indexingResources.maxOpenOverlayReaders");
         ValidateRange(resources.StorageReaderIdleSeconds, 1, 86400, "indexingResources.storageReaderIdleSeconds");
+    }
+
+    private static void ValidateRollingSettings(
+        string branchSeedMode,
+        int candidateCount,
+        double minimumSimilarity,
+        string section)
+    {
+        if (!branchSeedMode.Equals("closestCompatible", StringComparison.OrdinalIgnoreCase) &&
+            !branchSeedMode.Equals("disabled", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                $"{section}.branchSeedMode must be 'closestCompatible' or 'disabled'.");
+        ValidateRange(candidateCount, 1, 16, $"{section}.branchSeedCandidateCount");
+        if (double.IsNaN(minimumSimilarity) ||
+            minimumSimilarity < 0 ||
+            minimumSimilarity > 1)
+            throw new InvalidOperationException(
+                $"{section}.branchSeedMinimumSimilarity must be between 0 and 1.");
     }
 
     private static void ValidateRange(int value, int minimum, int maximum, string name)

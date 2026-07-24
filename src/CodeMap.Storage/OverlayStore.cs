@@ -52,6 +52,66 @@ public sealed class OverlayStore : IOverlayStore
     }
 
     /// <inheritdoc/>
+    public async Task ForkOverlayAsync(
+        RepoId repoId,
+        WorkspaceId sourceWorkspaceId,
+        int sourceRevision,
+        WorkspaceId targetWorkspaceId,
+        CancellationToken ct = default)
+    {
+        var targetPath = _factory.GetDbPath(repoId, targetWorkspaceId);
+        if (File.Exists(targetPath))
+            throw new InvalidOperationException("Target overlay already exists.");
+        Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+        var temporaryPath = targetPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            using (var source = _factory.OpenExisting(repoId, sourceWorkspaceId)
+                   ?? throw new InvalidOperationException("Source overlay does not exist."))
+            {
+                using var revisionCommand = source.CreateCommand();
+                revisionCommand.CommandText =
+                    "SELECT value FROM overlay_meta WHERE key = 'revision' LIMIT 1";
+                var currentValue = await revisionCommand.ExecuteScalarAsync(ct).ConfigureAwait(false);
+                if (currentValue is not string text ||
+                    !int.TryParse(text, out var currentRevision) ||
+                    currentRevision != sourceRevision)
+                {
+                    throw new InvalidOperationException(
+                        $"Overlay revision changed: expected {sourceRevision}, current {currentValue}.");
+                }
+
+                using var target = new SqliteConnection($"Data Source={temporaryPath}");
+                await target.OpenAsync(ct).ConfigureAwait(false);
+                source.BackupDatabase(target);
+                using var update = target.CreateCommand();
+                update.CommandText =
+                    "UPDATE overlay_meta SET value = $workspace WHERE key = 'workspace_id'";
+                update.Parameters.AddWithValue("$workspace", targetWorkspaceId.Value);
+                await update.ExecuteNonQueryAsync(ct).ConfigureAwait(false);
+            }
+
+            using (var stream = new FileStream(
+                       temporaryPath,
+                       FileMode.Open,
+                       FileAccess.Read,
+                       FileShare.Read,
+                       4096,
+                       FileOptions.WriteThrough))
+            {
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temporaryPath, targetPath);
+        }
+        catch
+        {
+            if (File.Exists(temporaryPath))
+                File.Delete(temporaryPath);
+            throw;
+        }
+    }
+
+    /// <inheritdoc/>
     /// <remarks>Deletes all existing overlay data for reindexed files before inserting new data, ensuring a clean slate on re-index. All mutations run in a single transaction; FTS is rebuilt after commit.</remarks>
     public async Task ApplyDeltaAsync(
         RepoId repoId,
@@ -348,6 +408,33 @@ public sealed class OverlayStore : IOverlayStore
         while (await reader.ReadAsync(ct))
             paths.Add(FilePath.From(reader.GetString(0)));
         return paths;
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<SymbolCard>> GetOverlaySymbolsByFileAsync(
+        RepoId repoId,
+        WorkspaceId workspaceId,
+        FilePath filePath,
+        CancellationToken ct = default)
+    {
+        using var conn = _factory.OpenExisting(repoId, workspaceId);
+        if (conn is null) return [];
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT s.symbol_id, s.fqname, s.kind, s.signature, s.documentation,
+                   s.namespace, s.containing_type, f.path, s.span_start, s.span_end,
+                   s.visibility, s.confidence, s.content_hash, s.stable_id
+            FROM symbols s
+            JOIN files f ON s.file_id = f.file_id
+            WHERE f.path = $path
+            ORDER BY s.span_start
+            """;
+        cmd.Parameters.AddWithValue("$path", filePath.Value);
+        using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        var cards = new List<SymbolCard>();
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            cards.Add(ReadSymbolCard(reader));
+        return cards;
     }
 
     /// <inheritdoc/>

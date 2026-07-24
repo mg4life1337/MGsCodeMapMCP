@@ -129,7 +129,7 @@ internal sealed class RollingIndexStateStore
         var paths = Directory.EnumerateFiles(repoDirectory, "state.json", SearchOption.AllDirectories)
             .Select(path => (Path: path, IsCurrent: true))
             .Concat(Directory.EnumerateFiles(repoDirectory, "*.json", SearchOption.AllDirectories)
-                .Where(path => string.Equals(Path.GetFileName(Path.GetDirectoryName(path)), "history", StringComparison.OrdinalIgnoreCase))
+                .Where(IsSolutionStateHistory)
                 .Select(path => (Path: path, IsCurrent: false)));
         var entries = new List<StateEntry>();
         foreach (var item in paths)
@@ -144,6 +144,18 @@ internal sealed class RollingIndexStateStore
         return entries;
     }
 
+    private static bool IsSolutionStateHistory(string path)
+    {
+        var history = Directory.GetParent(path);
+        var branch = history?.Parent;
+        var branches = branch?.Parent;
+        return history is not null &&
+               branch is not null &&
+               branches is not null &&
+               string.Equals(history.Name, "history", StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(branches.Name, "branches", StringComparison.OrdinalIgnoreCase);
+    }
+
     internal static string StableId(string value)
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(value));
@@ -153,8 +165,22 @@ internal sealed class RollingIndexStateStore
     private static void AtomicWrite(string path, string content)
     {
         var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        File.WriteAllText(temporary, content, new UTF8Encoding(false));
-        File.Move(temporary, path, overwrite: true);
+        var bytes = new UTF8Encoding(false).GetBytes(content);
+        using (var stream = new FileStream(
+                   temporary,
+                   FileMode.CreateNew,
+                   FileAccess.Write,
+                   FileShare.None,
+                   64 * 1024,
+                   FileOptions.WriteThrough))
+        {
+            stream.Write(bytes);
+            stream.Flush(flushToDisk: true);
+        }
+        if (File.Exists(path))
+            File.Replace(temporary, path, destinationBackupFileName: null);
+        else
+            File.Move(temporary, path);
     }
 
     private sealed record StateEntry(RollingSolutionStatus State, string Path, bool IsCurrent);

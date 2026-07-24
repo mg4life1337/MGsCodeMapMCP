@@ -100,6 +100,31 @@ public sealed class SolutionImpactMapTests : IDisposable
         result.RebuildMap.Should().BeTrue();
     }
 
+    [Fact]
+    public void Build_ExternalProjectReference_IsExcludedFromRepositoryInputs()
+    {
+        var external = _root + "-external";
+        Directory.CreateDirectory(external);
+        try
+        {
+            var project = Path.Combine(external, "External.csproj");
+            File.WriteAllText(project, "<Project Sdk=\"Microsoft.NET.Sdk\" />");
+            File.AppendAllText(
+                _solution,
+                $"Project(\"{{00000000-0000-0000-0000-000000000000}}\") = \"External\", \"{project}\", \"{{30000000-0000-0000-0000-000000000000}}\"\nEndProject\n");
+
+            var map = SolutionImpactMap.Build(_root, _solution);
+
+            map.Projects.Should().HaveCount(2);
+            map.GetWeightedInputs().Keys.Should().NotContain(path =>
+                path == ".." || path.StartsWith("../", StringComparison.Ordinal));
+        }
+        finally
+        {
+            Directory.Delete(external, recursive: true);
+        }
+    }
+
     private static FileChange Changed(string path) =>
         new(FilePath.From(path), FileChangeKind.Modified);
 }

@@ -237,6 +237,59 @@ internal sealed class EngineOverlay : IEngineOverlay
         finally { _lock.ExitWriteLock(); }
     }
 
+    /// <summary>
+    /// Materializes one immutable overlay revision into a new directory. The source
+    /// write lock makes snapshot, revision check, and WAL state one consistency point.
+    /// </summary>
+    internal void ForkSnapshot(
+        string targetDirectory,
+        string targetWorkspaceId,
+        int expectedRevision)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            if (Revision != expectedRevision)
+                throw new InvalidOperationException(
+                    $"Overlay revision changed: expected {expectedRevision}, current {Revision}.");
+            if (Directory.Exists(targetDirectory))
+                throw new InvalidOperationException("Target overlay already exists.");
+
+            var parent = Path.GetDirectoryName(targetDirectory)
+                ?? throw new InvalidOperationException("Target overlay has no parent directory.");
+            Directory.CreateDirectory(parent);
+            var staging = targetDirectory + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                Directory.CreateDirectory(staging);
+                SnapshotSerializer.Write(Path.Combine(staging, "overlay.snapshot"), this);
+                WriteManifest(
+                    Path.Combine(staging, "manifest.json"),
+                    targetWorkspaceId,
+                    BaseCommitSha,
+                    NBaselineStringIds);
+                using (var wal = new FileStream(
+                           Path.Combine(staging, "overlay.wal"),
+                           FileMode.CreateNew,
+                           FileAccess.Write,
+                           FileShare.None,
+                           4096,
+                           FileOptions.WriteThrough))
+                {
+                    wal.Flush(flushToDisk: true);
+                }
+                Directory.Move(staging, targetDirectory);
+            }
+            catch
+            {
+                if (Directory.Exists(staging))
+                    Directory.Delete(staging, recursive: true);
+                throw;
+            }
+        }
+        finally { _lock.ExitWriteLock(); }
+    }
+
     /// <summary>Synchronous checkpoint for use in Dispose — avoids sync-over-async.</summary>
     private void DoCheckpointSync()
     {
@@ -463,17 +516,41 @@ internal sealed class EngineOverlay : IEngineOverlay
 
     private void WriteManifest()
     {
+        WriteManifest(
+            Path.Combine(_overlayDir, "manifest.json"),
+            WorkspaceId,
+            BaseCommitSha,
+            NBaselineStringIds);
+    }
+
+    private static void WriteManifest(
+        string path,
+        string workspaceId,
+        string baseCommitSha,
+        int baselineStringCount)
+    {
         var manifest = new
         {
             format_major = StorageConstants.FormatMajor,
             format_minor = StorageConstants.FormatMinor,
-            workspace_id = WorkspaceId,
-            base_commit_sha = BaseCommitSha,
-            n_baseline_string_ids = NBaselineStringIds,
+            workspace_id = workspaceId,
+            base_commit_sha = baseCommitSha,
+            n_baseline_string_ids = baselineStringCount,
             created_at_utc = DateTimeOffset.UtcNow.ToString("O"),
         };
-        File.WriteAllText(Path.Combine(_overlayDir, "manifest.json"),
-            JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }));
+        var json = JsonSerializer.Serialize(
+            manifest,
+            new JsonSerializerOptions { WriteIndented = true });
+        var bytes = System.Text.Encoding.UTF8.GetBytes(json);
+        using var stream = new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            4096,
+            FileOptions.WriteThrough);
+        stream.Write(bytes);
+        stream.Flush(flushToDisk: true);
     }
 
     private void OpenWalWriter()

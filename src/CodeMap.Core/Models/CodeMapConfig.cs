@@ -37,6 +37,7 @@ public sealed record ServerConfig(
 /// </summary>
 public sealed record IndexingResourceConfig(
     int MaxConcurrentIndexes = 1,
+    int MaxConcurrentIncrementalSolutions = 2,
     int MaxParallelProjects = 2,
     int IncrementalSolutionCacheSize = 1,
     int IncrementalSolutionCacheIdleMinutes = 5,
@@ -62,7 +63,11 @@ public record RepositoryRootConfig(
     string UpdateStrategy = "full",
     bool CheckAllSolutions = true,
     bool SkipUnaffectedSolutions = true,
-    bool ServePreviousIndexWhileUpdating = true,
+    string BranchSeedMode = "closestCompatible",
+    int BranchSeedCandidateCount = 3,
+    double BranchSeedMinimumSimilarity = 0.60,
+    bool StrictGenerationPublish = true,
+    bool ServePreviousIndexWhileUpdating = false,
     int RetentionDays = 30,
     int MaxRollingBranches = 8,
     int FullRebuildChangeThreshold = 5000
@@ -81,7 +86,11 @@ public record RepositoryConfig(
     string UpdateStrategy = "full",
     bool CheckAllSolutions = true,
     bool SkipUnaffectedSolutions = true,
-    bool ServePreviousIndexWhileUpdating = true,
+    string BranchSeedMode = "closestCompatible",
+    int BranchSeedCandidateCount = 3,
+    double BranchSeedMinimumSimilarity = 0.60,
+    bool StrictGenerationPublish = true,
+    bool ServePreviousIndexWhileUpdating = false,
     int RetentionDays = 30,
     int MaxRollingBranches = 8,
     int FullRebuildChangeThreshold = 5000
