@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.8.0-mgs.8 - 2026-07-24
+
+### Atomic rolling generations and compatible branch seeds
+
+- Added consistent LibGit2Sharp repository snapshots covering branch, HEAD, index, and working-tree state without invoking `git.exe`, a shell, or an implicit fetch.
+- Added per-Solution compatible seed selection using weighted relevant-input similarity, Git relationship, changed-project count, and recency.
+- Added immutable, snapshot-consistent overlay forks with deletion handling against the complete merged seed view.
+- Replaced per-Solution rolling activation with one durable, atomically swapped repository generation containing every configured Solution binding.
+- Added strict target revalidation, structured `INDEX_UPDATING`/`INDEX_NOT_READY` query errors, and crash-safe cleanup of unpublished staging workspaces.
+- Added path-scoped generation pointers so separate local repository instances remain isolated even when they share a remote and Solution layout.
+- Replaced the global incremental compiler lock with per-Solution serialization and configurable cross-Solution parallelism.
+- Added configuration, scoring, routing, retention, overlay isolation, snapshot, duplicate-folder, and staging recovery regression coverage.
+- Verified an exact restart across 38 Solutions in 10 repository instances with 38 reused bindings, no full rebuilds, and no generation failures.
+
 ## 2.8.0-mgs.7 - 2026-07-24
 
 ### Idle memory reclamation and path-scoped solution identity

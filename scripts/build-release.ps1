@@ -1,4 +1,4 @@
-param([string]$Version = "2.8.0-mgs.7")
+param([string]$Version = "2.8.0-mgs.8")
 
 $ErrorActionPreference = "Stop"
 dotnet pack src/MGsCodeMap.Mcp/MGsCodeMap.Mcp.csproj -c Release "-p:Version=$Version" -o dist/nupkg

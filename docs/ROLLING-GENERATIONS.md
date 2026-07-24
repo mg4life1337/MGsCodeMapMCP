@@ -1,5 +1,7 @@
 # Rolling branch generations
 
+This generation model is introduced in `2.8.0-mgs.8`.
+
 Rolling indexing treats a branch as the long-lived logical cache key. HEAD and
 the index/working-tree fingerprint are internal consistency markers, not
 separate logical branches.

@@ -55,7 +55,7 @@ internal static class Program
 
     private static string Version => typeof(Program).Assembly
         .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
-        ?? "2.8.0-mgs.7";
+        ?? "2.8.0-mgs.8";
 
     private static string Sanitize(string value) =>
         value.Replace('\r', ' ').Replace('\n', ' ');

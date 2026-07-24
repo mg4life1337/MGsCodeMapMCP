@@ -4,7 +4,7 @@
 
 STDIO MCP clients commonly own the lifetime of the command they start. When several client tasks use the same STDIO configuration, each task can therefore start a complete semantic server. Each process then has its own Roslyn and MSBuild state while trying to open the same rolling overlays.
 
-MGsCodeMapMCP `2.8.0-mgs.7` keeps all semantic state in one long-lived process and adds a supervised windowless Windows task host:
+MGsCodeMapMCP `2.8.0-mgs.8` keeps all semantic state in one long-lived process and uses a supervised windowless Windows task host:
 
 ```text
 Task Scheduler ──> MGsCodeMap.TaskHost ──> MGsCodeMap.Daemon

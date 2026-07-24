@@ -1,4 +1,4 @@
-param([string]$Version = "2.8.0-mgs.7")
+param([string]$Version = "2.8.0-mgs.8")
 
 $ErrorActionPreference = "Stop"
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
@@ -62,7 +62,8 @@ foreach ($file in @("codemap.example.json", "README.md", "LICENSE.MD", "THIRD-PA
 New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "docs") | Out-Null
 foreach ($doc in @(
     "CENTRAL-DAEMON.MD", "WINDOWS-INSTALLATION.MD",
-    "ROLLING-BRANCH-INDEXING.MD", "ROLLING-GENERATIONS.md")) {
+    "ROLLING-BRANCH-INDEXING.MD", "ROLLING-GENERATIONS.md",
+    "MGS8-ROLLING-GENERATION-ACCEPTANCE.md")) {
     Copy-Item -LiteralPath (Join-Path $repoRoot "docs\$doc") -Destination (Join-Path $releaseDir "docs")
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "scripts") | Out-Null

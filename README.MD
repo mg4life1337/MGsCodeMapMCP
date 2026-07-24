@@ -26,7 +26,7 @@ MCP client 3 ─┘                                    ├─ Roslyn / MSBuild
                                                    └─ one writer per data directory
 ```
 
-Current fork version: `2.8.0-mgs.7`.
+Current fork version: `2.8.0-mgs.8`.
 
 ## Windows installation
 
@@ -125,6 +125,8 @@ In `rollingBranch` mode, the branch is the logical cache key. Each Solution inde
 
 All configured Solutions are published as one repository generation. The daemon revalidates branch, HEAD, index, and working tree immediately before atomically replacing `active-generation.json`. With the safe default `servePreviousIndexWhileUpdating: false`, queries return `INDEX_UPDATING` or `INDEX_NOT_READY` until a complete generation exists for the current target. Git observation uses LibGit2Sharp only and never performs an implicit network fetch.
 
+Details and measured verification: [rolling generation model](docs/ROLLING-GENERATIONS.md) and [mgs.8 rolling-generation acceptance](docs/MGS8-ROLLING-GENERATION-ACCEPTANCE.md).
+
 Full-index memory reclamation is batch-scoped. After publication and the reader idle timeout, the daemon waits until there is no full index, incremental update, or active MCP request and the last MCP request has been quiet for at least 120 seconds. If the managed heap remains above `memoryReclaimMinimumManagedHeapMb`, it requests one LOH compaction and performs one blocking full collection. It does not collect after each Solution.
 
 The default host is loopback-only. A non-loopback host is rejected unless `allowRemote` is explicitly enabled. Authentication and TLS are not built in, so remote exposure should be placed behind an appropriate protected reverse proxy.
@@ -187,7 +189,7 @@ The daemon must already be running. Add `--start-daemon` to the proxy arguments 
 5. Change Codex from `command`/`args` to the HTTP `url` configuration.
 6. Restart Codex and confirm one `MGsCodeMap.Daemon.exe` process.
 
-The storage format is unchanged in `2.8.0-mgs.7`; existing baselines, rolling state, overlays, and valid WAL data are reused. A validated compatibility alias reuses an existing `mgs.6` baseline only when its recorded repository root matches the current repository instance. A second clone in another folder receives its own path-scoped index.
+The baseline storage format remains compatible in `2.8.0-mgs.8`; existing baselines and valid baseline data from `mgs.7` are retained. Atomic rolling-generation metadata is created automatically. A validated compatibility alias reuses an existing `mgs.6` baseline only when its recorded repository root matches the current repository instance. A second clone in another folder receives its own path-scoped index.
 
 ## MCP tools
 

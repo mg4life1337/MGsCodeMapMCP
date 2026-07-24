@@ -130,7 +130,7 @@ The install operation uses `Register-ScheduledTask -Force`, so running it again 
 6. Change Codex from STDIO `command`/`args` to the HTTP `url`.
 7. Confirm that only one `MGsCodeMap.Daemon.exe` is running.
 
-The `2.8.0-mgs.7` storage format is compatible with the preceding fork release, so existing indexes are retained. Existing relative-path Solution IDs are reused through a validated alias when the recorded repository root matches. Identical clones in different folders are deliberately isolated into separate indexes.
+The baseline storage format in `2.8.0-mgs.8` remains compatible with `mgs.7`, so existing baselines are retained. Atomic rolling-generation metadata is created automatically. Existing relative-path Solution IDs are reused through a validated alias when the recorded repository root matches. Identical clones in different folders are deliberately isolated into separate indexes.
 
 ## STDIO fallback
 

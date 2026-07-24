@@ -19,7 +19,7 @@ public sealed class TaskHostSubprocessTests
         await process.WaitForExitAsync();
 
         process.ExitCode.Should().Be(0);
-        output.Trim().Should().Be("MGsCodeMapMCP Task Host 2.8.0-mgs.7");
+        output.Trim().Should().Be("MGsCodeMapMCP Task Host 2.8.0-mgs.8");
     }
 
     [Fact]

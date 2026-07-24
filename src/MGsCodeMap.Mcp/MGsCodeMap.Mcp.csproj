@@ -4,7 +4,7 @@
     <RootNamespace>MGsCodeMap.Mcp</RootNamespace>
     <AssemblyName>MGsCodeMap.Mcp</AssemblyName>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <Version>2.8.0-mgs.7</Version>
+    <Version>2.8.0-mgs.8</Version>
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>mgscodemap-mcp</ToolCommandName>
     <PackageId>MGsCodeMapMCP</PackageId>

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=${1:-2.8.0-mgs.7}
+VERSION=${1:-2.8.0-mgs.8}
 dotnet pack src/MGsCodeMap.Mcp/MGsCodeMap.Mcp.csproj -c Release -p:Version="${VERSION}" -o dist/nupkg
 
 for RID in win-x64 linux-x64 osx-arm64; do
