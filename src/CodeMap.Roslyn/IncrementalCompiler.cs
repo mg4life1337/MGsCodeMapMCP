@@ -24,6 +24,7 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
 {
     private readonly SymbolDiffer _differ;
     private readonly ILogger<IncrementalCompiler> _logger;
+    private readonly RuntimeActivityTracker? _activity;
 
     // Workspace caching — protects cached solutions from concurrent callers.
     private readonly SemaphoreSlim _lock = new(1, 1);
@@ -49,10 +50,12 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
         SymbolDiffer differ,
         ILogger<IncrementalCompiler> logger,
         IndexingResourceConfig? resources = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        RuntimeActivityTracker? activity = null)
     {
         _differ = differ;
         _logger = logger;
+        _activity = activity;
         var effectiveResources = resources ?? new IndexingResourceConfig();
         _maxCachedSolutions = effectiveResources.IncrementalSolutionCacheSize;
         _cacheIdleTime = TimeSpan.FromMinutes(effectiveResources.IncrementalSolutionCacheIdleMinutes);
@@ -84,6 +87,7 @@ public class IncrementalCompiler : IIncrementalCompiler, IDisposable
             return OverlayDelta.Empty(currentRevision + 1);
         }
 
+        using var activityLease = _activity?.BeginIncrementalUpdate();
         MsBuildInitializer.EnsureRegistered();
 
         await _lock.WaitAsync(ct);

@@ -17,7 +17,12 @@
     "maxParallelProjects": 2,
     "incrementalSolutionCacheSize": 1,
     "incrementalSolutionCacheIdleMinutes": 5,
-    "memoryTelemetry": true
+    "memoryTelemetry": true,
+    "releaseMemoryAfterFullIndex": true,
+    "memoryReclaimMinimumManagedHeapMb": 768,
+    "maxOpenBaselineReaders": 2,
+    "maxOpenOverlayReaders": 2,
+    "storageReaderIdleSeconds": 60
   },
   "repositories": [
     {

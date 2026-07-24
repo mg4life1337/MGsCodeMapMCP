@@ -133,6 +133,10 @@ public sealed record RuntimeConfiguration(
         ValidateRange(resources.MaxParallelProjects, 1, 64, "indexingResources.maxParallelProjects");
         ValidateRange(resources.IncrementalSolutionCacheSize, 1, 16, "indexingResources.incrementalSolutionCacheSize");
         ValidateRange(resources.IncrementalSolutionCacheIdleMinutes, 1, 1440, "indexingResources.incrementalSolutionCacheIdleMinutes");
+        ValidateRange(resources.MemoryReclaimMinimumManagedHeapMb, 1, 131072, "indexingResources.memoryReclaimMinimumManagedHeapMb");
+        ValidateRange(resources.MaxOpenBaselineReaders, 1, 128, "indexingResources.maxOpenBaselineReaders");
+        ValidateRange(resources.MaxOpenOverlayReaders, 1, 128, "indexingResources.maxOpenOverlayReaders");
+        ValidateRange(resources.StorageReaderIdleSeconds, 1, 86400, "indexingResources.storageReaderIdleSeconds");
     }
 
     private static void ValidateRange(int value, int minimum, int maximum, string name)

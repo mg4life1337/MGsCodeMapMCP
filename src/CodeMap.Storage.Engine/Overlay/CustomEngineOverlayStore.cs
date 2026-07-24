@@ -20,6 +20,7 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     // workspaceId → (baseCommitSha, repoId) mapping (set on CreateOverlayAsync)
     private readonly ConcurrentDictionary<string, (string CommitSha, string RepoId)> _wsToCommit = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, string> _wsToOverlayKey = new(StringComparer.Ordinal);
 
     public CustomEngineOverlayStore(CustomSymbolStore symbolStore, string storeBaseDir)
     {
@@ -31,18 +32,21 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task CreateOverlayAsync(RepoId repoId, WorkspaceId workspaceId, CommitSha baselineCommitSha, CancellationToken ct = default)
     {
-        var overlayKey = OverlayKey(repoId, workspaceId);
-        _wsToCommit[overlayKey] = (baselineCommitSha.Value, repoId.Value);
+        var logicalKey = OverlayKey(repoId, workspaceId);
+        var overlayKey = ResolveCompatibleOverlayKey(repoId, workspaceId, logicalKey);
+        _wsToCommit[logicalKey] = (baselineCommitSha.Value, repoId.Value);
+        _wsToOverlayKey[logicalKey] = overlayKey;
 
-        var (reader, _) = _symbolStore.GetOrOpenBaseline(repoId.Value, baselineCommitSha.Value);
-        _symbolStore.GetOrCreateOverlay(overlayKey, reader);
+        using var lease = _symbolStore.AcquireOverlay(
+            overlayKey, repoId.Value, baselineCommitSha.Value);
         return Task.CompletedTask;
     }
 
     public async Task ApplyDeltaAsync(RepoId repoId, WorkspaceId workspaceId, OverlayDelta delta, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null) return;
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null) return;
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
 
         using var batch = overlay.BeginBatch();
 
@@ -198,41 +202,49 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task ResetOverlayAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var overlayKey = OverlayKey(repoId, workspaceId);
-        var found = _wsToCommit.TryGetValue(overlayKey, out var entry);
+        var logicalKey = OverlayKey(repoId, workspaceId);
+        var overlayKey = _wsToOverlayKey.GetValueOrDefault(logicalKey, logicalKey);
+        var found = _wsToCommit.TryGetValue(logicalKey, out var entry);
 
         _symbolStore.DeleteOverlay(overlayKey);
         if (found)
         {
-            var (reader, _) = _symbolStore.GetOrOpenBaseline(entry.RepoId, entry.CommitSha);
-            _symbolStore.GetOrCreateOverlay(overlayKey, reader);
+            using var lease = _symbolStore.AcquireOverlay(
+                overlayKey, entry.RepoId, entry.CommitSha);
         }
         return Task.CompletedTask;
     }
 
     public Task DeleteOverlayAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var overlayKey = OverlayKey(repoId, workspaceId);
+        var logicalKey = OverlayKey(repoId, workspaceId);
+        var overlayKey = _wsToOverlayKey.GetValueOrDefault(logicalKey, logicalKey);
         _symbolStore.DeleteOverlay(overlayKey);
-        _wsToCommit.TryRemove(overlayKey, out _);
+        _wsToCommit.TryRemove(logicalKey, out _);
+        _wsToOverlayKey.TryRemove(logicalKey, out _);
         return Task.CompletedTask;
     }
 
     // ── Read ─────────────────────────────────────────────────────────────────
 
     public Task<bool> OverlayExistsAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
-        => Task.FromResult(_symbolStore.OverlayExists(OverlayKey(repoId, workspaceId)));
+    {
+        var logicalKey = OverlayKey(repoId, workspaceId);
+        var overlayKey = _wsToOverlayKey.GetValueOrDefault(logicalKey, logicalKey);
+        return Task.FromResult(_symbolStore.OverlayExists(overlayKey));
+    }
 
     public Task<int> GetRevisionAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var overlay = _symbolStore.TryGetOverlay(OverlayKey(repoId, workspaceId));
-        return Task.FromResult(overlay?.Revision ?? 0);
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        return Task.FromResult(lease?.Overlay.Revision ?? 0);
     }
 
     public Task<SymbolCard?> GetOverlaySymbolAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null) return Task.FromResult<SymbolCard?>(null);
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null) return Task.FromResult<SymbolCard?>(null);
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
 
         SymbolRecord? rec;
         if (symbolId.Value.StartsWith("sym_", StringComparison.Ordinal))
@@ -258,9 +270,10 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlyList<SymbolSearchHit>> SearchOverlaySymbolsAsync(RepoId repoId, WorkspaceId workspaceId, string query, SymbolSearchFilters? filters, int limit, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null)
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null)
             return Task.FromResult<IReadOnlyList<SymbolSearchHit>>([]);
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
 
         // Tokenize query the same way symbols are tokenized at index time
         var queryTokens = query.ToLowerInvariant()
@@ -366,9 +379,10 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
         IReadOnlyList<SymbolKind>? kinds, SymbolSearchFilters? filters,
         int limit, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null)
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null)
             return Task.FromResult<IReadOnlyList<SymbolSearchHit>>([]);
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
 
         var results = new List<SymbolSearchHit>();
         foreach (var sym in overlay.GetOverlayNewSymbols())
@@ -494,8 +508,9 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlyList<StoredReference>> GetOverlayReferencesAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, RefKind? kind, int limit, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null) return Task.FromResult<IReadOnlyList<StoredReference>>([]);
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null) return Task.FromResult<IReadOnlyList<StoredReference>>([]);
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
         var intId = ResolveIntId(reader, overlay, symbolId.Value);
         var edges = overlay.GetOverlayIncomingEdges(intId);
         var refs = new List<StoredReference>();
@@ -510,8 +525,9 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlySet<SymbolId>> GetDeletedSymbolIdsAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null) return Task.FromResult<IReadOnlySet<SymbolId>>(new HashSet<SymbolId>());
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null) return Task.FromResult<IReadOnlySet<SymbolId>>(new HashSet<SymbolId>());
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
         var result = new HashSet<SymbolId>();
         foreach (var stableId in overlay.Tombstones)
         {
@@ -527,8 +543,9 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlySet<FilePath>> GetOverlayFilePathsAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var (overlay, _) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null) return Task.FromResult<IReadOnlySet<FilePath>>(new HashSet<FilePath>());
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null) return Task.FromResult<IReadOnlySet<FilePath>>(new HashSet<FilePath>());
+        var overlay = lease.Overlay;
         var snapshot = overlay.GetFilePathsSnapshot();
         var paths = new HashSet<FilePath>(
             snapshot.Where(p => !string.IsNullOrWhiteSpace(p)).Select(FilePath.From),
@@ -538,8 +555,9 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlyList<StoredOutgoingReference>> GetOutgoingOverlayReferencesAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, RefKind? kind, int limit, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null) return Task.FromResult<IReadOnlyList<StoredOutgoingReference>>([]);
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null) return Task.FromResult<IReadOnlyList<StoredOutgoingReference>>([]);
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
         var intId = ResolveIntId(reader, overlay, symbolId.Value);
         var edges = overlay.GetOverlayOutgoingEdges(intId);
         var refs = new List<StoredOutgoingReference>();
@@ -554,9 +572,10 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlyList<StoredTypeRelation>> GetOverlayTypeRelationsAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null)
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null)
             return Task.FromResult<IReadOnlyList<StoredTypeRelation>>([]);
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
         var typeIntId = ResolveIntId(reader, overlay, symbolId.Value);
         var relations = overlay.GetOverlayOutgoingEdges(typeIntId)
             .Where(edge => edge.EdgeKind is 4 or 5)
@@ -569,9 +588,10 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlyList<StoredTypeRelation>> GetOverlayDerivedTypesAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null)
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null)
             return Task.FromResult<IReadOnlyList<StoredTypeRelation>>([]);
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
         var relatedIntId = ResolveIntId(reader, overlay, symbolId.Value);
         var relations = overlay.GetOverlayIncomingEdges(relatedIntId)
             .Where(edge => edge.EdgeKind is 4 or 5)
@@ -587,8 +607,9 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<SymbolCard?> GetSymbolByStableIdAsync(RepoId repoId, WorkspaceId workspaceId, StableId stableId, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null) return Task.FromResult<SymbolCard?>(null);
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null) return Task.FromResult<SymbolCard?>(null);
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
         var rec = overlay.TryGetOverlaySymbol(stableId.Value, out var tombstoned);
         if (rec == null || tombstoned) return Task.FromResult<SymbolCard?>(null);
         return Task.FromResult<SymbolCard?>(RecordToCoreMappings.ToSymbolCard(rec.Value, reader, overlay.ResolveString));
@@ -599,8 +620,9 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<IReadOnlyList<StoredFact>> GetOverlayFactsForSymbolAsync(RepoId repoId, WorkspaceId workspaceId, SymbolId symbolId, CancellationToken ct = default)
     {
-        var (overlay, reader) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null || reader == null) return Task.FromResult<IReadOnlyList<StoredFact>>([]);
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        if (lease is null) return Task.FromResult<IReadOnlyList<StoredFact>>([]);
+        var (overlay, reader) = (lease.Overlay, lease.Reader);
         var intId = ResolveIntId(reader, overlay, symbolId.Value);
         var facts = overlay.GetOverlayFacts(intId);
         var result = new List<StoredFact>(facts.Count);
@@ -611,9 +633,8 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     public Task<int> GetOverlayFactCountAsync(RepoId repoId, WorkspaceId workspaceId, CancellationToken ct = default)
     {
-        var (overlay, _) = GetOverlayAndReader(repoId, workspaceId);
-        if (overlay == null) return Task.FromResult(0);
-        return Task.FromResult(overlay.GetFactCount());
+        using var lease = GetOverlayLease(repoId, workspaceId);
+        return Task.FromResult(lease?.Overlay.GetFactCount() ?? 0);
     }
 
     public Task<IReadOnlyList<UnresolvedEdge>> GetOverlayUnresolvedEdgesAsync(RepoId repoId, WorkspaceId workspaceId, IReadOnlyList<FilePath> filePaths, CancellationToken ct = default)
@@ -628,17 +649,28 @@ public sealed class CustomEngineOverlayStore : IOverlayStore
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
-    private (EngineOverlay? Overlay, EngineBaselineReader? Reader) GetOverlayAndReader(
+    private CustomSymbolStore.OverlayReaderLease? GetOverlayLease(
         RepoId repoId,
         WorkspaceId workspaceId)
     {
         var overlayKey = OverlayKey(repoId, workspaceId);
         if (!_wsToCommit.TryGetValue(overlayKey, out var entry))
-            return (null, null);
+            return null;
 
-        var (reader, _) = _symbolStore.GetOrOpenBaseline(entry.RepoId, entry.CommitSha);
-        var overlay = _symbolStore.TryGetOverlay(overlayKey);
-        return (overlay, reader);
+        var physicalKey = _wsToOverlayKey.GetValueOrDefault(overlayKey, overlayKey);
+        return _symbolStore.AcquireOverlay(physicalKey, entry.RepoId, entry.CommitSha);
+    }
+
+    private string ResolveCompatibleOverlayKey(
+        RepoId repoId,
+        WorkspaceId workspaceId,
+        string logicalKey)
+    {
+        if (!_symbolStore.TryGetLegacyBaselineAlias(repoId, out var legacyRepoId))
+            return logicalKey;
+
+        var legacyKey = OverlayKey(legacyRepoId, workspaceId);
+        return _symbolStore.OverlayExists(legacyKey) ? legacyKey : logicalKey;
     }
 
     internal static string OverlayKey(RepoId repoId, WorkspaceId workspaceId)

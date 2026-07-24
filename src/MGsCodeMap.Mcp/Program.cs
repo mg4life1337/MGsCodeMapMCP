@@ -99,7 +99,7 @@ internal static class Program
 
     private static string Version => typeof(Program).Assembly
         .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
-        ?? "2.8.0-mgs.6";
+        ?? "2.8.0-mgs.7";
 
     private static async Task<bool> IsHealthyAsync(HttpClient client, Uri health)
     {

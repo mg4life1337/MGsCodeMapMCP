@@ -48,6 +48,8 @@ public sealed class IndexHandler
     private readonly ILogger<IndexHandler> _logger;
     private readonly IndexingResourceConfig _resources;
     private readonly IndexingResourceGate _resourceGate;
+    private readonly FullIndexMemoryReclaimer? _memoryReclaimer;
+    private readonly RuntimeActivityTracker? _activity;
 
     public IndexHandler(
         IGitService git,
@@ -59,7 +61,9 @@ public sealed class IndexHandler
         IBaselineScanner? scanner = null,
         WorkspaceManager? workspaceManager = null,
         IndexingResourceConfig? resources = null,
-        IndexingResourceGate? resourceGate = null)
+        IndexingResourceGate? resourceGate = null,
+        FullIndexMemoryReclaimer? memoryReclaimer = null,
+        RuntimeActivityTracker? activity = null)
     {
         _git = git;
         _compiler = compiler;
@@ -71,6 +75,8 @@ public sealed class IndexHandler
         _logger = logger;
         _resources = resources ?? new IndexingResourceConfig();
         _resourceGate = resourceGate ?? new IndexingResourceGate(_resources.MaxConcurrentIndexes);
+        _memoryReclaimer = memoryReclaimer;
+        _activity = activity;
     }
 
     /// <summary>
@@ -350,7 +356,8 @@ public sealed class IndexHandler
             {
 
             // Step 1: Check local (existing behavior)
-            var exists = await _store.BaselineExistsAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
+            var exists = await BaselineMatchesRepositoryAsync(
+                storageRepoId, commitSha, repoPath!, ct).ConfigureAwait(false);
             if (exists)
             {
                 _logger.LogInformation("index.ensure_baseline: baseline already exists for {Sha}", commitSha.Value[..8]);
@@ -366,7 +373,8 @@ public sealed class IndexHandler
             if (pulledPath is not null)
             {
                 // Verify the pulled DB is now available locally
-                var pulledExists = await _store.BaselineExistsAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
+                var pulledExists = await BaselineMatchesRepositoryAsync(
+                    storageRepoId, commitSha, repoPath!, ct).ConfigureAwait(false);
                 if (pulledExists)
                 {
                     _logger.LogInformation(
@@ -379,45 +387,21 @@ public sealed class IndexHandler
                 }
             }
 
-            // Step 3: Build locally via Roslyn. Cache/discovery work stays outside this
-            // process-wide gate; only memory-intensive compilation and persistence are bounded.
-            using var resourceLease = await _resourceGate.AcquireAsync(ct).ConfigureAwait(false);
-            await using var memoryTelemetry = _resources.MemoryTelemetry
-                ? IndexMemoryTelemetry.Start((phase, snapshot) =>
-                    _logger.LogInformation(
-                        "INDEX_MEMORY phase={Phase} working_set_mb={WorkingSetMb:F1} private_mb={PrivateMb:F1} managed_heap_mb={ManagedHeapMb:F1}",
-                        phase,
-                        snapshot.WorkingSetBytes / 1048576d,
-                        snapshot.PrivateMemoryBytes / 1048576d,
-                        snapshot.ManagedHeapBytes / 1048576d))
-                : null;
+            // Step 3: Keep the large Roslyn result and storage build input inside a
+            // dedicated async state machine. Only small stats cross this boundary.
+            FullIndexBuildResult build;
+            using (_activity?.BeginPublication())
+            {
+                build = await CompileAndCreateBaselineAsync(
+                    storageRepoId, commitSha, solutionPath, repoPath!, ct).ConfigureAwait(false);
+                if (build.Error is not null)
+                    return Error(build.Error);
 
-            _logger.LogInformation("index.ensure_baseline: compiling {SolutionPath}", solutionPath);
-            IndexMemoryTelemetry.MarkPhase("compile-start");
-            var compilationResult = await _compiler.CompileAndExtractAsync(solutionPath, ct).ConfigureAwait(false);
-
-            if (compilationResult.Symbols.Count == 0 && compilationResult.Stats.Confidence == Core.Enums.Confidence.Low)
-                return Error(CodeMapError.CompilationFailed(
-                    "Compilation produced no symbols. Check build errors.",
-                    [solutionPath]).Message);
-
-            // Store with repoRootPath (ADR-012)
-            await _store.CreateBaselineAsync(storageRepoId, commitSha, compilationResult, repoPath, ct).ConfigureAwait(false);
-            IndexMemoryTelemetry.MarkPhase("baseline-written");
-
-            var resourceUsage = memoryTelemetry?.Complete(
-                _resources.MaxParallelProjects,
-                _resources.MaxConcurrentIndexes);
-            var responseStats = compilationResult.Stats with { ResourceUsage = resourceUsage };
-
-            _logger.LogInformation(
-                "index.ensure_baseline: indexed {Symbols} symbols, {Refs} refs in {Ms:F1}ms",
-                responseStats.SymbolCount,
-                responseStats.ReferenceCount,
-                responseStats.ElapsedSeconds * 1000);
-
-            // Step 4: Push to shared cache — fire-and-forget for errors
-            await _cache.PushAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
+                // Step 4: Push after the baseline is atomically published.
+                await _cache.PushAsync(storageRepoId, commitSha, ct).ConfigureAwait(false);
+            }
+            _memoryReclaimer?.Schedule();
+            var responseStats = build.Stats!;
 
             _repoRegistry.Register(repoPath!);
             var response = new EnsureBaselineResponse(
@@ -436,6 +420,111 @@ public sealed class IndexHandler
             return Error($"Indexing failed: {ex.Message}");
         }
     }
+
+    private async Task<FullIndexBuildResult> CompileAndCreateBaselineAsync(
+        RepoId storageRepoId,
+        CommitSha commitSha,
+        string solutionPath,
+        string repoPath,
+        CancellationToken ct)
+    {
+        using var resourceLease = await _resourceGate.AcquireAsync(ct).ConfigureAwait(false);
+        await using var memoryTelemetry = _resources.MemoryTelemetry
+            ? IndexMemoryTelemetry.Start((phase, snapshot) =>
+                _logger.LogInformation(
+                    "INDEX_MEMORY phase={Phase} working_set_mb={WorkingSetMb:F1} private_mb={PrivateMb:F1} managed_heap_mb={ManagedHeapMb:F1}",
+                    phase,
+                    snapshot.WorkingSetBytes / 1048576d,
+                    snapshot.PrivateMemoryBytes / 1048576d,
+                    snapshot.ManagedHeapBytes / 1048576d))
+            : null;
+
+        _logger.LogInformation("index.ensure_baseline: compiling {SolutionPath}", solutionPath);
+        IndexMemoryTelemetry.MarkPhase("compile-start");
+        CompilationResult? compilationResult = await _compiler
+            .CompileAndExtractAsync(solutionPath, ct)
+            .ConfigureAwait(false);
+        if (compilationResult.Symbols.Count == 0 &&
+            compilationResult.Stats.Confidence == Core.Enums.Confidence.Low)
+        {
+            compilationResult = null;
+            return new FullIndexBuildResult(
+                null,
+                CodeMapError.CompilationFailed(
+                    "Compilation produced no symbols. Check build errors.",
+                    [solutionPath]).Message);
+        }
+
+        await _store.CreateBaselineAsync(
+            storageRepoId, commitSha, compilationResult, repoPath, ct).ConfigureAwait(false);
+        IndexMemoryTelemetry.MarkPhase("baseline-written");
+
+        var resourceUsage = memoryTelemetry?.Complete(
+            _resources.MaxParallelProjects,
+            _resources.MaxConcurrentIndexes);
+        var responseStats = compilationResult.Stats with { ResourceUsage = resourceUsage };
+        _logger.LogInformation(
+            "index.ensure_baseline: indexed {Symbols} symbols, {Refs} refs in {Ms:F1}ms",
+            responseStats.SymbolCount,
+            responseStats.ReferenceCount,
+            responseStats.ElapsedSeconds * 1000);
+        compilationResult = null;
+        return new FullIndexBuildResult(responseStats, null);
+    }
+
+    private async Task<bool> BaselineMatchesRepositoryAsync(
+        RepoId storageRepoId,
+        CommitSha commitSha,
+        string repoPath,
+        CancellationToken ct)
+    {
+        if (await _store.BaselineExistsAsync(storageRepoId, commitSha, ct).ConfigureAwait(false))
+            return await StoredRootMatchesAsync(
+                storageRepoId, commitSha, repoPath, ct).ConfigureAwait(false);
+
+        if (_store is not ILegacyBaselineAliasRegistry aliases ||
+            !SolutionScope.TryParse(storageRepoId, out var publicRepoId, out var solutionId) ||
+            !solutionId.TryGetLegacyId(out var legacySolutionId))
+            return false;
+
+        var legacyStorageRepoId = SolutionScope.ToStorageRepoId(publicRepoId, legacySolutionId);
+        if (!await _store.BaselineExistsAsync(
+                legacyStorageRepoId, commitSha, ct).ConfigureAwait(false))
+            return false;
+
+        if (!await StoredRootMatchesAsync(
+                legacyStorageRepoId, commitSha, repoPath, ct,
+                requireRecordedRoot: true).ConfigureAwait(false))
+        {
+            _logger.LogInformation(
+                "Existing legacy baseline belongs to a different repository instance; building an independent index for {RepoPath}",
+                repoPath);
+            return false;
+        }
+
+        aliases.RegisterLegacyBaselineAlias(storageRepoId, legacyStorageRepoId);
+        return true;
+    }
+
+    private async Task<bool> StoredRootMatchesAsync(
+        RepoId storageRepoId,
+        CommitSha commitSha,
+        string repoPath,
+        CancellationToken ct,
+        bool requireRecordedRoot = false)
+    {
+        var indexedRoot = await _store.GetRepoRootAsync(
+            storageRepoId, commitSha, ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(indexedRoot))
+            return !requireRecordedRoot;
+        return string.Equals(
+            NormalizePath(indexedRoot),
+            NormalizePath(repoPath),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizePath(string path) =>
+        Path.GetFullPath(path).Replace('\\', '/').TrimEnd('/');
 
     /// <summary>
     /// Discovers the solution file path. Handles four cases:
@@ -575,4 +664,6 @@ public sealed class IndexHandler
         bool AlreadyExisted,
         IndexStats? Stats,
         bool FromCache = false);
+
+    private sealed record FullIndexBuildResult(IndexStats? Stats, string? Error);
 }

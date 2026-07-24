@@ -166,7 +166,12 @@ public sealed class ConfigLoadingTests : IDisposable
                 "maxParallelProjects": 3,
                 "incrementalSolutionCacheSize": 2,
                 "incrementalSolutionCacheIdleMinutes": 10,
-                "memoryTelemetry": false
+                "memoryTelemetry": false,
+                "releaseMemoryAfterFullIndex": false,
+                "memoryReclaimMinimumManagedHeapMb": 900,
+                "maxOpenBaselineReaders": 3,
+                "maxOpenOverlayReaders": 4,
+                "storageReaderIdleSeconds": 75
               }
             }
             """);
@@ -179,6 +184,11 @@ public sealed class ConfigLoadingTests : IDisposable
         resources.IncrementalSolutionCacheSize.Should().Be(2);
         resources.IncrementalSolutionCacheIdleMinutes.Should().Be(10);
         resources.MemoryTelemetry.Should().BeFalse();
+        resources.ReleaseMemoryAfterFullIndex.Should().BeFalse();
+        resources.MemoryReclaimMinimumManagedHeapMb.Should().Be(900);
+        resources.MaxOpenBaselineReaders.Should().Be(3);
+        resources.MaxOpenOverlayReaders.Should().Be(4);
+        resources.StorageReaderIdleSeconds.Should().Be(75);
     }
 
     [Theory]
@@ -186,6 +196,10 @@ public sealed class ConfigLoadingTests : IDisposable
     [InlineData("maxParallelProjects", 0)]
     [InlineData("incrementalSolutionCacheSize", 0)]
     [InlineData("incrementalSolutionCacheIdleMinutes", 0)]
+    [InlineData("memoryReclaimMinimumManagedHeapMb", 0)]
+    [InlineData("maxOpenBaselineReaders", 0)]
+    [InlineData("maxOpenOverlayReaders", 0)]
+    [InlineData("storageReaderIdleSeconds", 0)]
     public void LoadConfig_InvalidIndexingResource_RejectsValue(string property, int value)
     {
         var configPath = Path.Combine(_tempDir, "codemap.json");
@@ -261,5 +275,10 @@ public sealed class ConfigLoadingTests : IDisposable
         resources.IncrementalSolutionCacheSize.Should().Be(1);
         resources.IncrementalSolutionCacheIdleMinutes.Should().Be(5);
         resources.MemoryTelemetry.Should().BeTrue();
+        resources.ReleaseMemoryAfterFullIndex.Should().BeTrue();
+        resources.MemoryReclaimMinimumManagedHeapMb.Should().Be(768);
+        resources.MaxOpenBaselineReaders.Should().Be(2);
+        resources.MaxOpenOverlayReaders.Should().Be(2);
+        resources.StorageReaderIdleSeconds.Should().Be(60);
     }
 }

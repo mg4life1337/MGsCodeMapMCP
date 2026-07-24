@@ -105,7 +105,7 @@ internal static class Program
 
     private static string Version => typeof(Program).Assembly
         .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
-        ?? "2.8.0-mgs.6";
+        ?? "2.8.0-mgs.7";
 
     private static void MapEndpoints(WebApplication app, RuntimeConfiguration runtime)
     {
@@ -113,7 +113,8 @@ internal static class Program
         var healthPath = RuntimeConfiguration.NormalizeHttpPath(runtime.Server.HealthPath);
 
         app.MapPost(mcpPath, async (HttpContext context, McpServer server,
-            McpSessionRegistry sessions, DaemonRuntimeState state, ILoggerFactory loggerFactory) =>
+            McpSessionRegistry sessions, DaemonRuntimeState state,
+            RuntimeActivityTracker activity, ILoggerFactory loggerFactory) =>
         {
             if (state.IsStopping) return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
             if (context.Request.ContentLength is > McpServer.MaxContentLength)
@@ -129,6 +130,7 @@ internal static class Program
             var sessionId = sessions.Touch(requestedSession);
             context.Response.Headers["Mcp-Session-Id"] = sessionId;
             state.RequestObserved();
+            using var requestActivity = activity.BeginRequest();
             var (requestId, method, tool) = DescribeRequest(body);
             loggerFactory.CreateLogger("McpHttp").LogInformation(
                 "MCP request session={SessionId} request={RequestId} method={Method} tool={Tool}",
@@ -156,12 +158,14 @@ internal static class Program
         app.MapGet(mcpPath, () => Results.StatusCode(StatusCodes.Status405MethodNotAllowed));
 
         app.MapGet(healthPath, (McpSessionRegistry sessions, DaemonRuntimeState state,
-            RepositorySupervisor supervisor, RollingIndexCoordinator rolling,
-            IndexingResourceGate indexing, WorkspaceManager workspaces,
-            ISymbolStore symbolStore, IncrementalCompiler incremental) =>
+             RepositorySupervisor supervisor, RollingIndexCoordinator rolling,
+             IndexingResourceGate indexing, WorkspaceManager workspaces,
+             ISymbolStore symbolStore, IncrementalCompiler incremental,
+             RuntimeActivityTracker activity) =>
         {
             using var process = Process.GetCurrentProcess();
             process.Refresh();
+            var gcMemory = GC.GetGCMemoryInfo();
             var custom = symbolStore as CustomSymbolStore;
             return Results.Json(new
             {
@@ -174,9 +178,14 @@ internal static class Program
                 endpoint = runtime.McpEndpoint,
                 activeSessions = sessions.Count,
                 loadedSolutions = rolling.TrackedSolutionCount,
+                trackedSolutions = rolling.TrackedSolutionCount,
+                logicalWorkspaces = workspaces.OpenWorkspaceCount,
+                roslynIncrementalCacheLoaded = incremental.CachedSolutions,
                 openWorkspaces = workspaces.OpenWorkspaceCount,
                 openBaselines = custom?.OpenBaselineCount ?? 0,
                 openOverlays = custom?.OpenOverlayCount ?? 0,
+                openBaselineReaders = custom?.OpenBaselineCount ?? 0,
+                openOverlayReaders = custom?.OpenOverlayCount ?? 0,
                 solutionCache = new
                 {
                     loaded = incremental.CachedSolutions,
@@ -188,7 +197,8 @@ internal static class Program
                 {
                     workingSetBytes = process.WorkingSet64,
                     privateBytes = process.PrivateMemorySize64,
-                    managedHeapBytes = GC.GetGCMemoryInfo().HeapSizeBytes,
+                    managedHeapBytes = gcMemory.HeapSizeBytes,
+                    fragmentedBytes = gcMemory.FragmentedBytes,
                 },
                 repositorySupervisor = new
                 {
@@ -199,7 +209,10 @@ internal static class Program
                 {
                     activeFullIndexes = indexing.ActiveIndexes,
                     activeRollingQueues = rolling.ActiveQueueCount,
-                    publishing = indexing.ActiveIndexes > 0 || rolling.ActiveQueueCount > 0,
+                    publishing = indexing.ActiveIndexes > 0 ||
+                        rolling.ActiveQueueCount > 0 ||
+                        activity.ActivePublications > 0,
+                    activeIncrementalUpdates = activity.ActiveIncrementalUpdates,
                 },
                 requestCount = state.RequestCount,
             });

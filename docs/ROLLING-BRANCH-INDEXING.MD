@@ -156,6 +156,11 @@ These defaults are configurable under `indexingResources`. Peak working set, pri
 and managed heap are returned in `IndexStats` when `memoryTelemetry` is enabled. Phase telemetry
 contains only phase names, durations, and memory values; it does not add repository names or paths.
 
+Starting with `2.8.0-mgs.7`, baseline and overlay readers are lease-protected and bounded to two
+open entries of each kind by default. Unleased readers close after 60 idle seconds and reopen from
+disk on demand. Full-index batches schedule one threshold-controlled idle memory reclaim after
+reader eviction; no collection is performed after each Solution.
+
 Three cold full-index measurements on the same isolated large VB.NET copy returned 164,162
 symbols and 1,001,683 references in every run. Peak working set was 4,750.1, 4,622.5, and
 4,705.6 MiB, giving a 4,705.6 MiB (4.60 GiB) median. This is about 49% below the previously

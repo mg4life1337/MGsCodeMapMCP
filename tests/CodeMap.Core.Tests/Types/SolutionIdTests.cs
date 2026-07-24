@@ -14,7 +14,7 @@ public sealed class SolutionIdTests
             Path.Combine(root, "SRC", "APP.SLN").Replace('\\', '/'));
 
         second.Should().Be(first);
-        first.Value.Should().MatchRegex("^sln_[0-9a-f]{24}$");
+        first.Value.Should().MatchRegex("^sln_[0-9a-f]{24}_[0-9a-f]{24}$");
     }
 
     [Fact]
@@ -24,6 +24,28 @@ public sealed class SolutionIdTests
 
         SolutionId.FromPath(root, Path.Combine(root, "one", "App.sln"))
             .Should().NotBe(SolutionId.FromPath(root, Path.Combine(root, "two", "App.sln")));
+    }
+
+    [Fact]
+    public void FromPath_ChangesWhenSameSolutionLivesInDifferentRepositoryFolder()
+    {
+        var firstRoot = Path.Combine(Path.GetTempPath(), "CodeMapSolutionCloneA");
+        var secondRoot = Path.Combine(Path.GetTempPath(), "CodeMapSolutionCloneB");
+
+        SolutionId.FromPath(firstRoot, Path.Combine(firstRoot, "src", "App.sln"))
+            .Should().NotBe(SolutionId.FromPath(secondRoot, Path.Combine(secondRoot, "src", "App.sln")));
+    }
+
+    [Fact]
+    public void LegacyId_CanBeRecoveredForExistingIndexes()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "CodeMapSolutionIdRepo");
+        var solution = Path.Combine(root, "src", "App.sln");
+        var current = SolutionId.FromPath(root, solution);
+
+        current.TryGetLegacyId(out var legacy).Should().BeTrue();
+        legacy.Should().Be(SolutionId.LegacyFromPath(root, solution));
+        legacy.Value.Should().MatchRegex("^sln_[0-9a-f]{24}$");
     }
 
     [Fact]

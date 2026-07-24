@@ -24,6 +24,7 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
     private readonly IRepoRegistry _repoRegistry;
     private readonly IWorkspaceStickyRegistry _sticky;
     private readonly ILogger<RollingIndexCoordinator> _logger;
+    private readonly RuntimeActivityTracker _activity;
     private readonly RollingIndexStateStore _stateStore;
     private readonly CancellationTokenSource _shutdown = new();
     private readonly ConcurrentDictionary<string, QueueState> _queues =
@@ -41,6 +42,7 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
         Core.Interfaces.IOverlayStore overlayStore,
         IRepoRegistry repoRegistry,
         IWorkspaceStickyRegistry sticky,
+        RuntimeActivityTracker activity,
         ILogger<RollingIndexCoordinator> logger)
     {
         _runtime = runtime;
@@ -50,6 +52,7 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
         _overlayStore = overlayStore;
         _repoRegistry = repoRegistry;
         _sticky = sticky;
+        _activity = activity;
         _logger = logger;
         _stateStore = new RollingIndexStateStore(runtime.DataDirectory);
         _sticky.SetSolutionRequestedCallback(RequestPriority);
@@ -101,7 +104,11 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
             }
             if (request is null) return;
 
-            try { await ProcessAsync(key, request, ct).ConfigureAwait(false); }
+            try
+            {
+                using var publication = _activity.BeginPublication();
+                await ProcessAsync(key, request, ct).ConfigureAwait(false);
+            }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
             catch (Exception ex)
             {
@@ -526,6 +533,15 @@ public sealed class RollingIndexCoordinator : IRollingIndexStatusProvider
         var storageRepoId = SolutionScope.ToStorageRepoId(state.RepoId, target.SolutionId);
         var existing = _workspaceManager.GetWorkspaceInfo(storageRepoId, state.WorkspaceId);
         if (existing is not null) return;
+        var baseline = await _indexHandler.HandleAsync(new JsonObject
+        {
+            ["repo_path"] = repoPath,
+            ["solution_path"] = target.SolutionPath,
+            ["commit_sha"] = state.BaselineCommit.Value,
+        }, ct).ConfigureAwait(false);
+        if (baseline.IsError)
+            throw new InvalidOperationException(
+                "Could not restore rolling baseline: " + Sanitize(baseline.Content, repoPath));
         var restored = await _workspaceManager.CreateWorkspaceAsync(
             storageRepoId, state.WorkspaceId, state.BaselineCommit,
             target.SolutionPath, repoPath, ct).ConfigureAwait(false);

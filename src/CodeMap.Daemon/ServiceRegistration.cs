@@ -63,6 +63,7 @@ public static class ServiceRegistration
             ?? new IndexingResourceConfig());
         services.AddSingleton(sp => new IndexingResourceGate(
             sp.GetRequiredService<IndexingResourceConfig>().MaxConcurrentIndexes));
+        services.AddSingleton<RuntimeActivityTracker>();
 
         // ── Git ───────────────────────────────────────────────────────────────
         services.AddSingleton<IGitService, GitService>();
@@ -76,8 +77,12 @@ public static class ServiceRegistration
         // ── Storage ────────────────────────────────────────────────────────────
         // v2 custom storage engine — all ISymbolStore methods + IOverlayStore adapter.
         var storeDir = Path.Combine(resolvedBaseDir, "repositories");
-        services.AddSingleton(_ => new CustomSymbolStore(storeDir));
+        services.AddSingleton(sp => new CustomSymbolStore(
+            storeDir,
+            sp.GetRequiredService<IndexingResourceConfig>()));
         services.AddSingleton<ISymbolStore>(sp => sp.GetRequiredService<CustomSymbolStore>());
+        services.AddSingleton<IStorageReaderCache>(sp => sp.GetRequiredService<CustomSymbolStore>());
+        services.AddSingleton<FullIndexMemoryReclaimer>();
         services.AddSingleton(sp => new CustomEngineOverlayStore(
             sp.GetRequiredService<CustomSymbolStore>(), storeDir));
         services.AddSingleton<IOverlayStore>(sp => sp.GetRequiredService<CustomEngineOverlayStore>());
@@ -93,7 +98,8 @@ public static class ServiceRegistration
         services.AddSingleton<IncrementalCompiler>(sp => new IncrementalCompiler(
             sp.GetRequiredService<SymbolDiffer>(),
             sp.GetRequiredService<ILogger<IncrementalCompiler>>(),
-            sp.GetRequiredService<IndexingResourceConfig>()));
+            sp.GetRequiredService<IndexingResourceConfig>(),
+            activity: sp.GetRequiredService<RuntimeActivityTracker>()));
         services.AddSingleton<IIncrementalCompiler>(sp => sp.GetRequiredService<IncrementalCompiler>());
 
         // ── Metadata resolver (lazy DLL stub extraction) ──────────────────────
@@ -147,7 +153,9 @@ public static class ServiceRegistration
             sp.GetRequiredService<IBaselineScanner>(),
             sp.GetRequiredService<WorkspaceManager>(),
             sp.GetRequiredService<IndexingResourceConfig>(),
-            sp.GetRequiredService<IndexingResourceGate>()));
+            sp.GetRequiredService<IndexingResourceGate>(),
+            sp.GetRequiredService<FullIndexMemoryReclaimer>(),
+            sp.GetRequiredService<RuntimeActivityTracker>()));
         services.AddSingleton<McpToolHandlers>();
         services.AddSingleton<WorkspaceHandler>();
         services.AddSingleton<OverlayRefreshHandler>();

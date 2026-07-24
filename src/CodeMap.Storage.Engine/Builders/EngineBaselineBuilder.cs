@@ -375,7 +375,7 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
                 Directory.Delete(finalDir, recursive: true);
 
             Directory.CreateDirectory(Path.GetDirectoryName(finalDir)!);
-            Directory.Move(tempDir, finalDir);
+            PublishDirectory(tempDir, finalDir);
 
             sw.Stop();
             StorageTelemetry.BaselineBuilds.Add(1);
@@ -440,6 +440,29 @@ internal sealed class EngineBaselineBuilder : IEngineBaselineBuilder
         catch
         {
             // Best effort cleanup
+        }
+    }
+
+    private static void PublishDirectory(string tempDir, string finalDir)
+    {
+        const int maxAttempts = 5;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                Directory.Move(tempDir, finalDir);
+                return;
+            }
+            catch (Exception ex) when (
+                attempt < maxAttempts &&
+                ex is IOException or UnauthorizedAccessException)
+            {
+                // Windows may briefly retain a just-disposed memory-mapped view,
+                // and antivirus/indexing filters can transiently deny the atomic
+                // directory rename. Keep the publish atomic and retry the rename;
+                // never copy a partially written baseline into its final path.
+                Thread.Sleep(TimeSpan.FromMilliseconds(50 * attempt));
+            }
         }
     }
 }

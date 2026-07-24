@@ -4,7 +4,7 @@
 
 STDIO MCP clients commonly own the lifetime of the command they start. When several client tasks use the same STDIO configuration, each task can therefore start a complete semantic server. Each process then has its own Roslyn and MSBuild state while trying to open the same rolling overlays.
 
-MGsCodeMapMCP `2.8.0-mgs.6` keeps all semantic state in one long-lived process and adds a supervised windowless Windows task host:
+MGsCodeMapMCP `2.8.0-mgs.7` keeps all semantic state in one long-lived process and adds a supervised windowless Windows task host:
 
 ```text
 Task Scheduler ──> MGsCodeMap.TaskHost ──> MGsCodeMap.Daemon
@@ -90,9 +90,15 @@ Management scripts wait for this sequence. A force fallback is opt-in and refuse
 
 ## Health and memory
 
-`GET /health` exposes operational values only. It includes process memory, loaded Solution-cache count, cache hits/misses/evictions, open workspace/baseline/overlay counts, active sessions, supervisor status, and indexing activity. It does not expose source text, symbols, repository names, or request payloads.
+`GET /health` exposes operational values only. It includes process memory, tracked Solution count, logical workspace count, Roslyn incremental cache count, cache hits/misses/evictions, open baseline/overlay reader counts, active sessions, supervisor status, and indexing activity. It does not expose source text, symbols, repository names, or request payloads. `openWorkspaces` is a compatibility name for logical workspace registrations; it is not a count of loaded Roslyn Solutions or `MSBuildWorkspace` instances.
 
-The central process prevents memory from multiplying per client. Incremental MSBuild Solutions remain bounded by `incrementalSolutionCacheSize` and idle eviction. Full builds remain bounded by `maxConcurrentIndexes` and `maxParallelProjects`. No forced `GC.Collect` is used.
+The central process prevents memory from multiplying per client. Incremental MSBuild Solutions remain bounded by `incrementalSolutionCacheSize` and idle eviction. Full builds remain bounded by `maxConcurrentIndexes` and `maxParallelProjects`.
+
+Baseline and overlay readers use reference-counted leases. Unleased entries are reduced to the configured LRU limits immediately and closed after `storageReaderIdleSeconds`; closing an overlay checkpoints pending WAL records but never deletes its files. A later query reopens it from snapshot/WAL without rebuilding the baseline.
+
+After a complete full-index batch, the daemon waits for reader idle eviction, zero publication/index/incremental activity, zero active MCP requests, and 120 seconds of MCP-request quiet. When the managed heap exceeds the configured threshold, one LOH-compacting blocking full GC runs and logs working set, private bytes, heap size, fragmentation, and duration before and after. A new Solution completion replaces the pending reclaim, so multi-Solution repositories receive one reclaim rather than one per Solution.
+
+Solution storage identity includes the normalized repository root and repository-relative Solution path. The same remote and `.sln` checked out in two folders therefore produces two independent index scopes. Existing `mgs.6` scopes remain readable only through a repository-root-validated compatibility alias.
 
 ## Endpoint security
 

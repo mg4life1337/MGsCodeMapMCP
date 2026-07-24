@@ -11,22 +11,62 @@ using CodeMap.Core.Types;
 /// Phase 4: All read-only query methods implemented.
 /// Registered in DI when CODEMAP_ENGINE=custom.
 /// </summary>
-public sealed class CustomSymbolStore : ISymbolStore, IDisposable
+public sealed class CustomSymbolStore :
+    ISymbolStore,
+    IStorageReaderCache,
+    ILegacyBaselineAliasRegistry,
+    IDisposable
 {
     private readonly EngineBaselineBuilder _builder;
     private readonly string _storeBaseDir;
-    private readonly Dictionary<string, (EngineBaselineReader Reader, EngineMergedReader Merged)> _cache = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, EngineOverlay> _overlays = new(StringComparer.Ordinal);
+    private readonly IndexingResourceConfig _resources;
+    private readonly Dictionary<string, BaselineCacheEntry> _cache = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, OverlayCacheEntry> _overlays = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _legacyBaselineAliases = new(StringComparer.Ordinal);
     private readonly object _cacheLock = new();
+    private readonly Timer _readerSweep;
     private bool _disposed;
 
     public int OpenBaselineCount { get { lock (_cacheLock) return _cache.Count; } }
     public int OpenOverlayCount { get { lock (_cacheLock) return _overlays.Count; } }
+    public int OpenBaselineReaderCount => OpenBaselineCount;
+    public int OpenOverlayReaderCount => OpenOverlayCount;
 
-    public CustomSymbolStore(string storeBaseDir)
+    public void RegisterLegacyBaselineAlias(RepoId storageRepoId, RepoId legacyStorageRepoId)
+    {
+        lock (_cacheLock)
+            _legacyBaselineAliases[storageRepoId.Value] = legacyStorageRepoId.Value;
+    }
+
+    public bool TryGetLegacyBaselineAlias(
+        RepoId storageRepoId,
+        out RepoId legacyStorageRepoId)
+    {
+        lock (_cacheLock)
+        {
+            if (_legacyBaselineAliases.TryGetValue(storageRepoId.Value, out var value))
+            {
+                legacyStorageRepoId = RepoId.From(value);
+                return true;
+            }
+        }
+        legacyStorageRepoId = default;
+        return false;
+    }
+
+    public CustomSymbolStore(string storeBaseDir, IndexingResourceConfig? resources = null)
     {
         _storeBaseDir = storeBaseDir;
+        _resources = resources ?? new IndexingResourceConfig();
         _builder = new EngineBaselineBuilder(storeBaseDir);
+        var sweepSeconds = Math.Max(1, Math.Min(
+            _resources.StorageReaderIdleSeconds,
+            Math.Max(1, _resources.StorageReaderIdleSeconds / 2)));
+        _readerSweep = new Timer(
+            static state => ((CustomSymbolStore)state!).TrimIdleReaders(),
+            this,
+            TimeSpan.FromSeconds(sweepSeconds),
+            TimeSpan.FromSeconds(sweepSeconds));
     }
 
     // ── Baseline lifecycle ───────────────────────────────────────────────────
@@ -60,13 +100,13 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
         lock (_cacheLock)
         {
             if (_cache.Remove(cacheKey, out var old))
-                old.Reader.Dispose();
+                RetireBaselineUnsafe(old);
         }
     }
 
     public Task<bool> BaselineExistsAsync(RepoId repoId, CommitSha commitSha, CancellationToken ct = default)
     {
-        var baselineDir = BaselineDir(repoId.Value, commitSha.Value);
+        var baselineDir = ResolveBaselineDir(repoId.Value, commitSha.Value);
         var manifestPath = Path.Combine(baselineDir, "manifest.json");
         var exists = File.Exists(manifestPath) && ManifestWriter.Read(manifestPath) != null;
         return Task.FromResult(exists);
@@ -76,7 +116,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<SymbolCard?> GetSymbolAsync(RepoId repoId, CommitSha commitSha, SymbolId symbolId, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         SymbolRecord? rec;
 
         // sym_ prefix → StableId lookup
@@ -91,7 +132,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<SymbolCard?> GetSymbolByStableIdAsync(RepoId repoId, CommitSha commitSha, StableId stableId, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var rec = merged.GetSymbolByStableId(stableId.Value);
         if (rec == null) return Task.FromResult<SymbolCard?>(null);
         return Task.FromResult<SymbolCard?>(RecordToCoreMappings.ToSymbolCard(rec.Value, reader));
@@ -99,7 +141,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<SymbolSearchHit>> SearchSymbolsAsync(RepoId repoId, CommitSha commitSha, string query, SymbolSearchFilters? filters, int limit, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
 
         // Single-kind filter is forwarded into the engine fast path. Multi-kind is
         // post-filtered below (the engine filter struct holds only one kind).
@@ -129,7 +172,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
         RepoId repoId, CommitSha commitSha, IReadOnlyList<SymbolKind>? kinds, int limit,
         CancellationToken ct = default, SymbolSearchFilters? filters = null)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var kindFilter = kinds?.Count == 1 ? RecordMappers.MapSymbolKind(kinds[0]) : (short?)null;
         var symbols = merged.EnumerateSymbols(kindFilter);
 
@@ -182,7 +226,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<SymbolCard>> GetSymbolsByFileAsync(RepoId repoId, CommitSha commitSha, FilePath filePath, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var records = merged.GetSymbolsByFile(filePath.Value);
         var cards = new List<SymbolCard>(records.Count);
         foreach (var r in records)
@@ -194,7 +239,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<StoredReference>> GetReferencesAsync(RepoId repoId, CommitSha commitSha, SymbolId symbolId, RefKind? kind, int limit, CancellationToken ct = default, ResolutionState? resolutionState = null)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var intId = ResolveSymbolIntId(merged, symbolId.Value);
         if (intId == 0) return Task.FromResult<IReadOnlyList<StoredReference>>([]);
 
@@ -216,7 +262,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<StoredOutgoingReference>> GetOutgoingReferencesAsync(RepoId repoId, CommitSha commitSha, SymbolId symbolId, RefKind? kind, int limit, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var intId = ResolveSymbolIntId(merged, symbolId.Value);
         if (intId == 0) return Task.FromResult<IReadOnlyList<StoredOutgoingReference>>([]);
 
@@ -236,7 +283,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<StoredTypeRelation>> GetTypeRelationsAsync(RepoId repoId, CommitSha commitSha, SymbolId symbolId, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var intId = ResolveSymbolIntId(merged, symbolId.Value);
         if (intId == 0) return Task.FromResult<IReadOnlyList<StoredTypeRelation>>([]);
 
@@ -281,7 +329,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<StoredTypeRelation>> GetDerivedTypesAsync(RepoId repoId, CommitSha commitSha, SymbolId symbolId, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var intId = ResolveSymbolIntId(merged, symbolId.Value);
         if (intId == 0) return Task.FromResult<IReadOnlyList<StoredTypeRelation>>([]);
 
@@ -306,7 +355,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<StoredFact>> GetFactsByKindAsync(RepoId repoId, CommitSha commitSha, FactKind kind, int limit, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var records = merged.GetFactsByKind((int)kind);
 
         // Convert all matching facts, then sort by (FilePath, LineStart) for deterministic
@@ -324,7 +374,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<StoredFact>> GetFactsForSymbolAsync(RepoId repoId, CommitSha commitSha, SymbolId symbolId, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var intId = ResolveSymbolIntId(merged, symbolId.Value);
         if (intId == 0) return Task.FromResult<IReadOnlyList<StoredFact>>([]);
 
@@ -339,7 +390,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<FileSpan?> GetFileSpanAsync(RepoId repoId, CommitSha commitSha, FilePath filePath, int startLine, int endLine, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var file = merged.GetFileByPath(filePath.Value);
         if (file == null) return Task.FromResult<FileSpan?>(null);
 
@@ -361,7 +413,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<FilePath>> GetAllFilePathsAsync(RepoId repoId, CommitSha commitSha, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var paths = new List<FilePath>();
         foreach (var p in merged.EnumerateFilePaths())
             paths.Add(FilePath.From(p));
@@ -370,7 +423,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<(FilePath Path, string? Content)>> GetAllFileContentsAsync(RepoId repoId, CommitSha commitSha, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var result = new List<(FilePath, string?)>();
         foreach (var file in merged.EnumerateFiles())
         {
@@ -390,7 +444,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
         FilePath filePath,
         CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var file = merged.GetFileByPath(filePath.Value);
         string? content = file is { ContentId: > 0 }
             ? reader.ResolveContent(file.Value.ContentId)
@@ -402,7 +457,7 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<SemanticLevel?> GetSemanticLevelAsync(RepoId repoId, CommitSha commitSha, CancellationToken ct = default)
     {
-        var baselineDir = BaselineDir(repoId.Value, commitSha.Value);
+        var baselineDir = ResolveBaselineDir(repoId.Value, commitSha.Value);
         var manifestPath = Path.Combine(baselineDir, "manifest.json");
         var manifest = ManifestWriter.Read(manifestPath);
         if (manifest?.ProjectDiagnostics is not { Count: > 0 } diags)
@@ -422,7 +477,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<SymbolSummary>> GetAllSymbolSummariesAsync(RepoId repoId, CommitSha commitSha, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var summaries = new List<SymbolSummary>();
         foreach (var sym in merged.EnumerateSymbols())
             summaries.Add(RecordToCoreMappings.ToSummary(sym, reader));
@@ -431,7 +487,7 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<string?> GetRepoRootAsync(RepoId repoId, CommitSha commitSha, CancellationToken ct = default)
     {
-        var baselineDir = BaselineDir(repoId.Value, commitSha.Value);
+        var baselineDir = ResolveBaselineDir(repoId.Value, commitSha.Value);
         var manifestPath = Path.Combine(baselineDir, "manifest.json");
         var manifest = ManifestWriter.Read(manifestPath);
         return Task.FromResult(manifest?.RepoRootPath);
@@ -442,7 +498,7 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
         // Read authoritative ProjectDiagnostics stored at build time (matches SQLite behavior).
         // These come from CompilationResult.Stats.ProjectDiagnostics, which Roslyn populates
         // with exact per-project counts during compilation.
-        var baselineDir = BaselineDir(repoId.Value, commitSha.Value);
+        var baselineDir = ResolveBaselineDir(repoId.Value, commitSha.Value);
         var manifestPath = Path.Combine(baselineDir, "manifest.json");
         var manifest = ManifestWriter.Read(manifestPath);
         IReadOnlyList<ProjectDiagnostic> diags = manifest?.ProjectDiagnostics ?? [];
@@ -451,7 +507,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public Task<IReadOnlyList<UnresolvedEdge>> GetUnresolvedEdgesAsync(RepoId repoId, CommitSha commitSha, IReadOnlyList<FilePath> filePaths, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
+        using var lease = AcquireBaseline(repoId.Value, commitSha.Value);
+        var (reader, merged) = (lease.Reader, lease.Merged);
         var fileIntIds = new HashSet<int>();
         foreach (var fp in filePaths)
         {
@@ -485,8 +542,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public async Task UpgradeEdgeAsync(RepoId repoId, CommitSha commitSha, EdgeUpgrade upgrade, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
-        var overlay = GetOrCreateOverlay(commitSha.Value, reader);
+        using var lease = AcquireOverlay(commitSha.Value, repoId.Value, commitSha.Value);
+        var (reader, merged, overlay) = (lease.Reader, lease.Merged, lease.Overlay);
         var fromIntId = ResolveSymbolIntId(merged, upgrade.FromSymbolId);
         var toIntId = ResolveSymbolIntId(merged, upgrade.ResolvedToSymbolId.Value);
         var file = merged.GetFileByPath(upgrade.FileId);
@@ -500,8 +557,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
     public async Task<int> InsertMetadataStubsAsync(RepoId repoId, CommitSha commitSha, IReadOnlyList<SymbolCard> stubs, IReadOnlyList<ExtractedTypeRelation>? typeRelations = null, CancellationToken ct = default)
     {
         if (stubs.Count == 0) return 0;
-        var (reader, _) = GetOrOpen(repoId.Value, commitSha.Value);
-        var overlay = GetOrCreateOverlay(commitSha.Value, reader);
+        using var lease = AcquireOverlay(commitSha.Value, repoId.Value, commitSha.Value);
+        var (reader, overlay) = (lease.Reader, lease.Overlay);
 
         using var batch = overlay.BeginBatch();
         foreach (var stub in stubs)
@@ -533,8 +590,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public async Task InsertVirtualFileAsync(RepoId repoId, CommitSha commitSha, string virtualPath, string content, IReadOnlyList<ExtractedReference>? decompiledRefs = null, CancellationToken ct = default)
     {
-        var (reader, _) = GetOrOpen(repoId.Value, commitSha.Value);
-        var overlay = GetOrCreateOverlay(commitSha.Value, reader);
+        using var lease = AcquireOverlay(commitSha.Value, repoId.Value, commitSha.Value);
+        var overlay = lease.Overlay;
 
         using var batch = overlay.BeginBatch();
         var pathSid = batch.InternString(virtualPath);
@@ -547,8 +604,8 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     public async Task UpgradeDecompiledSymbolAsync(RepoId repoId, CommitSha commitSha, SymbolId symbolId, string virtualFilePath, CancellationToken ct = default)
     {
-        var (reader, merged) = GetOrOpen(repoId.Value, commitSha.Value);
-        var overlay = GetOrCreateOverlay(commitSha.Value, reader);
+        using var lease = AcquireOverlay(commitSha.Value, repoId.Value, commitSha.Value);
+        var (reader, merged, overlay) = (lease.Reader, lease.Merged, lease.Overlay);
         var rec = symbolId.Value.StartsWith("sym_", StringComparison.Ordinal)
             ? merged.GetSymbolByStableId(symbolId.Value)
             : merged.GetSymbolByFqn(symbolId.Value);
@@ -574,38 +631,66 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     // ── Internal helpers ─────────────────────────────────────────────────────
 
-    internal (EngineBaselineReader Reader, EngineMergedReader Merged) GetOrOpenBaseline(string repoId, string commitSha)
-        => GetOrOpen(repoId, commitSha);
-
-    private (EngineBaselineReader Reader, EngineMergedReader Merged) GetOrOpen(string repoId, string commitSha)
+    internal BaselineReaderLease AcquireBaseline(string repoId, string commitSha)
     {
-        var cacheKey = CacheKey(repoId, commitSha);
         lock (_cacheLock)
         {
-            if (_cache.TryGetValue(cacheKey, out var cached))
-                return cached;
-
-            var baselineDir = BaselineDir(repoId, commitSha);
-            if (!File.Exists(Path.Combine(baselineDir, "manifest.json")))
-                throw new StorageFormatException($"No baseline found for repo {repoId} commit {commitSha}");
-
-            var reader = new EngineBaselineReader(baselineDir);
-
-            // Init search index
-            var searchPath = Path.Combine(baselineDir, "search.idx");
-            if (File.Exists(searchPath))
-                reader.InitSearch(new SearchIndexReader(reader, searchPath));
-
-            // Init adjacency index
-            var adjOutPath = Path.Combine(baselineDir, "adjacency-out.idx");
-            var adjInPath = Path.Combine(baselineDir, "adjacency-in.idx");
-            if (File.Exists(adjOutPath) && File.Exists(adjInPath))
-                reader.InitAdjacency(new AdjacencyIndexReader(adjOutPath, adjInPath, reader.SymbolCount));
-
-            var merged = new EngineMergedReader(reader);
-            _cache[cacheKey] = (reader, merged);
-            return (reader, merged);
+            ThrowIfDisposed();
+            var entry = AcquireBaselineUnsafe(repoId, commitSha);
+            TrimReadersUnsafe(DateTimeOffset.UtcNow);
+            return new BaselineReaderLease(this, entry);
         }
+    }
+
+    internal OverlayReaderLease AcquireOverlay(string workspaceId, string repoId, string commitSha)
+    {
+        lock (_cacheLock)
+        {
+            ThrowIfDisposed();
+            if (_overlays.TryGetValue(workspaceId, out var existing))
+            {
+                // A delete that raced an already active query is completed after
+                // the final lease. Reuse that same object for any query which
+                // already resolved the workspace instead of opening the same WAL
+                // directory a second time.
+                existing.LeaseCount++;
+                existing.LastAccessUtc = DateTimeOffset.UtcNow;
+                existing.Baseline.LastAccessUtc = existing.LastAccessUtc;
+                return new OverlayReaderLease(this, existing);
+            }
+
+            var baseline = AcquireBaselineUnsafe(repoId, commitSha);
+            try
+            {
+                var overlayDir = Path.Combine(_storeBaseDir, "overlays", workspaceId);
+                var overlay = new EngineOverlay(overlayDir, workspaceId, baseline.Reader);
+                var entry = new OverlayCacheEntry(workspaceId, overlay, baseline)
+                {
+                    LeaseCount = 1,
+                    LastAccessUtc = DateTimeOffset.UtcNow,
+                };
+                _overlays[workspaceId] = entry;
+                TrimReadersUnsafe(DateTimeOffset.UtcNow);
+                return new OverlayReaderLease(this, entry);
+            }
+            catch
+            {
+                ReleaseBaselineUnsafe(baseline);
+                throw;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Compatibility helper for engine tests. Production query paths use a lease for the
+    /// complete operation and never retain the returned reader after releasing it.
+    /// </summary>
+    internal (EngineBaselineReader Reader, EngineMergedReader Merged) GetOrOpenBaseline(
+        string repoId,
+        string commitSha)
+    {
+        using var lease = AcquireBaseline(repoId, commitSha);
+        return (lease.Reader, lease.Merged);
     }
 
     private static int ResolveSymbolIntId(EngineMergedReader merged, string symbolId)
@@ -627,11 +712,17 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
         lock (_cacheLock)
         {
             if (_overlays.TryGetValue(workspaceId, out var existing))
-                return existing;
+                return existing.Overlay;
 
             var overlayDir = Path.Combine(_storeBaseDir, "overlays", workspaceId);
             var overlay = new EngineOverlay(overlayDir, workspaceId, reader);
-            _overlays[workspaceId] = overlay;
+            var baseline = _cache.Values.FirstOrDefault(entry => ReferenceEquals(entry.Reader, reader))
+                ?? throw new InvalidOperationException("The baseline reader must be leased before opening an overlay.");
+            baseline.LeaseCount++;
+            _overlays[workspaceId] = new OverlayCacheEntry(workspaceId, overlay, baseline)
+            {
+                LastAccessUtc = DateTimeOffset.UtcNow,
+            };
             return overlay;
         }
     }
@@ -650,7 +741,7 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
     {
         lock (_cacheLock)
         {
-            return _overlays.GetValueOrDefault(workspaceId);
+            return _overlays.TryGetValue(workspaceId, out var entry) ? entry.Overlay : null;
         }
     }
 
@@ -658,18 +749,175 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
     {
         lock (_cacheLock)
         {
-            if (_overlays.Remove(workspaceId, out var overlay))
-                overlay.Dispose();
-
-            var overlayDir = Path.Combine(_storeBaseDir, "overlays", workspaceId);
-            try
+            if (_overlays.TryGetValue(workspaceId, out var entry))
             {
-                if (Directory.Exists(overlayDir))
-                    Directory.Delete(overlayDir, recursive: true);
+                entry.DeletePending = true;
+                if (entry.LeaseCount == 0)
+                    RemoveOverlayUnsafe(entry, deleteFiles: true);
+                return;
             }
-            catch (IOException) { /* Best effort cleanup */ }
+            DeleteOverlayFilesUnsafe(workspaceId);
         }
     }
+
+    public void TrimIdleReaders()
+    {
+        lock (_cacheLock)
+        {
+            if (_disposed) return;
+            TrimReadersUnsafe(DateTimeOffset.UtcNow);
+        }
+    }
+
+    private BaselineCacheEntry AcquireBaselineUnsafe(string repoId, string commitSha)
+    {
+        var cacheKey = CacheKey(repoId, commitSha);
+        if (_cache.TryGetValue(cacheKey, out var cached))
+        {
+            cached.LeaseCount++;
+            cached.LastAccessUtc = DateTimeOffset.UtcNow;
+            return cached;
+        }
+
+        var baselineDir = ResolveBaselineDir(repoId, commitSha);
+        if (!File.Exists(Path.Combine(baselineDir, "manifest.json")))
+            throw new StorageFormatException($"No baseline found for repo {repoId} commit {commitSha}");
+
+        var reader = new EngineBaselineReader(baselineDir);
+        try
+        {
+            var searchPath = Path.Combine(baselineDir, "search.idx");
+            if (File.Exists(searchPath))
+                reader.InitSearch(new SearchIndexReader(reader, searchPath));
+
+            var adjOutPath = Path.Combine(baselineDir, "adjacency-out.idx");
+            var adjInPath = Path.Combine(baselineDir, "adjacency-in.idx");
+            if (File.Exists(adjOutPath) && File.Exists(adjInPath))
+                reader.InitAdjacency(new AdjacencyIndexReader(adjOutPath, adjInPath, reader.SymbolCount));
+
+            var entry = new BaselineCacheEntry(
+                cacheKey,
+                reader,
+                new EngineMergedReader(reader))
+            {
+                LeaseCount = 1,
+                LastAccessUtc = DateTimeOffset.UtcNow,
+            };
+            _cache[cacheKey] = entry;
+            return entry;
+        }
+        catch
+        {
+            reader.Dispose();
+            throw;
+        }
+    }
+
+    private void ReleaseBaseline(BaselineCacheEntry entry)
+    {
+        lock (_cacheLock)
+        {
+            ReleaseBaselineUnsafe(entry);
+            TrimReadersUnsafe(DateTimeOffset.UtcNow);
+        }
+    }
+
+    private void ReleaseBaselineUnsafe(BaselineCacheEntry entry, bool touch = true)
+    {
+        if (entry.LeaseCount <= 0) return;
+        entry.LeaseCount--;
+        if (touch)
+            entry.LastAccessUtc = DateTimeOffset.UtcNow;
+        if (entry.Retired && entry.LeaseCount == 0)
+            entry.Reader.Dispose();
+    }
+
+    private void ReleaseOverlay(OverlayCacheEntry entry)
+    {
+        lock (_cacheLock)
+        {
+            if (entry.LeaseCount <= 0) return;
+            entry.LeaseCount--;
+            entry.LastAccessUtc = DateTimeOffset.UtcNow;
+            entry.Baseline.LastAccessUtc = entry.LastAccessUtc;
+            if (entry.DeletePending && entry.LeaseCount == 0)
+                RemoveOverlayUnsafe(entry, deleteFiles: true);
+            else
+                TrimReadersUnsafe(DateTimeOffset.UtcNow);
+        }
+    }
+
+    private void RetireBaselineUnsafe(BaselineCacheEntry entry)
+    {
+        entry.Retired = true;
+        if (entry.LeaseCount == 0)
+            entry.Reader.Dispose();
+    }
+
+    private void TrimReadersUnsafe(DateTimeOffset now)
+    {
+        var idleBefore = now - TimeSpan.FromSeconds(_resources.StorageReaderIdleSeconds);
+
+        foreach (var entry in _overlays.Values
+            .Where(entry => entry.LeaseCount == 0 && entry.LastAccessUtc <= idleBefore)
+            .OrderBy(entry => entry.LastAccessUtc)
+            .ToList())
+            RemoveOverlayUnsafe(entry, deleteFiles: false);
+
+        while (_overlays.Count > _resources.MaxOpenOverlayReaders)
+        {
+            var candidate = _overlays.Values
+                .Where(entry => entry.LeaseCount == 0)
+                .OrderBy(entry => entry.LastAccessUtc)
+                .FirstOrDefault();
+            if (candidate is null) break;
+            RemoveOverlayUnsafe(candidate, deleteFiles: false);
+        }
+
+        foreach (var entry in _cache.Values
+            .Where(entry => entry.LeaseCount == 0 && entry.LastAccessUtc <= idleBefore)
+            .OrderBy(entry => entry.LastAccessUtc)
+            .ToList())
+        {
+            if (_cache.Remove(entry.CacheKey))
+                RetireBaselineUnsafe(entry);
+        }
+
+        while (_cache.Count > _resources.MaxOpenBaselineReaders)
+        {
+            var candidate = _cache.Values
+                .Where(entry => entry.LeaseCount == 0)
+                .OrderBy(entry => entry.LastAccessUtc)
+                .FirstOrDefault();
+            if (candidate is null) break;
+            _cache.Remove(candidate.CacheKey);
+            RetireBaselineUnsafe(candidate);
+        }
+    }
+
+    private void RemoveOverlayUnsafe(OverlayCacheEntry entry, bool deleteFiles)
+    {
+        if (!_overlays.Remove(entry.WorkspaceId)) return;
+        entry.Overlay.Dispose();
+        ReleaseBaselineUnsafe(entry.Baseline, touch: false);
+        if (deleteFiles)
+            DeleteOverlayFilesUnsafe(entry.WorkspaceId);
+    }
+
+    private void DeleteOverlayFilesUnsafe(string workspaceId)
+    {
+        var overlayDir = Path.Combine(_storeBaseDir, "overlays", workspaceId);
+        try
+        {
+            if (Directory.Exists(overlayDir))
+                Directory.Delete(overlayDir, recursive: true);
+        }
+        catch (IOException) { /* Best effort cleanup */ }
+        catch (UnauthorizedAccessException) { /* Best effort cleanup */ }
+    }
+
+    private void ThrowIfDisposed() =>
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
     // ── Path helpers ─────────────────────────────────────────────────────────
 
@@ -689,6 +937,24 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
 
     private string BaselineDir(string repoId, string commitSha)
         => Path.Combine(RepoStoreDir(repoId), "baselines", commitSha);
+
+    private string ResolveBaselineDir(string repoId, string commitSha)
+    {
+        var primary = BaselineDir(repoId, commitSha);
+        if (File.Exists(Path.Combine(primary, "manifest.json")))
+            return primary;
+
+        string? legacyRepoId;
+        lock (_cacheLock)
+            _legacyBaselineAliases.TryGetValue(repoId, out legacyRepoId);
+        if (legacyRepoId is not null)
+        {
+            var legacy = BaselineDir(legacyRepoId, commitSha);
+            if (File.Exists(Path.Combine(legacy, "manifest.json")))
+                return legacy;
+        }
+        return primary;
+    }
 
     private static string CacheKey(string repoId, string commitSha)
         => $"{repoId}|{commitSha}";
@@ -710,16 +976,79 @@ public sealed class CustomSymbolStore : ISymbolStore, IDisposable
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
+        _readerSweep.Dispose();
         lock (_cacheLock)
         {
-            foreach (var (reader, _) in _cache.Values)
-                reader.Dispose();
+            if (_disposed) return;
+            _disposed = true;
+            foreach (var overlay in _overlays.Values.ToList())
+                RemoveOverlayUnsafe(overlay, deleteFiles: false);
+            foreach (var entry in _cache.Values)
+            {
+                entry.Retired = true;
+                entry.Reader.Dispose();
+            }
             _cache.Clear();
-
-            foreach (var overlay in _overlays.Values)
-                overlay.Dispose();
-            _overlays.Clear();
+            _legacyBaselineAliases.Clear();
         }
+    }
+
+    internal sealed class BaselineReaderLease : IDisposable
+    {
+        private CustomSymbolStore? _owner;
+        private readonly BaselineCacheEntry _entry;
+
+        internal BaselineReaderLease(CustomSymbolStore owner, BaselineCacheEntry entry)
+        {
+            _owner = owner;
+            _entry = entry;
+        }
+
+        public EngineBaselineReader Reader => _entry.Reader;
+        public EngineMergedReader Merged => _entry.Merged;
+        public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleaseBaseline(_entry);
+    }
+
+    internal sealed class OverlayReaderLease : IDisposable
+    {
+        private CustomSymbolStore? _owner;
+        private readonly OverlayCacheEntry _entry;
+
+        internal OverlayReaderLease(CustomSymbolStore owner, OverlayCacheEntry entry)
+        {
+            _owner = owner;
+            _entry = entry;
+        }
+
+        public EngineOverlay Overlay => _entry.Overlay;
+        public EngineBaselineReader Reader => _entry.Baseline.Reader;
+        public EngineMergedReader Merged => _entry.Baseline.Merged;
+        public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleaseOverlay(_entry);
+    }
+
+    internal sealed class BaselineCacheEntry(
+        string cacheKey,
+        EngineBaselineReader reader,
+        EngineMergedReader merged)
+    {
+        public string CacheKey { get; } = cacheKey;
+        public EngineBaselineReader Reader { get; } = reader;
+        public EngineMergedReader Merged { get; } = merged;
+        public int LeaseCount { get; set; }
+        public DateTimeOffset LastAccessUtc { get; set; }
+        public bool Retired { get; set; }
+    }
+
+    internal sealed class OverlayCacheEntry(
+        string workspaceId,
+        EngineOverlay overlay,
+        BaselineCacheEntry baseline)
+    {
+        public string WorkspaceId { get; } = workspaceId;
+        public EngineOverlay Overlay { get; } = overlay;
+        public BaselineCacheEntry Baseline { get; } = baseline;
+        public int LeaseCount { get; set; }
+        public DateTimeOffset LastAccessUtc { get; set; }
+        public bool DeletePending { get; set; }
     }
 }

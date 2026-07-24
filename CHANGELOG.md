@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.8.0-mgs.7 - 2026-07-24
+
+### Idle memory reclamation and path-scoped solution identity
+
+- Moved full Roslyn compilation and baseline creation into a dedicated async scope that returns only `IndexStats`, allowing `CompilationResult`, Roslyn Solutions, symbol/reference lists, and storage build input to become unreachable before idle reclamation.
+- Added one debounced, threshold-controlled LOH-compacting full GC after the complete full-index batch is idle; it never runs after each Solution or during publication, incremental updates, or MCP requests.
+- Replaced the unbounded custom-engine reader dictionaries with thread-safe, leased LRU/idle caches. The defaults retain at most two baseline readers and two overlay readers and close idle readers after 60 seconds.
+- Kept overlay snapshots and WAL files when an idle reader is closed. A later query transparently reopens the baseline and overlay without reindexing.
+- Added `releaseMemoryAfterFullIndex`, `memoryReclaimMinimumManagedHeapMb`, `maxOpenBaselineReaders`, `maxOpenOverlayReaders`, and `storageReaderIdleSeconds` configuration.
+- Added structured pre/post reclaim telemetry for working set, private bytes, managed heap, fragmentation, and duration.
+- Clarified health observability with `trackedSolutions`, `logicalWorkspaces`, `roslynIncrementalCacheLoaded`, `openBaselineReaders`, and `openOverlayReaders`; compatibility fields remain present.
+- Made `SolutionId` include the normalized repository instance path as well as the repository-relative Solution path, so identical clones in different folders receive independent indexes and rolling state.
+- Added a validated legacy alias for existing relative-path-only `mgs.6` baselines and rolling state, retaining format compatibility without allowing a second clone to read the first clone's index.
+- Added reader lease, LRU bound, idle close/reopen, WAL recovery, legacy identity, and duplicate-folder regression coverage.
+- Documented the practical 41-Solution Windows run, repeated same-process clone batch, idle targets, MCP queries, rolling update, and exact memory reductions in `docs/MGS7-MEMORY-ACCEPTANCE.md`.
+
 ## 2.8.0-mgs.6 - 2026-07-16
 
 ### Windowless supervised user task

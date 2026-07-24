@@ -22,10 +22,14 @@ internal sealed class RollingIndexStateStore
     public RollingSolutionStatus? Load(RepoId repoId, SolutionId solutionId, string branch)
     {
         var path = StatePath(repoId, solutionId, branch);
+        if (!File.Exists(path) && solutionId.TryGetLegacyId(out var legacySolutionId))
+            path = StatePath(repoId, legacySolutionId, branch);
         if (!File.Exists(path)) return null;
         try
         {
-            return JsonSerializer.Deserialize<RollingSolutionStatus>(File.ReadAllText(path), JsonOptions);
+            var state = JsonSerializer.Deserialize<RollingSolutionStatus>(
+                File.ReadAllText(path), JsonOptions);
+            return state is null ? null : state with { SolutionId = solutionId };
         }
         catch (Exception ex) when (ex is IOException or JsonException) { return null; }
     }
@@ -35,12 +39,17 @@ internal sealed class RollingIndexStateStore
         return LoadEntries(repoId).Select(entry => entry.State).ToList();
     }
 
-    public RollingSolutionStatus? FindAtCommit(RepoId repoId, SolutionId solutionId, CommitSha commit) =>
-        LoadAll(repoId)
-            .Where(state => state.SolutionId == solutionId && state.IndexedCommit == commit &&
+    public RollingSolutionStatus? FindAtCommit(RepoId repoId, SolutionId solutionId, CommitSha commit)
+    {
+        solutionId.TryGetLegacyId(out var legacySolutionId);
+        var state = LoadAll(repoId)
+            .Where(state => (state.SolutionId == solutionId || state.SolutionId == legacySolutionId) &&
+                            state.IndexedCommit == commit &&
                             state.IndexState == RollingIndexState.UpToDate)
             .OrderByDescending(state => state.LastUpdatedAt)
             .FirstOrDefault();
+        return state is null ? null : state with { SolutionId = solutionId };
+    }
 
     public void Save(RollingSolutionStatus state)
     {
@@ -62,6 +71,8 @@ internal sealed class RollingIndexStateStore
     public SolutionImpactMap? LoadImpactMap(RepoId repoId, SolutionId solutionId)
     {
         var path = ImpactPath(repoId, solutionId);
+        if (!File.Exists(path) && solutionId.TryGetLegacyId(out var legacySolutionId))
+            path = ImpactPath(repoId, legacySolutionId);
         if (!File.Exists(path)) return null;
         try
         {

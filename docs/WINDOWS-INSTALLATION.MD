@@ -81,6 +81,22 @@ Use `repositoryRoots` when all repositories beneath one source root should be di
 
 Explicit `repositories` entries are needed only for per-repository settings, a fixed solution list, or an explicit `defaultSolution`.
 
+Keep the default memory controls unless measurement shows a reason to tune them:
+
+```json
+{
+  "indexingResources": {
+    "releaseMemoryAfterFullIndex": true,
+    "memoryReclaimMinimumManagedHeapMb": 768,
+    "maxOpenBaselineReaders": 2,
+    "maxOpenOverlayReaders": 2,
+    "storageReaderIdleSeconds": 60
+  }
+}
+```
+
+Reader limits are process-wide. Active queries hold leases, so their readers cannot be closed. Idle overlay close retains snapshots and WAL data and the next query reopens them transparently.
+
 ## Management
 
 All commands accept an absolute or relative configuration path, including paths containing spaces:
@@ -114,7 +130,7 @@ The install operation uses `Register-ScheduledTask -Force`, so running it again 
 6. Change Codex from STDIO `command`/`args` to the HTTP `url`.
 7. Confirm that only one `MGsCodeMap.Daemon.exe` is running.
 
-The `2.8.0-mgs.6` storage format is compatible with the preceding fork release, so existing indexes are retained. Reinstalling the task upgrades its action from a direct daemon start to the supervised Task Host without changing configuration or data formats.
+The `2.8.0-mgs.7` storage format is compatible with the preceding fork release, so existing indexes are retained. Existing relative-path Solution IDs are reused through a validated alias when the recorded repository root matches. Identical clones in different folders are deliberately isolated into separate indexes.
 
 ## STDIO fallback
 
@@ -158,7 +174,7 @@ This is expected for the installed task. `MGsCodeMap.TaskHost.exe` is a Windows 
 
 ### High memory during initial indexing
 
-Check `/health`, keep the default indexing limits, and wait for idle Solution eviction. Working set may include memory-mapped baseline pages that the operating system can reclaim. The important process invariant is one heavy daemon regardless of client count.
+Check `/health`, keep the default indexing limits, and wait for reader idle eviction plus batch memory reclamation. `openWorkspaces`/`logicalWorkspaces` are logical overlay registrations, not loaded `MSBuildWorkspace` or Roslyn Solution instances. `openBaselineReaders`, `openOverlayReaders`, and `roslynIncrementalCacheLoaded` show the actual in-process caches.
 
 ### Stop timeout
 

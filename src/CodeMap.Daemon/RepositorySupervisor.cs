@@ -24,6 +24,7 @@ public sealed class RepositorySupervisor : BackgroundService
     private readonly IndexHandler _indexHandler;
     private readonly IGitService _git;
     private readonly RollingIndexCoordinator _rolling;
+    private readonly RuntimeActivityTracker _activity;
     private readonly ILogger<RepositorySupervisor> _logger;
     private readonly ConcurrentDictionary<string, string> _lastObservedHead =
         new(StringComparer.OrdinalIgnoreCase);
@@ -42,12 +43,14 @@ public sealed class RepositorySupervisor : BackgroundService
         IndexHandler indexHandler,
         IGitService git,
         RollingIndexCoordinator rolling,
+        RuntimeActivityTracker activity,
         ILogger<RepositorySupervisor> logger)
     {
         _runtime = runtime;
         _indexHandler = indexHandler;
         _git = git;
         _rolling = rolling;
+        _activity = activity;
         _logger = logger;
     }
 
@@ -74,10 +77,15 @@ public sealed class RepositorySupervisor : BackgroundService
                     await ObserveRollingRepositoryAsync(repositoryGroup.ToList(), stoppingToken).ConfigureAwait(false);
                 }
 
-                foreach (var target in targets.Where(target => !target.IsRolling))
+                var commitTargets = targets.Where(target => !target.IsRolling).ToList();
+                if (commitTargets.Count > 0)
                 {
-                    if (stoppingToken.IsCancellationRequested) break;
-                    await ObserveCommitTargetAsync(target, stoppingToken).ConfigureAwait(false);
+                    using var publication = _activity.BeginPublication();
+                    foreach (var target in commitTargets)
+                    {
+                        if (stoppingToken.IsCancellationRequested) break;
+                        await ObserveCommitTargetAsync(target, stoppingToken).ConfigureAwait(false);
+                    }
                 }
 
                 var delaySeconds = targets.Count == 0

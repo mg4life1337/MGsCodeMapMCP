@@ -26,7 +26,7 @@ MCP client 3 ─┘                                    ├─ Roslyn / MSBuild
                                                    └─ one writer per data directory
 ```
 
-Current fork version: `2.8.0-mgs.6`.
+Current fork version: `2.8.0-mgs.7`.
 
 ## Windows installation
 
@@ -101,14 +101,21 @@ Minimal `codemap.json`:
     "maxParallelProjects": 2,
     "incrementalSolutionCacheSize": 1,
     "incrementalSolutionCacheIdleMinutes": 5,
-    "memoryTelemetry": true
+    "memoryTelemetry": true,
+    "releaseMemoryAfterFullIndex": true,
+    "memoryReclaimMinimumManagedHeapMb": 768,
+    "maxOpenBaselineReaders": 2,
+    "maxOpenOverlayReaders": 2,
+    "storageReaderIdleSeconds": 60
   }
 }
 ```
 
 Relative `dataDirectory`, `logDirectory`, repository, and solution paths are resolved relative to `codemap.json`.
 
-When `discoverGitRepositories` and `discoverSolutions` are enabled on a root, explicit `repositories` entries are unnecessary unless you need per-repository overrides or an explicit default solution. If several solutions are found, MCP responses expose their stable `solution_id`; pass `solution_path` or `solution_id` where selection is ambiguous.
+When `discoverGitRepositories` and `discoverSolutions` are enabled on a root, explicit `repositories` entries are unnecessary unless you need per-repository overrides or an explicit default solution. If several solutions are found, MCP responses expose their stable `solution_id`; pass `solution_path` or `solution_id` where selection is ambiguous. A Solution ID includes the normalized repository root and repository-relative Solution path. Two clones in different folders therefore have separate indexes even when they share the same remote, commit, and `.sln` name.
+
+Full-index memory reclamation is batch-scoped. After publication and the reader idle timeout, the daemon waits until there is no full index, incremental update, or active MCP request and the last MCP request has been quiet for at least 120 seconds. If the managed heap remains above `memoryReclaimMinimumManagedHeapMb`, it requests one LOH compaction and performs one blocking full collection. It does not collect after each Solution.
 
 The default host is loopback-only. A non-loopback host is rejected unless `allowRemote` is explicitly enabled. Authentication and TLS are not built in, so remote exposure should be placed behind an appropriate protected reverse proxy.
 
@@ -137,8 +144,8 @@ Uninstalling the logon task does not delete `codemap.json`, `data`, or `logs`:
 
 - product version, PID, start time, endpoint, and mode;
 - active MCP sessions and request count;
-- observed and loaded solutions, workspaces, baselines, and overlays;
-- working set, private bytes, and managed heap;
+- tracked Solutions, logical workspaces, Roslyn incremental cache entries, and open baseline/overlay readers;
+- working set, private bytes, managed heap, and managed-heap fragmentation;
 - Solution-cache hits, misses, and evictions;
 - repository supervisor and current indexing status.
 
@@ -170,7 +177,7 @@ The daemon must already be running. Add `--start-daemon` to the proxy arguments 
 5. Change Codex from `command`/`args` to the HTTP `url` configuration.
 6. Restart Codex and confirm one `MGsCodeMap.Daemon.exe` process.
 
-The storage format is unchanged in `2.8.0-mgs.6`; existing baselines, rolling state, overlays, and valid WAL data are reused. A full reindex is not required solely for this upgrade.
+The storage format is unchanged in `2.8.0-mgs.7`; existing baselines, rolling state, overlays, and valid WAL data are reused. A validated compatibility alias reuses an existing `mgs.6` baseline only when its recorded repository root matches the current repository instance. A second clone in another folder receives its own path-scoped index.
 
 ## MCP tools
 

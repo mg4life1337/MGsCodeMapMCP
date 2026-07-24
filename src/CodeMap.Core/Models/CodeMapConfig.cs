@@ -40,7 +40,12 @@ public sealed record IndexingResourceConfig(
     int MaxParallelProjects = 2,
     int IncrementalSolutionCacheSize = 1,
     int IncrementalSolutionCacheIdleMinutes = 5,
-    bool MemoryTelemetry = true
+    bool MemoryTelemetry = true,
+    bool ReleaseMemoryAfterFullIndex = true,
+    int MemoryReclaimMinimumManagedHeapMb = 768,
+    int MaxOpenBaselineReaders = 2,
+    int MaxOpenOverlayReaders = 2,
+    int StorageReaderIdleSeconds = 60
 );
 
 /// <summary>Automatic repository and solution discovery beneath a common root.</summary>
